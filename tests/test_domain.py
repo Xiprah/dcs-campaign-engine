@@ -32,6 +32,7 @@ from campaign.attrition import (
     ATTRIBUTION_UNKNOWN,
     CAUSE_ATTRITED,
     CAUSE_DESTROYED,
+    CAUSE_UNOBSERVED,
     CAUSE_VANISHED,
     KIND_FLIGHT,
     KIND_TARGET,
@@ -1173,16 +1174,32 @@ class TestCampaignLoop(unittest.TestCase):
         return campaign, package
 
     def _assert_nothing_was_lost(self, campaign: Campaign, package) -> None:
+        """Nothing was written off by *observation*.
+
+        These scenarios run past the package's TOT with the observer gone, so
+        the unobserved resolver may legitimately damage the depot on paper --
+        that is the whole point of it. What must never appear is a loss the
+        engine inferred from a census: the flight left the bubble intact, and
+        an entity the engine removed itself must not come back as a casualty.
+        """
+        invented = [
+            loss.to_dict()
+            for loss in campaign.tracker.losses
+            if loss.cause != CAUSE_UNOBSERVED
+        ]
         self.assertEqual(
-            [loss.to_dict() for loss in campaign.tracker.losses],
+            invented,
             [],
             "the engine invented losses for entities it removed itself",
+        )
+        self.assertFalse(
+            [loss for loss in campaign.tracker.losses if loss.entity_kind == KIND_FLIGHT],
+            "the flight was written off despite never being observed to die",
         )
         self.assertEqual(campaign.tracker.units_alive(package.spawn_id), 2)
         self.assertEqual(package.state, ENROUTE)
         squadron = campaign.inventories["blue"].squadron("vfa_incirlik_f16")
         self.assertEqual(squadron.airframes_lost, 0)
-        self.assertEqual(campaign.theater.targets["latakia_fuel_depot"].units_alive, 4)
 
     def test_a_despawn_the_client_never_acked_is_not_a_vanish(self):
         """We removed it. Its absence from every later census is our own doing.

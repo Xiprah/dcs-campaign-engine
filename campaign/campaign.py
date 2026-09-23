@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Any
 
 from campaign.attrition import (
+    ATTRIBUTION_UNOBSERVED,
+    CAUSE_UNOBSERVED,
     KIND_FLIGHT,
     KIND_TARGET,
     AttritionTracker,
@@ -43,6 +45,7 @@ from campaign.attrition import (
 )
 from campaign.bubble import bubble_delta, resolve_bubble
 from campaign.oob import SideInventory, Squadron, UnknownReservation, build_slice_oob
+from campaign.resolver import resolve_strike
 from campaign.planner import (
     ABORTED,
     COMPLETE,
@@ -142,6 +145,8 @@ class Campaign:
         self.blocked: set[str] = set()
         self.connected: bool = False
         self._objectives_announced: bool = False
+        #: Not persisted; see _announce_dry.
+        self._dry_announced: bool = False
 
         self._ensure_targets_tracked()
 
@@ -393,8 +398,12 @@ class Campaign:
                 # a gap on every tick a stalled campaign fails to plan.
                 self._package_counter -= 1
                 self._spawn_counter -= 1
+                dry = self._announce_dry(base)
+                if dry:
+                    return dry
                 continue
             self.packages[package.id] = package
+            self._dry_announced = False
             self.tracker.track(
                 spawn_id,
                 entity_id=package.id,
@@ -409,6 +418,24 @@ class Campaign:
                 )
             ]
         return []
+
+    def _announce_dry(self, base: Any) -> list[Downlink]:
+        """Say so, once, when the campaign can no longer task anything.
+
+        A campaign that quietly stops planning is indistinguishable from one
+        with nothing to do. This is the difference between a war that ended and
+        a war that ran out of bombs, and the save file looks identical either
+        way. Deliberately not persisted: repeating it once after a reload is a
+        far smaller sin than a silent stall.
+        """
+        if self._dry_announced:
+            return []
+        self._dry_announced = True
+        return [
+            self._message(
+                f"Cannot task: {base.name} has no aircraft or ordnance available."
+            )
+        ]
 
     def _announce_objectives_complete(self) -> list[Downlink]:
         if self._objectives_announced:
@@ -435,13 +462,19 @@ class Campaign:
 
         Expenditure comes off the paper track, not off a snapshot, because it
         is the engine's own fact: the engine knows what it loaded and what
-        reached the target. What the ordnance *achieved* is a different
-        question and only a snapshot may answer it.
+        reached the target.
 
-        TODO(seam): out-of-bubble resolution. A strike nobody watched currently
-        does no damage, because damage may only come from a snapshot. The
-        resolver that rolls an unobserved outcome on `self.rng` belongs here,
-        and it is the one place the campaign's seeded randomness will matter.
+        What the ordnance *achieved* has two possible authorities, and exactly
+        one of them applies. If DCS is holding the target at this instant, the
+        sim decides and the answer arrives in a snapshot. If it is not, nobody
+        is watching, and `campaign.resolver` rolls the outcome on `self.rng`.
+        Choosing once, here, is what keeps a target from being killed twice.
+
+        TODO(threat): unobserved strikes currently cost nothing. The flight
+        always comes home, because applying a flight loss on paper means
+        decrementing the tracked group as well as debiting the reservation,
+        and that belongs with a real threat model rather than a flat dice
+        roll. Until then an unflown strike is safer than a flown one.
         """
         package.weapons_released = True
         survivors = self.tracker.units_alive(package.spawn_id)
@@ -454,11 +487,44 @@ class Campaign:
             )
         if survivors <= 0:
             return []
-        return [
+        frames = self._resolve_unobserved(package, survivors)
+        frames.append(
             self._message(
                 f"{package.callsign} off target, {survivors} aircraft egressing."
             )
-        ]
+        )
+        return frames
+
+    def _resolve_unobserved(self, package: Package, survivors: int) -> list[Downlink]:
+        """Damage a target nobody was watching. No-op if DCS holds it."""
+        target = self.theater.targets.get(package.target_id)
+        if target is None or target.destroyed:
+            return []
+        if self.tracker.is_instantiated(target.spawn_id):
+            return []  # DCS has it; the snapshot is the authority.
+        outcome = resolve_strike(
+            rounds=survivors * package.rounds_per_aircraft,
+            target_units_alive=target.units_alive,
+            rng=self.rng,
+        )
+        frames: list[Downlink] = []
+        for _ in range(outcome.units_killed):
+            loss = LossRecord(
+                t=self.clock,
+                spawn_id=target.spawn_id,
+                entity_id=target.id,
+                entity_kind=KIND_TARGET,
+                coalition=target.coalition,
+                cause=CAUSE_UNOBSERVED,
+                attribution=ATTRIBUTION_UNOBSERVED,
+            )
+            self.tracker.losses.append(loss)
+            frames.extend(self._apply_target_loss(loss))
+        if outcome.missed:
+            frames.append(
+                self._message(f"{package.callsign} reports no effect on target.")
+            )
+        return frames
 
     def _complete_package(self, package: Package) -> list[Downlink]:
         package.state = COMPLETE

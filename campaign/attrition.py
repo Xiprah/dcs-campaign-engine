@@ -48,6 +48,15 @@ ATTRIBUTION_UNKNOWN = "unknown"
 CAUSE_ATTRITED = "attrited"
 CAUSE_DESTROYED = "destroyed"
 CAUSE_VANISHED = "vanished"
+#: Killed on paper, outside the bubble, by campaign.resolver. Never produced by
+#: `ingest`: a snapshot and the resolver are mutually exclusive authorities over
+#: any one entity, so a loss carrying this cause was never observed by DCS.
+CAUSE_UNOBSERVED = "unobserved"
+
+#: Attribution for an unobserved loss. Not event-derived -- there was no event
+#: and no observer -- but it occupies the same field, and says so plainly rather
+#: than claiming the `unknown` of a loss whose event merely went missing.
+ATTRIBUTION_UNOBSERVED = "unobserved"
 
 KIND_FLIGHT = "flight"
 KIND_TARGET = "target"
@@ -265,6 +274,15 @@ class AttritionTracker:
     def units_alive(self, spawn_id: str) -> int:
         group = self.groups.get(spawn_id)
         return 0 if group is None else group.units_alive
+
+    def is_instantiated(self, spawn_id: str) -> bool:
+        """Is DCS currently holding this entity?
+
+        The question that decides which authority may record a loss for it: a
+        snapshot if DCS has it, the unobserved resolver if it does not.
+        """
+        group = self.groups.get(spawn_id)
+        return group is not None and group.instantiated
 
     def is_alive(self, spawn_id: str) -> bool:
         group = self.groups.get(spawn_id)
