@@ -836,6 +836,10 @@ local function handle_spawn(frame)
         units_initial = unit_count,
         category = tmpl.static and "static" or frame.category,
         coalition = frame.coalition,
+        -- Unit names DCS has told us landed. See snapshot_of: DCS deletes AI
+        -- aircraft a short while after they land, and without this the client
+        -- would report a flight that made it home as a flight that died.
+        landed = {},
     }
 
     log_info("spawned " .. name .. " from " .. tostring(frame.template)
@@ -887,10 +891,24 @@ local function snapshot_of(sid, rec)
         return snap
     end
 
+    -- Aircraft DCS has deleted since they landed. DCS removes AI aircraft a
+    -- short while after they are down, so their handles vanish exactly like a
+    -- destroyed unit's. Counting them as gone would report a flight that made
+    -- it home as a flight that died -- and the engine, obeying the
+    -- reconciliation rule correctly, would write off the whole package. The
+    -- rule is only as good as the census feeding it, so the census has to know
+    -- the difference between an aircraft that is missing and one that is
+    -- parked.
+    local recovered, recovered_names = 0, rec.landed or {}
+    for _ in pairs(recovered_names) do recovered = recovered + 1 end
+
     local grp = try(Group.getByName, rec.name)
     if not (grp and try(grp.isExist, grp)) then
         -- Gone with no event is the case snapshots exist to catch. Report
-        -- it as dead rather than omitting it.
+        -- it as dead rather than omitting it -- unless we were told it landed,
+        -- in which case it is at an airbase, not at the bottom of a crater.
+        snap.units = math.min(recovered, rec.units_initial)
+        snap.alive = snap.units > 0
         return snap
     end
 
@@ -899,16 +917,26 @@ local function snapshot_of(sid, rec)
     -- wrong loss into the campaign, so count what actually exists.
     local units = try(grp.getUnits, grp) or {}
     local alive, first = 0, nil
+    local present = {}
     for i = 1, #units do
         local u = units[i]
         if u and try(u.isExist, u) then
             alive = alive + 1
+            local uname = try(u.getName, u)
+            if uname then present[uname] = true end
             if not first then first = try(u.getPoint, u) end
         end
     end
 
-    snap.units = alive
-    snap.alive = alive > 0
+    -- A landed aircraft DCS has already deleted is still an aircraft we have.
+    -- Only count the ones no longer in the unit list, or a jet that landed and
+    -- is still sitting there would be counted twice.
+    for uname in pairs(recovered_names) do
+        if not present[uname] then alive = alive + 1 end
+    end
+
+    snap.units = math.min(alive, rec.units_initial)
+    snap.alive = snap.units > 0
     if first then snap.pos = json.array({first.x, first.y, first.z}) end
     return snap
 end
@@ -1148,6 +1176,18 @@ local PLAYER_GONE = {
     ejection = true, dead = true, unit_lost = true,
 }
 
+--- The spawn record a DCS object belongs to, plus that object's own name.
+---
+--- `object_name` resolves a unit to its *group* name, which is what maps to a
+--- spawn_id; the unit's own name is what the landed set is keyed by.
+local function owned_record(obj)
+    local gname = object_name(obj)
+    if not is_owned(gname) then return nil, nil end
+    local rec = S.spawns[string.sub(gname, #OWNED_PREFIX + 1)]
+    if not rec then return nil, nil end
+    return rec, try(obj.getName, obj)
+end
+
 local function on_event_body(e)
     build_event_tables()
 
@@ -1155,6 +1195,23 @@ local function on_event_body(e)
     if not raw then return end
 
     local ini = e.initiator
+
+    -- Landing bookkeeping, before any connection check: whether the engine is
+    -- listening has no bearing on whether an aircraft got home, and a landing
+    -- missed during a reconnect would be a flight written off on the next
+    -- census. This reads DCS's own events, not the wire, so suppressing event
+    -- frames to the engine cannot change what a snapshot says.
+    if raw == "land" and ini then
+        local rec, uname = owned_record(ini)
+        if rec and uname and rec.category ~= "static" then
+            rec.landed[uname] = true
+        end
+    elseif (raw == "dead" or raw == "crash" or raw == "unit_lost") and ini then
+        -- Destroyed after landing -- on the ramp, or by the airfield being
+        -- hit. It is no longer a recovered aircraft.
+        local rec, uname = owned_record(ini)
+        if rec and uname and rec.landed then rec.landed[uname] = nil end
+    end
 
     -- Player bookkeeping happens whether or not there is a connection.
     if raw == "birth" and ini then
