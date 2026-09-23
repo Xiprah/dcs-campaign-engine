@@ -158,6 +158,12 @@ pip install -r requirements-dev.txt
 Skipping is the dangerous default, because the Lua is the half of this system
 that has never run inside DCS. Install it.
 
+What no test here can settle is *content* — the unit type strings, static
+categories, task schemas and pylon CLSIDs the client hands to DCS. The mock
+accepts any well-formed table, so the suite is green whether or not DCS agrees.
+`mission/validate_templates.lua` answers that in one run inside the sim; see
+[mission/VALIDATION.md](mission/VALIDATION.md).
+
 To run inside DCS for real, see `mission/README.md` — it covers desanitising
 `MissionScripting.lua`, which is required and has real consequences.
 

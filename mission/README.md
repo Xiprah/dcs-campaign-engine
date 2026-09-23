@@ -238,11 +238,19 @@ disagrees with the sim about what is flying.
 
 ## 6. Known limits
 
+Everything named here is *content* — strings this client hands to DCS that no
+test off a DCS install can judge. `mission/validate_templates.lua` exists to
+settle them in one run rather than one crash at a time: load it in any mission,
+read the report with `tools/parse_validation.py`, and see which templates,
+countries, task schemas and pylon CLSIDs DCS actually accepts. Start there
+before debugging any of the below. See [VALIDATION.md](VALIDATION.md).
+
 These are deliberate for the first vertical slice, not oversights:
 
 - **Loadouts are empty.** `TEMPLATES` in `campaign_client.lua` carries no
   pylon CLSIDs, because they are DCS-version specific and an unknown one
-  silently yields an empty pylon rather than an error. Copy real values from
+  silently yields an empty pylon rather than an error. So the strike package
+  spawns unarmed: it will fly the route and drop nothing. Copy real values from
   mission-editor exported group data before expecting anything to hit a target.
   Munitions accounting lives in the engine either way.
 - **Air starts only.** A ground start needs an `airdromeId` on the waypoint and
