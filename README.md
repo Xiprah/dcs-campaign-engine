@@ -147,6 +147,17 @@ python -m unittest discover -s tests -t .
 real harness over a loopback socket, and is the only test that can fail
 because two layers disagreed rather than because one of them is wrong.
 
+`tests/test_mission_client.py` executes the real `mission/campaign_client.lua`
+in Lua 5.1 against a mocked DCS and a real `Campaign` over a real socket. It
+needs one development dependency, and skips cleanly without it:
+
+```
+pip install -r requirements-dev.txt
+```
+
+Skipping is the dangerous default, because the Lua is the half of this system
+that has never run inside DCS. Install it.
+
 To run inside DCS for real, see `mission/README.md` — it covers desanitising
 `MissionScripting.lua`, which is required and has real consequences.
 

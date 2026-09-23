@@ -1,0 +1,7 @@
+# Development only. The engine and the mission client have no runtime deps.
+#
+# lupa embeds Lua 5.1, which is what DCS runs. It is what lets tests/
+# test_mission_client.py execute mission/campaign_client.lua for real instead
+# of trusting that 1600 lines of unexecuted Lua are correct. Without it those
+# tests skip and the rest of the suite still passes.
+lupa>=2.8
