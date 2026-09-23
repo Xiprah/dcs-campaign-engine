@@ -151,6 +151,9 @@ class SimGroup:
     resolved: bool = False
     took_off: bool = False
     dead_reports: int = 0
+    #: Logged once, not every step, when a strike cannot resolve for want of a
+    #: target the engine has not instantiated.
+    warned_no_target: bool = False
 
     @property
     def name(self) -> str:
@@ -335,7 +338,11 @@ class FakeDCS:
             # despawned tells the engine that everything else disappeared, and
             # it will correctly write off a flight that is still flying.
             await self._send_state()
-            del self.groups[frame.spawn_id]
+            # pop, not del: the census above expires groups that have finished
+            # lingering dead, so despawning one of those would already have
+            # removed the key -- and the KeyError would kill the reader task
+            # and look, from the outside, like a dropped connection.
+            self.groups.pop(frame.spawn_id, None)
             log.info("despawned %s (%s)", group.name, frame.reason or "no reason given")
         await self._ack(frame.ref, True)
 
@@ -415,31 +422,40 @@ class FakeDCS:
             target_id = spawn_id_of(target_name) if isinstance(target_name, str) else None
             target = self.groups.get(target_id) if target_id else None
             tot = tasking.get("tot")
-            in_range = target is not None and _hdist(group.pos, target.pos) <= self.cfg.weapon_range
             overdue = isinstance(tot, (int, float)) and self.t >= float(tot) + 120.0
+            if target is None:
+                # A target DCS has not instantiated cannot be struck, and this
+                # harness does not get to pretend otherwise. Resolving the
+                # strike anyway -- which the overdue path used to do -- made the
+                # offline loop report a clean kill for a sortie that delivers
+                # nothing in the sim, and the reconciliation proof rests on this
+                # harness being no kinder than DCS.
+                if overdue and not group.warned_no_target:
+                    group.warned_no_target = True
+                    log.warning(
+                        "%s is past its TOT but %r is not instantiated; nothing "
+                        "is struck, exactly as in DCS",
+                        group.name,
+                        target_name,
+                    )
+                continue
+            in_range = _hdist(group.pos, target.pos) <= self.cfg.weapon_range
             if not in_range and not overdue:
                 continue
-            await self._strike(group, target, target_name)
+            await self._strike(group, target)
 
-    async def _strike(self, flight: SimGroup, target: SimGroup | None, target_name: object) -> None:
+    async def _strike(self, flight: SimGroup, target: SimGroup) -> None:
         flight.resolved = True
         self.struck.add(flight.spawn_id)
         cfg = self.cfg
         await self._emit_event(
             "shot",
             initiator=flight.name,
-            target=target.name if target else None,
+            target=target.name,
             weapon=cfg.weapon,
         )
         killed = 0
-        if target is None:
-            log.warning(
-                "%s struck %r, which is not instantiated: the engine can only "
-                "learn this from events, so --drop-events will show nothing",
-                flight.name,
-                target_name,
-            )
-        elif cfg.target_outcome != "intact" and self.rng.random() < cfg.target_pk:
+        if cfg.target_outcome != "intact" and self.rng.random() < cfg.target_pk:
             before = target.units
             if cfg.target_outcome == "destroyed":
                 target.units = 0
@@ -476,9 +492,9 @@ class FakeDCS:
             {
                 "t": self.t,
                 "flight": flight.name,
-                "target": target.name if target else target_name,
+                "target": target.name,
                 "target_units_killed": killed,
-                "target_alive": target.alive if target else None,
+                "target_alive": target.alive,
                 "flight_losses": losses,
                 "flight_units": flight.units,
             }
@@ -487,8 +503,8 @@ class FakeDCS:
             "strike at t=%.0f: %s -> %s, target %s, flight %d/%d remaining",
             self.t,
             flight.name,
-            target.name if target else target_name,
-            "destroyed" if target and not target.alive else "damaged" if target else "unknown",
+            target.name,
+            "destroyed" if not target.alive else "damaged",
             flight.units,
             flight.units_initial,
         )
@@ -600,8 +616,15 @@ class FakeDCS:
             return await self._sim_loop(reader_task)
         finally:
             reader_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
+            try:
                 await reader_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # A harness bug in here used to be indistinguishable from the
+                # engine hanging up: `_sim_loop` sees the task done, returns
+                # "closed", and `run()` quietly reconnects. Say so instead.
+                log.exception("reader task failed; this is a harness bug")
             self._writer = None
             with contextlib.suppress(Exception):
                 if self._drop_now:

@@ -46,6 +46,8 @@ from campaign.oob import (
     build_slice_oob,
 )
 from campaign.planner import (
+    CRUISE_ALTITUDE,
+    ENROUTE,
     OPEN_STATES,
     build_package,
     package_position,
@@ -271,6 +273,18 @@ class FakeDCS:
         )
 
 
+class SilentDespawnDCS(FakeDCS):
+    """A client that obeys a despawn but whose ack never arrives.
+
+    An ordinary failure: a socket dropping between the despawn and the ack, or
+    a Lua client that destroyed the group and then failed before answering. The
+    engine must not need the ack to know it removed the entity itself.
+    """
+
+    def _on_despawn(self, frame: Despawn) -> None:
+        self.groups.pop(frame.spawn_id, None)
+
+
 def fork_client(dcs: FakeDCS, campaign: Campaign) -> FakeDCS:
     """A second client holding the same picture of DCS, bound to another campaign.
 
@@ -331,6 +345,10 @@ def drive(
 THEATER = build_slice_theater()
 DEPOT = THEATER.targets["latakia_fuel_depot"]
 OBSERVER_AT_TARGET = [(DEPOT.pos[0], 100.0, DEPOT.pos[2])]
+
+#: Hundreds of kilometres from anything in the slice: whatever was in the
+#: bubble leaves it, and nothing re-enters.
+OBSERVER_FAR_AWAY = [(DEPOT.pos[0] + 300_000.0, 100.0, DEPOT.pos[2] + 300_000.0)]
 
 SCENARIO: list[Damage] = [
     # Bombs on target, fully explained by events.
@@ -739,6 +757,41 @@ class TestAttrition(unittest.TestCase):
         self.assertEqual(losses, [])
         self.assertEqual(tracker.units_alive("a91f"), 4)
 
+    def test_a_stale_census_does_not_re_arm_vanish_detection(self):
+        """Only an ack says a group is live. A snapshot may not say it.
+
+        The protocol allows the sequence outright: the engine despawns a flight
+        for `left_bubble`, and a census the client had already built arrives a
+        moment later still listing it. If `ingest` treated that as evidence the
+        group is instantiated, every later report -- correctly omitting a group
+        the engine itself removed -- would read as a vanish, and the campaign
+        would write off a two-ship that is alive and on its paper track.
+        """
+        tracker = _tracker_with_flight()
+        tracker.ingest(_snapshot(30.0, True, 4))
+        tracker.mark_removed("a91f")
+
+        self.assertEqual(tracker.ingest(_snapshot(35.0, True, 4)), [])
+
+        for t in (90.0, 150.0, 900.0):
+            self.assertEqual(tracker.ingest(StateReport(seq=3, t=t, groups=[])), [])
+        self.assertEqual(tracker.losses, [])
+        self.assertEqual(tracker.units_alive("a91f"), 4)
+        self.assertTrue(tracker.is_alive("a91f"))
+
+    def test_a_stale_census_may_still_report_a_real_loss(self):
+        """Removal stops absence meaning anything. It does not stop truth.
+
+        The guard above must not turn into "ignore snapshots for removed
+        groups": a census generated before the despawn is still ground truth
+        about what was standing when it was taken.
+        """
+        tracker = _tracker_with_flight()
+        tracker.mark_removed("a91f")
+        losses = tracker.ingest(_snapshot(35.0, True, 2))
+        self.assertEqual(len(losses), 2)
+        self.assertEqual(tracker.units_alive("a91f"), 2)
+
     def test_a_snapshot_cannot_resurrect_units(self):
         tracker = _tracker_with_flight()
         tracker.ingest(_snapshot(60.0, True, 2))
@@ -1097,6 +1150,135 @@ class TestCampaignLoop(unittest.TestCase):
         )
         self.assertEqual(flight.tasking["units"], 1)
 
+    def _flight_in_the_bubble(self, dcs: FakeDCS | None = None):
+        """A campaign whose two-ship is airborne, healthy and instantiated."""
+        campaign = Campaign()
+        if dcs is not None:
+            dcs.campaign = campaign
+            dcs.connect(0.0)
+        drive(
+            campaign,
+            observer_positions=OBSERVER_AT_TARGET,
+            damages=[],
+            deliver_events=False,
+            start=0,
+            duration=1200,
+            dcs=dcs,
+        )
+        package = next(p for p in campaign.packages.values() if p.state in OPEN_STATES)
+        self.assertIn(
+            package.spawn_id, campaign.live, "the flight never entered the bubble"
+        )
+        self.assertEqual(campaign.tracker.units_alive(package.spawn_id), 2)
+        return campaign, package
+
+    def _assert_nothing_was_lost(self, campaign: Campaign, package) -> None:
+        self.assertEqual(
+            [loss.to_dict() for loss in campaign.tracker.losses],
+            [],
+            "the engine invented losses for entities it removed itself",
+        )
+        self.assertEqual(campaign.tracker.units_alive(package.spawn_id), 2)
+        self.assertEqual(package.state, ENROUTE)
+        squadron = campaign.inventories["blue"].squadron("vfa_incirlik_f16")
+        self.assertEqual(squadron.airframes_lost, 0)
+        self.assertEqual(campaign.theater.targets["latakia_fuel_depot"].units_alive, 4)
+
+    def test_a_despawn_the_client_never_acked_is_not_a_vanish(self):
+        """We removed it. Its absence from every later census is our own doing.
+
+        `_retire` stops expecting snapshots when the despawn is *sent*, not when
+        it is acknowledged, precisely because the ack may never come. Without
+        that, a healthy two-ship flown out of the bubble comes back as two
+        `vanished` airframes and a destroyed package.
+        """
+        dcs = SilentDespawnDCS(campaign=Campaign(), deliver_events=False)
+        campaign, package = self._flight_in_the_bubble(dcs)
+
+        drive(
+            campaign,
+            observer_positions=OBSERVER_FAR_AWAY,
+            damages=[],
+            deliver_events=False,
+            start=1200,
+            duration=300,
+            dcs=dcs,
+        )
+
+        self.assertNotIn(package.spawn_id, campaign.live)
+        self.assertTrue(
+            any(
+                isinstance(f, Despawn) and f.reason == "left_bubble"
+                for f in dcs.downlink
+            ),
+            "the flight was never despawned, so this proves nothing",
+        )
+        self._assert_nothing_was_lost(campaign, package)
+
+    def test_a_disconnect_stops_the_engine_expecting_snapshots(self):
+        campaign, _ = self._flight_in_the_bubble()
+        self.assertTrue(
+            [g for g in campaign.tracker.groups.values() if g.expects_snapshot],
+            "nothing was awaiting snapshots, so this proves nothing",
+        )
+        campaign.on_disconnect()
+        self.assertEqual(
+            [g.spawn_id for g in campaign.tracker.groups.values() if g.expects_snapshot],
+            [],
+            "the engine still expects snapshots from a sim that is gone",
+        )
+
+    def test_a_restarted_client_is_not_indicted_for_its_empty_first_census(self):
+        """A reconnect re-issues every spawn. Until they are acked, nothing is live.
+
+        The client's first census can easily go out before it has finished
+        creating what the engine just re-issued -- and measured against the old
+        connection's timings, that absence is long past the vanish grace window.
+        """
+        campaign, package = self._flight_in_the_bubble()
+        campaign.on_disconnect()
+
+        frames = campaign.on_hello(
+            Hello(seq=1, t=0.0, protocol=PROTOCOL_VERSION, theater="Syria")
+        )
+        self.assertIn(
+            package.spawn_id,
+            {f.spawn_id for f in frames if isinstance(f, Spawn)},
+            "the flight was not re-issued, so this proves nothing",
+        )
+        # Censuses arrive; the acks for those spawns do not.
+        for t in (0.0, 30.0, 60.0, 120.0, 240.0):
+            campaign.on_state(StateReport(seq=2, t=t, groups=[]))
+
+        self._assert_nothing_was_lost(campaign, package)
+
+    def test_a_campaign_reloaded_mid_sortie_does_not_start_by_losing_the_flight(self):
+        """The save was written with the flight instantiated, because it was.
+
+        A process that was killed rather than shut down never ran
+        `on_disconnect`, so the save says the flight is live in a DCS that no
+        longer exists. The first `hello` has to undo that belief before any
+        census arrives, or the engine opens the reloaded campaign by writing off
+        a two-ship that is sitting on the ramp of a mission nobody has started.
+        """
+        campaign, _ = self._flight_in_the_bubble()
+        self.assertTrue(
+            [g for g in campaign.tracker.groups.values() if g.expects_snapshot],
+            "nothing was instantiated in the save, so this proves nothing",
+        )
+        path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "campaign.json"
+        campaign.save(path)
+
+        reloaded = Campaign.load(path)
+        package = next(p for p in reloaded.packages.values() if p.state in OPEN_STATES)
+        reloaded.on_hello(
+            Hello(seq=1, t=0.0, protocol=PROTOCOL_VERSION, theater="Syria")
+        )
+        for t in (0.0, 30.0, 60.0, 120.0, 240.0):
+            reloaded.on_state(StateReport(seq=2, t=t, groups=[]))
+
+        self._assert_nothing_was_lost(reloaded, package)
+
     def test_protocol_mismatch_is_fatal(self):
         from campaign.protocol import ProtocolError
 
@@ -1226,14 +1408,48 @@ class TestPlanner(unittest.TestCase):
             package_position(package, base, target, package.t_rtb + 1.0), base.pos
         )
 
+        # The interior of the track, not just its endpoints. Without this the
+        # outbound leg can teleport the flight onto the target at takeoff and
+        # nothing notices -- and the bubble would then instantiate a two-ship
+        # over its target twenty minutes before its TOT.
+        leg = ground_distance(base.pos, target.pos)
         midpoint = (package.t_takeoff + package.t_tot) / 2.0
-        self.assertEqual(
-            package_position(package, base, target, midpoint),
-            package_position(package, base, target, midpoint),
+        at_mid = package_position(package, base, target, midpoint)
+        self.assertAlmostEqual(ground_distance(base.pos, at_mid) / leg, 0.5, places=2)
+        self.assertAlmostEqual(ground_distance(at_mid, target.pos) / leg, 0.5, places=2)
+
+        # And it closes on the target monotonically, rather than merely passing
+        # through the halfway point on its way somewhere else.
+        span = package.t_tot - package.t_takeoff
+        ranges = [
+            ground_distance(
+                package_position(
+                    package, base, target, package.t_takeoff + span * n / 10.0
+                ),
+                target.pos,
+            )
+            for n in range(11)
+        ]
+        self.assertEqual(ranges, sorted(ranges, reverse=True))
+        self.assertAlmostEqual(ranges[0] / leg, 1.0, places=2)
+
+        # The egress leg is the same story in reverse.
+        egress = (package.t_tot + package.t_rtb) / 2.0
+        at_egress = package_position(package, base, target, egress)
+        self.assertAlmostEqual(
+            ground_distance(target.pos, at_egress) / leg, 0.5, places=2
         )
-        self.assertTrue(
-            math.isfinite(package_position(package, base, target, midpoint)[0])
+        self.assertGreater(
+            ground_distance(at_egress, target.pos),
+            ground_distance(
+                package_position(package, base, target, package.t_tot + 1.0), target.pos
+            ),
         )
+
+        # Cruising altitude, not ground level: a flight re-instantiated on its
+        # paper track has to come back in the air.
+        self.assertAlmostEqual(at_mid[1], CRUISE_ALTITUDE)
+        self.assertTrue(math.isfinite(at_mid[0]))
 
 
 if __name__ == "__main__":

@@ -50,6 +50,12 @@ DEFAULT_TICK_PERIOD: Final = 1.0
 #: the cap, not a frame, so small reads keep a burst of legal frames legal.
 _READ_CHUNK: Final = 8192
 
+#: Ceiling on waiting for a torn-down connection's handler to finish. The abort
+#: in `_Connection.close` should make this a formality; the bound exists so that
+#: a handler wedged for any other reason cannot lock out the reconnecting sim,
+#: or the shutdown that persists the campaign, indefinitely.
+_CLOSE_TIMEOUT: Final = 5.0
+
 def _elapsed_clock() -> Callable[[], float]:
     """Monotonic seconds since the server started, not since the host booted.
 
@@ -90,7 +96,11 @@ class _Connection:
     def close(self) -> None:
         self.alive = False
         with contextlib.suppress(Exception):
-            self.writer.close()
+            # abort(), not close(): close() defers `connection_lost` until the
+            # write buffer drains, so a DCS that wedged with bytes outstanding
+            # would never reach it -- and nothing that waits on `closed` would
+            # ever be released. This socket is being torn down, not flushed.
+            self.writer.transport.abort()
 
 
 class CampaignServer:
@@ -113,6 +123,7 @@ class CampaignServer:
         self._server: asyncio.Server | None = None
         self._tick_task: asyncio.Task[None] | None = None
         self._conn: _Connection | None = None
+        self._serving: asyncio.Future[None] | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -137,26 +148,55 @@ class CampaignServer:
         logger.info("listening on %s:%d", self._host, self._port)
 
     async def serve_forever(self) -> None:
+        """Accept clients until cancelled, tearing everything down on the way out.
+
+        Deliberately not a passthrough to `asyncio.Server.serve_forever()`.
+        That one answers cancellation by awaiting `wait_closed()`, which since
+        3.12 waits for every live connection handler to finish -- and ours only
+        finishes when the client socket dies, which is exactly what the caller's
+        `finally` was going to do. Ctrl-C with DCS attached therefore hung
+        forever and the campaign was never persisted. Owning the wait here means
+        cancellation runs the teardown instead of deadlocking against it.
+        """
+        if self._serving is not None:
+            raise RuntimeError("serve_forever() is already running on this server")
         if self._server is None:
             await self.start()
-        assert self._server is not None
-        await self._server.serve_forever()
+        self._serving = asyncio.get_running_loop().create_future()
+        try:
+            await self._serving
+        except asyncio.CancelledError:
+            await self.close()
+            raise
+        finally:
+            self._serving = None
 
     async def close(self) -> None:
         """Shut down: no task, socket or engine callback left outstanding."""
+        if self._serving is not None and not self._serving.done():
+            self._serving.set_result(None)
         if self._tick_task is not None:
             self._tick_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            # A tick task that already died of its own exception must not take
+            # the shutdown -- and the campaign save that follows it -- with it.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._tick_task
             self._tick_task = None
         conn = self._conn
         if conn is not None:
             conn.close()
-            await conn.closed.wait()
+            try:
+                await asyncio.wait_for(conn.closed.wait(), _CLOSE_TIMEOUT)
+            except TimeoutError:
+                logger.error("%s did not finish closing; shutting down anyway", conn.peer)
         if self._server is not None:
             self._server.close()
             with contextlib.suppress(Exception):
-                await self._server.wait_closed()
+                # Bounded for the same reason as everything else here: since
+                # 3.12 `wait_closed()` waits for every connection handler, and
+                # the campaign save happens after this returns. Shutdown must
+                # not be hostage to a handler that will not let go.
+                await asyncio.wait_for(self._server.wait_closed(), _CLOSE_TIMEOUT)
             self._server = None
 
     async def __aenter__(self) -> CampaignServer:
@@ -178,7 +218,13 @@ class CampaignServer:
             # reaped yet. The newest client is always the real one.
             logger.warning("client %s displaces %s", conn.peer, previous.peer)
             previous.close()
-            await previous.closed.wait()
+            try:
+                await asyncio.wait_for(previous.closed.wait(), _CLOSE_TIMEOUT)
+            except TimeoutError:
+                # The reconnecting sim is the one that matters. A predecessor
+                # whose handler will not let go is a bug to log, not a reason to
+                # leave DCS talking to nothing.
+                logger.error("%s did not finish closing; proceeding", previous.peer)
         self._conn = conn
         logger.info("client connected: %s", conn.peer)
         try:
@@ -194,7 +240,11 @@ class CampaignServer:
             if self._conn is conn:
                 self._conn = None
             with contextlib.suppress(Exception):
-                await writer.wait_closed()
+                # Bounded for the same reason the close is an abort: a transport
+                # with bytes still queued to a client that stopped reading never
+                # reports itself closed, and this handler is what everything
+                # else waits on.
+                await asyncio.wait_for(writer.wait_closed(), _CLOSE_TIMEOUT)
             logger.info("client disconnected: %s", conn.peer)
             self._notify_disconnect()
             conn.closed.set()
@@ -230,10 +280,20 @@ class CampaignServer:
             raise ProtocolError(f"no handler for {type(frame).__name__}")
         try:
             out = getattr(self._engine, name)(frame)
+        except ProtocolError:
+            # docs/protocol.md: the engine closes the connection on a protocol
+            # mismatch rather than negotiating. The engine states that verdict by
+            # raising, so it has to reach `_on_client` instead of being logged as
+            # one more survivable handler crash -- otherwise an incompatible
+            # client keeps driving the campaign it was just refused by.
+            raise
         except Exception:
             logger.exception("%s raised; campaign continues", name)
             return
-        await self._send(conn, out or ())
+        try:
+            await self._send(conn, out or ())
+        except Exception:
+            logger.exception("sending the reply to %s failed; campaign continues", name)
 
     def _notify_disconnect(self) -> None:
         try:
@@ -253,9 +313,11 @@ class CampaignServer:
         for frame in frames:
             try:
                 blob += encode(frame)
-            except ProtocolError:
+            except Exception:
                 # An unsendable frame is an engine bug. Losing the rest of the
-                # batch over it would turn a bug into a broken campaign.
+                # batch over it would turn a bug into a broken campaign, and it
+                # need not be a ProtocolError: a non-dataclass or a value JSON
+                # cannot serialise comes out of `encode` as a TypeError.
                 logger.exception("cannot encode %s, skipping it", type(frame).__name__)
         if not blob:
             return
@@ -282,7 +344,12 @@ class CampaignServer:
                 logger.exception("tick raised; campaign continues")
                 continue
             if frames:
-                await self._send(self._conn, frames)
+                try:
+                    await self._send(self._conn, frames)
+                except Exception:
+                    # The clock is the campaign's heartbeat. Nothing watches this
+                    # task, so an exception escaping here stops time silently.
+                    logger.exception("sending tick output failed; campaign continues")
 
 
 async def serve(

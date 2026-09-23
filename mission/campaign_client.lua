@@ -83,6 +83,13 @@ local CONFIG = {
     --- How long a non-blocking connect may stay pending.
     connect_timeout = 5.0,
 
+    --- How long after `hello` the engine has to answer with `sync`. The
+    --- protocol says the engine replies sync or closes the connection on a
+    --- mismatch, but a connection that is open and silent is a third outcome
+    --- the client has to survive on its own: without a deadline it sits in
+    --- phase "open" forever, sending nothing and never retrying.
+    sync_timeout = 15.0,
+
     --- Seconds between repeats of a "cannot reach the engine" log line, so
     --- a dead engine does not fill dcs.log.
     log_throttle = 60.0,
@@ -141,6 +148,7 @@ local S = {
     sock = nil,
     phase = "idle",              -- idle | connecting | open
     connect_deadline = 0,
+    sync_deadline = nil,
     next_connect_at = 0,
     backoff = CONFIG.reconnect_base,
     last_fail_log = -1e18,
@@ -239,32 +247,39 @@ end
 -- ------------------------------------------------------------------
 
 local socket = nil
+--- The search paths below are appended once, not once per connect attempt:
+--- this is retried on every backoff, and `package.path` would otherwise grow
+--- for as long as the engine stays down.
+local socket_path_extended = false
 
-local function load_socket()
-    if socket then return socket end
-
+local function try_require_socket()
     local ok, mod = pcall(require, "socket")
     if ok and type(mod) == "table" then
         socket = mod
         return socket
     end
+    return nil
+end
+
+local function load_socket()
+    if socket then return socket end
+    if try_require_socket() then return socket end
+    if not package or socket_path_extended then return nil end
+    socket_path_extended = true
 
     -- DCS ships LuaSocket beside the executable but does not put it on the
-    -- mission environment's package.path.
-    if lfs and package then
-        local dir = try(lfs.currentdir)
-        if dir then
-            package.path = package.path .. ";" .. dir .. "/LuaSocket/?.lua"
-            package.cpath = package.cpath .. ";" .. dir .. "/LuaSocket/?.dll"
-            ok, mod = pcall(require, "socket")
-            if ok and type(mod) == "table" then
-                socket = mod
-                return socket
-            end
-        end
+    -- mission environment's package.path. `lfs.currentdir()` is the reliable
+    -- way to name that directory; the relative form after it is the fallback
+    -- for an install where only `require` and `package` were desanitised,
+    -- which is what the README used to tell people to do.
+    local dir = lfs and try(lfs.currentdir)
+    if dir then
+        package.path = package.path .. ";" .. dir .. "/LuaSocket/?.lua"
+        package.cpath = package.cpath .. ";" .. dir .. "/LuaSocket/?.dll"
     end
-
-    return nil
+    package.path = package.path .. ";./LuaSocket/?.lua"
+    package.cpath = package.cpath .. ";./LuaSocket/?.dll"
+    return try_require_socket()
 end
 
 -- ------------------------------------------------------------------
@@ -531,12 +546,36 @@ local function build_route(spawn)
     return {points = points, attack_at = attack_at}
 end
 
+--- A Bombing task aimed at one map point. `x`/`y` are DCS map coordinates,
+--- which is the vec3's x and z -- see `pos_xy`.
+local function bombing_task(number, x, y)
+    return {
+        number = number,
+        auto = false,
+        id = "Bombing",
+        enabled = true,
+        params = {
+            point = {x = x, y = y},
+            attackQty = 1,
+            expend = "All",
+            groupAttack = true,
+        },
+    }
+end
+
 --- Attach a best-effort attack task to the waypoint the engine marked
 --- `attack`, falling back to the last one.
 ---
 --- Which waypoint this lands on is not cosmetic. The engine's strike route
 --- is ingress, target, home, so hanging the task on the last point tasks the
 --- flight to attack *after* it has landed, and nothing is ever struck.
+---
+--- Three ways to name the target, in descending order of fidelity: the group
+--- it names, the static object it names, and -- when neither exists yet --
+--- the ground under the attack waypoint. The last one is not a corner case.
+--- A flight is instantiated when it is near the players, and on a strike it
+--- usually is long before its target is, so without it the common case is a
+--- two-ship with an empty task list flying a sightseeing tour of Latakia.
 ---
 --- `tasking.tot` is deliberately ignored. The engine owns the schedule and
 --- expresses it by choosing when to send the spawn, so honouring a TOT here
@@ -574,18 +613,20 @@ local function attach_tasking(route, tasking)
                  or try(StaticObject.getByName, target .. "_1")
     local point = stat and try(stat.getPoint, stat)
     if point then
-        tasks[#tasks + 1] = {
-            number = #tasks + 1,
-            auto = false,
-            id = "Bombing",
-            enabled = true,
-            params = {
-                point = {x = point.x, y = point.z},
-                attackQty = 1,
-                expend = "All",
-                groupAttack = true,
-            },
-        }
+        tasks[#tasks + 1] = bombing_task(#tasks + 1, point.x, point.z)
+        return
+    end
+
+    -- Nothing resolved, which is the ordinary case rather than the odd one:
+    -- the bubble instantiates whatever is nearest the players, and a package
+    -- flying out to a target is usually inside it long before the target is.
+    -- The protocol has no re-tasking frame and the flight is not re-spawned,
+    -- so a group left with an empty ComboTask flies its route and drops
+    -- nothing, ever. The attack waypoint is the target's own position, which
+    -- is everything a Bombing task needs.
+    local wp = route.attack_at and route.points[route.attack_at]
+    if wp then
+        tasks[#tasks + 1] = bombing_task(#tasks + 1, wp.x, wp.y)
     end
 end
 
@@ -704,11 +745,21 @@ local function handle_spawn(frame)
     if tmpl.static then
         -- Several objects under one spawn_id: DCS has no static group, so the
         -- engine's multi-unit target becomes N objects the client counts.
-        local count = tmpl.count or 1
+        --
+        -- How many is the engine's call, exactly as for an aircraft group. A
+        -- target the campaign has already half-flattened leaves the bubble and
+        -- comes back, and rebuilding it from the template would stand the
+        -- destroyed objects back up: the next census would honestly report them
+        -- and the engine would need them destroyed all over again. Do that
+        -- often enough and the target can never be finished at all.
+        local total = tmpl.count or 1
+        local count = unit_count_for(tmpl, frame.tasking)
         names = {}
         local failure = nil
         for i = 1, count do
-            local member = (count > 1) and (name .. "_" .. i) or name
+            -- Suffixed off the template, not the surviving count, so an object
+            -- keeps its name across bubble cycles.
+            local member = (total > 1) and (name .. "_" .. i) or name
             local built, data = pcall(build_static_data, frame, tmpl, member, i)
             if not built then
                 failure = "bad spawn payload: " .. tostring(data)
@@ -717,6 +768,16 @@ local function handle_spawn(frame)
             local ok, err = pcall(coalition.addStaticObject, country_id, data)
             if not ok then
                 failure = "addStaticObject failed: " .. tostring(err)
+                break
+            end
+            -- pcall only catches a raised error. DCS routinely fails a static
+            -- silently -- an unsupported category pair, a Fortifications type
+            -- with no shape_name -- logging internally and returning nil. An
+            -- ack of "ok" for an object that does not exist is worse than a
+            -- refusal: the next census reports it destroyed.
+            local obj = try(StaticObject.getByName, member)
+            if not (obj and try(obj.isExist, obj)) then
+                failure = "addStaticObject created nothing: " .. tostring(frame.template)
                 break
             end
             names[#names + 1] = member
@@ -750,6 +811,21 @@ local function handle_spawn(frame)
         if not ok then
             log_err("spawn " .. sid .. ": " .. tostring(err))
             send_ack(frame.ref, false, "addGroup failed: " .. tostring(err))
+            return
+        end
+        -- As above: `addGroup` fails silently on a table DCS does not like --
+        -- an unknown unit type, an unsupported country/category pair -- and
+        -- returns without raising. Registering the spawn_id anyway is the one
+        -- way to turn a content mistake into campaign corruption: the next
+        -- census finds no group, reports zero units, and the engine writes off
+        -- the whole flight as a combat loss before anyone has flown.
+        local grp = try(Group.getByName, name)
+        local members = grp and try(grp.getUnits, grp)
+        if not (grp and try(grp.isExist, grp) and members and #members > 0) then
+            if grp then guard("destroy " .. name, grp.destroy, grp) end
+            local failure = "addGroup created nothing: " .. tostring(frame.template)
+            log_err("spawn " .. sid .. ": " .. failure)
+            send_ack(frame.ref, false, failure)
             return
         end
     end
@@ -931,6 +1007,7 @@ local function handle_sync(frame)
     end
 
     S.synced = true
+    S.sync_deadline = nil
     S.campaign_time = frame.campaign_time
     -- Stored for diagnostics only. The engine decides what is in the bubble
     -- and says so with spawn and despawn; a client that also applied the
@@ -1224,6 +1301,7 @@ local function reset_stream()
     -- always seq 1.
     S.seq = 0
     S.synced = false
+    S.sync_deadline = nil
     S.next_state_at = nil
     S.next_observer_at = nil
 end
@@ -1342,6 +1420,7 @@ local function poll_connect(now)
             reset_stream()
             S.last_fail_log = -1e18
             log_info("connected to " .. CONFIG.host .. ":" .. CONFIG.port)
+            S.sync_deadline = now + CONFIG.sync_timeout
             send_hello()
             flush_outbox()
             return
@@ -1385,7 +1464,15 @@ local function pump_recv()
 end
 
 local function periodic(now)
-    if not S.synced then return end
+    if not S.synced then
+        if S.sync_deadline and now >= S.sync_deadline then
+            -- Open, and silent. Back off and try again rather than sit here:
+            -- an engine that refused this client's protocol version hangs up
+            -- without answering, and so does one that is wedged.
+            teardown("engine did not answer hello with sync")
+        end
+        return
+    end
 
     if S.next_observer_at and now >= S.next_observer_at then
         S.next_observer_at = now + S.observer_period
@@ -1473,6 +1560,16 @@ function M.stop()
     close_socket()
     S.phase = "idle"
     reset_stream()
+
+    -- Exactly what teardown() does, and for the same two reasons. The engine
+    -- re-issues every spawn on the next connect, and a duplicate spawn_id is a
+    -- hard failure that scrubs the package for good -- so a stop/start pair
+    -- would kill whatever is in the air. And the self-reload guard at the
+    -- bottom of this file calls the *old* module's stop: groups left behind
+    -- there are unreachable for the rest of the mission, because the new
+    -- client spawns its own under the same names and getByName resolves only
+    -- one of them.
+    destroy_all_spawns("client stopped")
 
     log_info("client stopped")
 end

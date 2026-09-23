@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import socket
 import unittest
 
 from campaign.api import CampaignEngine
@@ -28,6 +29,7 @@ from campaign.protocol import (
     Message,
     Observer,
     ObserverReport,
+    ProtocolError,
     Spawn,
     StateReport,
     Sync,
@@ -70,8 +72,14 @@ class StubEngine:
         self.disconnects = 0
         self.ticks = 0
         self.raise_in: set[str] = set()
+        #: Handlers that raise ProtocolError rather than RuntimeError. The
+        #: transport has to tell the two apart: one closes the connection, the
+        #: other must not.
+        self.protocol_error_in: set[str] = set()
         self.live_spawns: list[Spawn] = []
         self.tick_frames: list[Downlink] = []
+        #: When set, returned by on_state instead of the usual Despawn.
+        self.state_frames: list[Downlink] | None = None
         self._seq = 0
 
     def _next(self) -> int:
@@ -79,6 +87,8 @@ class StubEngine:
         return self._seq
 
     def _guard(self, name: str) -> None:
+        if name in self.protocol_error_in:
+            raise ProtocolError(f"stub engine refuses {name}")
         if name in self.raise_in:
             raise RuntimeError(f"stub engine exploded in {name}")
 
@@ -112,6 +122,9 @@ class StubEngine:
     def on_state(self, msg: StateReport) -> list[Downlink]:
         self.calls.append(("state", msg))
         self._guard("on_state")
+        if self.state_frames is not None:
+            frames, self.state_frames = self.state_frames, None
+            return frames
         return [Despawn(seq=self._next(), t=msg.t, ref=self._seq, spawn_id="a91f", reason="dead")]
 
     def on_ack(self, msg: Ack) -> list[Downlink]:
@@ -471,6 +484,204 @@ class TickTests(TransportTestCase):
         self.engine.raise_in = set()
         after = self.engine.ticks
         await self.wait_for(lambda: self.engine.ticks > after, "ticks resume")
+
+
+class ProtocolMismatchTests(TransportTestCase):
+    """docs/protocol.md: the engine closes the connection on a mismatch.
+
+    The engine says so by raising ProtocolError out of `on_hello`. If the
+    transport logs that like any other handler crash, the refused client keeps
+    its socket and keeps driving the campaign it was just declared incompatible
+    with -- which is worse than either accepting it or hanging up on it.
+    """
+
+    async def test_a_handler_protocol_error_closes_the_connection(self) -> None:
+        self.engine.protocol_error_in = {"on_hello"}
+        client = await self.client()
+        await client.send(Hello(seq=1, t=0.0, protocol=99, theater="Syria"))
+        await client.wait_closed()
+        await self.wait_for(lambda: self.engine.disconnects == 1, "on_disconnect")
+        self.assertFalse(self.server.connected)
+
+    async def test_a_refused_client_cannot_keep_driving_the_campaign(self) -> None:
+        self.engine.protocol_error_in = {"on_hello"}
+        client = await self.client()
+        await client.send(
+            Hello(seq=1, t=0.0, protocol=99, theater="Syria"),
+            ObserverReport(
+                seq=2, t=10.0, observers=[Observer(id="player:X", pos=(0.0, 0.0, 0.0))]
+            ),
+        )
+        await client.wait_closed()
+        self.assertEqual(self.engine.frames_of("observer"), [])
+
+    async def test_a_matching_client_is_still_served_afterwards(self) -> None:
+        self.engine.protocol_error_in = {"on_hello"}
+        doomed = await self.client()
+        await doomed.send(Hello(seq=1, t=0.0, protocol=99, theater="Syria"))
+        await doomed.wait_closed()
+        self.engine.protocol_error_in = set()
+        survivor = await self.client()
+        self.assertIsInstance(await self.hello(survivor), Sync)
+
+
+class EncodeFailureTests(TransportTestCase):
+    """A frame the engine cannot encode is a bug, not a reason to stop the war.
+
+    `encode` raises TypeError, not ProtocolError, for a non-dataclass or a value
+    json cannot serialise, and the send sites are outside the try/except that
+    guards the handler and tick calls themselves.
+    """
+
+    tick_period = 0.01
+
+    async def test_an_unencodable_tick_frame_does_not_stop_the_clock(self) -> None:
+        client = await self.client()
+        await self.hello(client)
+        self.engine.tick_frames = [None]  # type: ignore[list-item]
+        with self.assertLogs("campaign.server", level="ERROR"):
+            before = self.engine.ticks
+            await self.wait_for(
+                lambda: self.engine.ticks > before + 3, "ticks after an unsendable frame"
+            )
+
+    async def test_shutdown_still_runs_after_an_unencodable_tick_frame(self) -> None:
+        client = await self.client()
+        await self.hello(client)
+        self.engine.tick_frames = [None]  # type: ignore[list-item]
+        with self.assertLogs("campaign.server", level="ERROR"):
+            await self.wait_for(lambda: self.engine.ticks > 2, "a tick past the bad frame")
+        # close() awaits the tick task; a stored exception coming back out of
+        # here would propagate through __main__'s finally and skip the save.
+        await self.server.close()
+        self.assertEqual(self.engine.disconnects, 1)
+
+    async def test_the_rest_of_a_batch_survives_an_unencodable_frame(self) -> None:
+        client = await self.client()
+        await self.hello(client)
+        self.engine.tick_frames = [
+            None,  # type: ignore[list-item]
+            Message(seq=99, t=0.0, to="blue", text="the rest of the batch"),
+        ]
+        with self.assertLogs("campaign.server", level="ERROR"):
+            frame = await client.recv()
+        self.assertIsInstance(frame, Message)
+        self.assertEqual(frame.text, "the rest of the batch")
+
+
+class DispatchEncodeFailureTests(TransportTestCase):
+    async def test_an_unencodable_handler_frame_does_not_kill_the_connection(self) -> None:
+        client = await self.client()
+        await self.hello(client)
+        self.engine.state_frames = [None]  # type: ignore[list-item]
+        with self.assertLogs("campaign.server", level="ERROR"):
+            await client.send(StateReport(seq=2, t=30.0, groups=[]))
+            await self.wait_for(lambda: self.engine.frames_of("state"), "the doomed reply")
+            await asyncio.sleep(0.05)
+        await client.send(Event(seq=3, t=31.0, kind="shot"))
+        await self.wait_for(
+            lambda: self.engine.frames_of("event"), "the connection still serving"
+        )
+
+
+class WedgedClientTests(TransportTestCase):
+    """A DCS that stopped reading must not lock out the one replacing it.
+
+    `transport.close()` defers `connection_lost` until the write buffer drains,
+    which a client that has stopped reading never lets happen. Everything that
+    waits on `_Connection.closed` then waits forever: the displacing client's
+    handler, and `close()` itself.
+    """
+
+    tick_period = 0.01
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.flooding = False
+
+    def _backed_up(self) -> bool:
+        conn = self.server._conn
+        return conn is not None and conn.writer.transport.get_write_buffer_size() > 0
+
+    async def _wedge(self) -> None:
+        """Attach a client that never reads, and stuff the engine's write buffer.
+
+        The flood has to keep coming: one large write is swallowed whole by the
+        loopback stack, and it is an *outstanding* write that makes a graceful
+        close defer forever.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+        self.addCleanup(sock.close)
+        sock.connect(("127.0.0.1", self.server.port))
+        sock.sendall(
+            encode(Hello(seq=1, t=0.0, protocol=PROTOCOL_VERSION, theater="Syria"))
+        )
+        await self.wait_for(lambda: self.server.connected, "the deaf client")
+        batch = [
+            Message(seq=n, t=0.0, to="blue", text="x" * 40_000) for n in range(1, 21)
+        ]
+        self.engine.tick = (  # type: ignore[method-assign]
+            lambda now: list(batch) if self.flooding else []
+        )
+        self.flooding = True
+        await self.wait_for(self._backed_up, "the deaf client's socket to back up")
+
+    async def test_a_deaf_client_is_displaced_by_the_next_one(self) -> None:
+        await self._wedge()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await self.client()
+        await self.wait_for(
+            lambda: self.engine.disconnects == 1, "the deaf client to be let go"
+        )
+        elapsed = loop.time() - started
+        self.flooding = False
+        # Displacement is bounded by a timeout so a wedged predecessor can never
+        # lock the sim out entirely; aborting makes it immediate. Anything near
+        # that bound means the graceful close is back.
+        self.assertLess(elapsed, 2.0, "displacement waited on a drain")
+
+    async def test_close_completes_with_a_deaf_client_attached(self) -> None:
+        await self._wedge()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await self.server.close()
+        elapsed = loop.time() - started
+        self.flooding = False
+        self.assertLess(elapsed, 2.0, "close waited on a drain")
+        self.assertFalse(self.server.connected)
+
+
+class ServeForeverTests(TransportTestCase):
+    """Cancelling `serve_forever` must tear down, not deadlock.
+
+    `asyncio.Server.serve_forever()` answers cancellation by awaiting
+    `wait_closed()`, which since 3.12 waits for every connection handler --
+    and this server's handler only ends when the client socket does. Delegating
+    to it meant Ctrl-C with DCS attached hung, the operator killed the process,
+    and every sortie since the last disconnect was lost.
+    """
+
+    async def test_cancelling_serve_forever_tears_down_a_live_client(self) -> None:
+        task = asyncio.create_task(self.server.serve_forever())
+        client = await self.client()
+        await self.hello(client)
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=TIMEOUT)
+        self.assertEqual(done, {task}, "serve_forever did not return after cancel")
+        self.assertTrue(task.cancelled())
+        self.assertFalse(self.server.connected)
+        self.assertEqual(self.engine.disconnects, 1)
+
+    async def test_close_releases_serve_forever(self) -> None:
+        task = asyncio.create_task(self.server.serve_forever())
+        client = await self.client()
+        await self.hello(client)
+        await self.server.close()
+        done, _ = await asyncio.wait({task}, timeout=TIMEOUT)
+        self.assertEqual(done, {task}, "serve_forever did not return after close")
+        self.assertIsNone(task.exception())
 
 
 class ShutdownTests(TransportTestCase):

@@ -251,6 +251,33 @@ class TestReconnect(unittest.TestCase):
         campaign.inventories["blue"].squadron(SQUADRON).check_invariant()
 
 
+class TestTheHarnessDoesNotHideItsOwnFailures(unittest.TestCase):
+    """A bug in the stand-in must not read as a dropped connection.
+
+    `_sim_loop` treats a finished reader task as "the engine hung up" and
+    `run()` reconnects, so an exception inside the reader produced a run that
+    silently lost frames and still exited 0 -- which is the one thing a harness
+    whose whole job is to be the reference implementation may not do.
+
+    The case that triggered it is ordinary: a flight that dies while the engine
+    is despawning it, with the destroyed group lingering in the census for more
+    than one report.
+    """
+
+    def test_despawning_an_already_expired_group_leaves_the_reader_alive(self):
+        with self.assertNoLogs("fake_dcs", level="ERROR"):
+            campaign, sim = run_loop(dead_linger=3, flight_losses=2)
+        self.assertEqual(sim.sent["hello"], 1, "the harness reconnected mid-run")
+        self.assertEqual(
+            sim.sent["ack"],
+            sim.received["spawn"] + sim.received["despawn"],
+            "the client stopped acking part-way through",
+        )
+        package = next(iter(campaign.packages.values()))
+        self.assertIn(package.state, ("destroyed", "complete"))
+        self.assertTrue(campaign.tracker.losses, "no losses reached the ledger")
+
+
 class TestDeterminism(unittest.TestCase):
     def test_two_identical_runs_produce_the_same_campaign(self):
         a, _ = run_loop()

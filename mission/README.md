@@ -36,7 +36,13 @@ contains lines that sanitise `os`, `io` and `lfs`, and lines that set
 Comment out the lines for the pieces the client needs:
 
 - `require` and `package` — **required**, this is how `socket` is loaded
-- `lfs` — recommended, it lets the client find the LuaSocket DLL DCS ships
+- `lfs` — **required** too, despite appearances. A bare `require("socket")`
+  fails, because LuaSocket is not on the mission environment's `package.path`,
+  and `lfs.currentdir()` is how the client names the directory DCS ships it in.
+  There is a fallback that guesses the same directory relative to the working
+  one, but it only works when DCS was started from its own install directory.
+  Without `lfs` the likely outcome is `LuaSocket is unavailable` on every
+  attempt, forever.
 - `io` and `os` — **not needed**. Leave these sanitised. The client does not
   read files and does not read a clock: `os.time()` would make the campaign's
   `mission_start_epoch` depend on the host's timezone, so it computes the date
@@ -76,7 +82,7 @@ Keep the two `.lua` files wherever you like and load them from a trigger.
 In the Mission Editor, add **one** trigger:
 
 - **Type:** `4 MISSION START`
-- **Condition:** `TIME MORE (1)`
+- **Condition:** *none*
 - **Actions**, in this order:
   1. `DO SCRIPT` → `dofile("C:\\dcs-campaign-engine\\mission\\json.lua")`
   2. `DO SCRIPT` → `dofile("C:\\dcs-campaign-engine\\mission\\campaign_client.lua")`
@@ -88,13 +94,25 @@ Option B instead, which does not need it.
 ### Option B — embed in the mission (shipping)
 
 - **Type:** `4 MISSION START`
-- **Condition:** `TIME MORE (1)`
+- **Condition:** *none*
 - **Actions**, in this order:
   1. `DO SCRIPT FILE` → `json.lua`
   2. `DO SCRIPT FILE` → `campaign_client.lua`
 
 `DO SCRIPT FILE` copies the file into the `.miz` at save time. Re-add the file
 after every edit, or the mission keeps running the stale copy embedded earlier.
+
+### Leave the condition empty
+
+Both recipes above say **no condition**, and that is deliberate. A
+`4 MISSION START` rule is evaluated once, at mission start, when the model
+clock is still zero — so adding `TIME MORE (1)` makes it false at the only
+instant it is ever tested, and the `DO SCRIPT` actions never run at all. The
+symptom is not an error: it is nothing whatsoever in `dcs.log`.
+
+If you would rather use a time condition, the other consistent pairing is
+**Type** `1 ONCE` with **Condition** `TIME MORE (1)`. Pick one or the other;
+combining them is the one arrangement that cannot work.
 
 ### Load order is not optional
 
@@ -162,9 +180,11 @@ So:
 
 - Desanitise on a machine where you accept that risk, ideally one dedicated to
   this campaign, and not on one that holds anything you care about.
-- Comment out only what you need. `require` and `package` are required;
-  `lfs` is convenient; **leave `io` and `os` sanitised** — this client does not
-  use them.
+- Comment out only what you need. `require`, `package` and `lfs` are all three
+  required — `lfs` is how the client reaches LuaSocket at all, so it is not the
+  optional one it looks like. **Leave `io` and `os` sanitised**: this client
+  does not use them, and they are the two that turn a hostile `.miz` into
+  arbitrary file access.
 - Re-comment the block before you play someone else's mission, or keep a
   sanitised install alongside and only run the campaign on the other.
 - Check the file after every DCS update. Updates restore it, and they do it
@@ -241,9 +261,9 @@ These are deliberate for the first vertical slice, not oversights:
 
 | symptom | cause |
 |---|---|
-| `LuaSocket is unavailable` in `dcs.log` | `MissionScripting.lua` not desanitised, or a DCS update reverted it |
+| `LuaSocket is unavailable` in `dcs.log` | `MissionScripting.lua` not desanitised, or a DCS update reverted it — check `lfs` specifically, since desanitising only `require` and `package` produces exactly this and nothing else |
 | `engine not reachable ... retrying` | the engine is not listening on 7777; the client keeps retrying, the mission is unaffected |
 | `load mission/json.lua before this file` | trigger actions are in the wrong order |
 | `unknown template: X` in an `ack` | the engine asked for a template that is not in `TEMPLATES` |
 | `engine speaks protocol N` | version mismatch; the engine closes the connection and the client backs off to `reconnect_max` |
-| nothing at all in `dcs.log` | the trigger never fired — check it is `MISSION START` with `TIME MORE (1)` |
+| nothing at all in `dcs.log` | the trigger never fired — a `MISSION START` rule must carry **no condition**; `TIME MORE (1)` is false at mission start and the rule is never evaluated again |

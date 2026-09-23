@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -55,17 +57,30 @@ class _Persisting:
         self.persist()
 
     def persist(self) -> None:
+        """Write the campaign out, via a temp file and an atomic rename.
+
+        This runs on every DCS disconnect, so an interrupted write is not a rare
+        event -- and a save is truncated before it is rewritten, so the naive
+        version leaves a zero-length `campaign.json` that the next start cannot
+        load. `os.replace` makes the previous save survive anything up to and
+        including the process being killed mid-write.
+        """
         saver = getattr(self._engine, "save", None)
         if saver is None:
             logging.getLogger("campaign").warning(
                 "engine has no save(path); campaign state will not persist"
             )
             return
+        # Same directory, so the replace is a rename within one filesystem.
+        staging = self._save.with_name(self._save.name + ".partial")
         try:
-            saver(self._save)
+            saver(staging)
+            os.replace(staging, self._save)
             logging.getLogger("campaign").info("campaign saved to %s", self._save)
         except Exception:
             logging.getLogger("campaign").exception("saving to %s failed", self._save)
+            with contextlib.suppress(OSError):
+                staging.unlink()
 
 
 def _load_engine_factory(spec: str) -> CampaignEngine:
@@ -139,6 +154,21 @@ def main(argv: list[str] | None = None) -> int:
             "Pass --engine module:callable to run against another implementation.",
             file=sys.stderr,
         )
+        return 2
+    except (ValueError, KeyError, TypeError) as exc:
+        # json.JSONDecodeError is a ValueError; a save from another format
+        # version raises ValueError, and a truncated one KeyError. All three
+        # mean the same thing to an operator, and a bare traceback tells them
+        # nothing about what to do next.
+        print(
+            f"cannot read the campaign save at {args.save}: {exc}\n"
+            "The file is corrupt or from an incompatible save version. Move it "
+            "aside to start a new campaign, or restore a backup.",
+            file=sys.stderr,
+        )
+        return 2
+    except OSError as exc:
+        print(f"cannot read the campaign save at {args.save}: {exc}", file=sys.stderr)
         return 2
     args.save.parent.mkdir(parents=True, exist_ok=True)
     try:
