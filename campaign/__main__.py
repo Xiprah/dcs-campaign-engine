@@ -1,0 +1,115 @@
+"""``python -m campaign`` - start the campaign engine and listen for DCS.
+
+This module is wiring only. It parses arguments, builds an engine, and hands it
+to :mod:`campaign.server`. The one interesting line is marked INTEGRATION SEAM.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import sys
+from pathlib import Path
+
+from campaign.api import CampaignEngine
+from campaign.server import DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TICK_PERIOD, CampaignServer
+
+DEFAULT_SAVE = Path("saves/campaign.json")
+
+
+# ---------------------------------------------------------------------------
+# INTEGRATION SEAM
+# ---------------------------------------------------------------------------
+# The transport has no idea what a campaign is, and must not learn. This is the
+# only place in the process that names the concrete implementation. Replace the
+# body; keep the signature. Anything satisfying campaign.api.CampaignEngine
+# works, which is also how tests and tools/fake_dcs.py stay honest.
+def build_engine(save: Path) -> CampaignEngine:
+    """Load the campaign from `save`, or start a new one if it is absent."""
+    from campaign.campaign import Campaign  # INTEGRATION SEAM: the real brain
+
+    return Campaign.load(save) if save.exists() else Campaign.new(save)
+
+
+# ---------------------------------------------------------------------------
+
+
+def _load_engine_factory(spec: str) -> CampaignEngine:
+    """Build an engine from a ``module:callable`` spec (tests and harnesses)."""
+    module_name, _, attr = spec.partition(":")
+    if not module_name or not attr:
+        raise SystemExit(f"--engine wants 'module:callable', got {spec!r}")
+    from importlib import import_module
+
+    return getattr(import_module(module_name), attr)()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m campaign",
+        description="Dynamic campaign engine for DCS World. Listens; DCS connects out.",
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help="bind address")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="bind port")
+    parser.add_argument(
+        "--save", type=Path, default=DEFAULT_SAVE, help="campaign save file (JSON)"
+    )
+    parser.add_argument(
+        "--tick-period",
+        type=float,
+        default=DEFAULT_TICK_PERIOD,
+        help="seconds between engine ticks",
+    )
+    parser.add_argument(
+        "--engine",
+        default=None,
+        help="override the integration seam with a 'module:callable' factory",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="logging verbosity",
+    )
+    return parser.parse_args(argv)
+
+
+async def _run(args: argparse.Namespace, engine: CampaignEngine) -> None:
+    server = CampaignServer(
+        engine, host=args.host, port=args.port, tick_period=args.tick_period
+    )
+    try:
+        await server.serve_forever()
+    finally:
+        await server.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+    try:
+        engine = (
+            _load_engine_factory(args.engine) if args.engine else build_engine(args.save)
+        )
+    except ImportError as exc:
+        print(
+            f"cannot build a campaign engine: {exc}\n"
+            "The integration seam in campaign/__main__.py is not wired up yet. "
+            "Pass --engine module:callable to run against another implementation.",
+            file=sys.stderr,
+        )
+        return 2
+    args.save.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        asyncio.run(_run(args, engine))
+    except KeyboardInterrupt:
+        logging.getLogger("campaign").info("interrupted; campaign state is on disk")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
