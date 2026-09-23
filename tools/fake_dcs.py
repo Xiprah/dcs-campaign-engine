@@ -102,7 +102,7 @@ class Config:
     seed: int = 1
     step: float = 1.0
     speed: float = 60.0
-    duration: float = 2400.0
+    duration: float = 3600.0
     connect_timeout: float = 10.0
     max_reconnects: int = 3
     observer_from: tuple[float, float] = INCIRLIK_XZ
@@ -328,9 +328,13 @@ class FakeDCS:
     async def _on_despawn(self, frame: Despawn) -> None:
         group = self.groups.get(frame.spawn_id)
         if group is not None:
-            # The spec requires ground truth to reach the engine before the
-            # entity stops existing, so the loss can never be lost with it.
-            await self._send_state(only=[group])
+            # Ground truth has to reach the engine before the entity stops
+            # existing, so a loss can never be lost with it -- and it has to
+            # be the *whole* census. A `state` frame is every instantiated
+            # entity (docs/protocol.md); a report listing only the group being
+            # despawned tells the engine that everything else disappeared, and
+            # it will correctly write off a flight that is still flying.
+            await self._send_state()
             del self.groups[frame.spawn_id]
             log.info("despawned %s (%s)", group.name, frame.reason or "no reason given")
         await self._ack(frame.ref, True)
@@ -524,16 +528,16 @@ class FakeDCS:
             )
         )
 
-    async def _send_state(self, only: list[SimGroup] | None = None) -> None:
-        groups = only if only is not None else list(self.groups.values())
+    async def _send_state(self) -> None:
+        """One complete census of everything instantiated. Never a subset."""
         snapshots: list[GroupSnapshot] = []
         expired: list[str] = []
-        for group in groups:
+        for group in list(self.groups.values()):
             if not group.alive:
                 if group.dead_reports >= self.cfg.dead_linger:
                     continue
                 group.dead_reports += 1
-                if group.dead_reports >= self.cfg.dead_linger and only is None:
+                if group.dead_reports >= self.cfg.dead_linger:
                     expired.append(group.spawn_id)
             snapshots.append(
                 GroupSnapshot(
@@ -726,7 +730,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
     p.add_argument("--restart-gap", type=float, default=15.0, help="mission seconds offline")
     p.add_argument("--restart-keeps-clock", action="store_true",
                    help="do not reset mission time on reconnect (a net drop, not a sim restart)")
-    p.add_argument("--duration", type=float, default=2400.0, help="mission seconds to simulate")
+    p.add_argument("--duration", type=float, default=3600.0,
+                   help="mission seconds to simulate; the slice's own strike needs "
+                        "about 2600 to take off, hit and land again")
     p.add_argument("--step", type=float, default=1.0, help="simulation step, mission seconds")
     p.add_argument("--speed", type=float, default=60.0,
                    help="mission seconds per wall second; 0 runs flat out")

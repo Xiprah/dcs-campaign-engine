@@ -197,7 +197,11 @@ end
 ---
 --- Group name first, because that is what spawn_id maps to. Unit names
 --- inside an engine-owned group are `cmp_<id>_<n>`, which the engine
---- cannot resolve back to a spawn_id; the group name it can.
+--- cannot resolve back to a spawn_id; the group name it can. A static
+--- object has no group, so the numbering is stripped here instead --
+--- without it every event about a multi-object target would arrive under a
+--- name the engine owns nothing by, and the loss it explains would be
+--- recorded as unattributed.
 local function object_name(obj)
     if not obj then return nil end
     if obj.getGroup then
@@ -207,7 +211,12 @@ local function object_name(obj)
             if n then return n end
         end
     end
-    return try(obj.getName, obj)
+    local name = try(obj.getName, obj)
+    if type(name) == "string" then
+        local stem = string.match(name, "^(.*)_%d+$")
+        if stem and is_owned(stem) then return stem end
+    end
+    return name
 end
 
 --- Days from 1970-01-01 for a proleptic Gregorian date.
@@ -442,12 +451,25 @@ local TEMPLATES = {
         skill = "High",
         payload = DEFAULT_PAYLOAD,
     },
-    -- The red strategic target: a static object, so it has no route and no
-    -- task. State snapshots report it as one unit, alive or not.
-    ["target_fuel_depot"] = {
+    -- The red strategic target. Statics have no route and no task.
+    --
+    -- The name is the one the engine puts on the wire
+    -- (campaign/theater.py: Target.template); a key that does not match it
+    -- makes every spawn of the target fail its ack, which the engine treats
+    -- as a bad template and never retries.
+    --
+    -- `count` matters just as much: DCS statics are one object each, but the
+    -- engine models this depot as four units and reads unit counts from
+    -- snapshots. A single object reporting `units = 1` against
+    -- `units_initial = 4` would book three losses the instant the depot
+    -- spawned, and the campaign would think it was three-quarters flattened
+    -- before anyone dropped anything on it.
+    ["fuel_depot_medium"] = {
         static = true,
         unit_type = "Tank",
         static_category = "Fortifications",
+        count = 4,
+        spread = 60,
     },
 }
 
@@ -485,10 +507,12 @@ local function build_route(spawn)
         return {points = points}
     end
 
+    local attack_at = nil
     for i = 1, #route do
         local wp = route[i]
         local x, y, alt = pos_xy(wp.pos)
         local kind = WAYPOINT_ACTIONS[wp.action] or WAYPOINT_ACTIONS.turning_point
+        if wp.action == "attack" and not attack_at then attack_at = i end
         points[i] = {
             x = x,
             y = y,
@@ -504,10 +528,15 @@ local function build_route(spawn)
         }
     end
 
-    return {points = points}
+    return {points = points, attack_at = attack_at}
 end
 
---- Attach a best-effort attack task to the last waypoint.
+--- Attach a best-effort attack task to the waypoint the engine marked
+--- `attack`, falling back to the last one.
+---
+--- Which waypoint this lands on is not cosmetic. The engine's strike route
+--- is ingress, target, home, so hanging the task on the last point tasks the
+--- flight to attack *after* it has landed, and nothing is ever struck.
 ---
 --- `tasking.tot` is deliberately ignored. The engine owns the schedule and
 --- expresses it by choosing when to send the spawn, so honouring a TOT here
@@ -523,8 +552,8 @@ local function attach_tasking(route, tasking)
     local target = tasking.target
     if type(target) ~= "string" or #route.points == 0 then return end
 
-    local last = route.points[#route.points]
-    local tasks = last.task.params.tasks
+    local waypoint = route.points[route.attack_at or #route.points]
+    local tasks = waypoint.task.params.tasks
 
     local grp = try(Group.getByName, target)
     if grp and try(grp.isExist, grp) then
@@ -539,7 +568,10 @@ local function attach_tasking(route, tasking)
     end
 
     -- Statics cannot be an AttackGroup target, so bomb the point instead.
+    -- A multi-object static template numbers its objects, so the bare
+    -- spawn-id name may not resolve; the first object is the aim point.
     local stat = try(StaticObject.getByName, target)
+                 or try(StaticObject.getByName, target .. "_1")
     local point = stat and try(stat.getPoint, stat)
     if point then
         tasks[#tasks + 1] = {
@@ -557,12 +589,29 @@ local function attach_tasking(route, tasking)
     end
 end
 
-local function build_group_data(spawn, tmpl, name)
+--- How many units this spawn actually brings.
+---
+--- The template decides, except that the engine may know better: a flight
+--- that has already lost a wingman carries `tasking.units`, and honouring it
+--- is what stops a bubble re-entry from quietly handing the campaign back an
+--- aircraft it has already written off. Clamped to the template so a bad
+--- number cannot conjure a twelve-ship out of a two-ship template.
+local function unit_count_for(tmpl, tasking)
+    local count = tmpl.count or 1
+    if type(tasking) == "table" and type(tasking.units) == "number" then
+        local wanted = math.floor(tasking.units)
+        if wanted >= 1 and wanted < count then return wanted end
+    end
+    return count
+end
+
+
+local function build_group_data(spawn, tmpl, name, count)
     local units = {}
     local gx, gy, galt = pos_xy(spawn.position)
     local heading = tonumber(spawn.heading) or 0
 
-    for i = 1, (tmpl.count or 1) do
+    for i = 1, count do
         units[i] = {
             -- Unit names carry the prefix too, so anything that leaks into
             -- an event is still recognisably ours even though the engine
@@ -600,8 +649,18 @@ local function build_group_data(spawn, tmpl, name)
     }
 end
 
-local function build_static_data(spawn, tmpl, name)
+--- One object of a possibly multi-object static template.
+--- `index` is 1-based; objects are laid out on a ring so they are separate
+--- aim points rather than one stack a single bomb flattens.
+local function build_static_data(spawn, tmpl, name, index)
     local x, y = pos_xy(spawn.position)
+    local count = tmpl.count or 1
+    if count > 1 then
+        local spread = tmpl.spread or 60
+        local angle = (2 * math.pi * (index - 1)) / count
+        x = x + spread * math.cos(angle)
+        y = y + spread * math.sin(angle)
+    end
     return {
         name = name,
         type = tmpl.unit_type,
@@ -639,46 +698,72 @@ local function handle_spawn(frame)
     end
 
     local name = group_name(sid)
-    local built, data, unit_count
+    local names = {name}
+    local unit_count = 1
 
     if tmpl.static then
-        built, data = pcall(build_static_data, frame, tmpl, name)
-        unit_count = 1
+        -- Several objects under one spawn_id: DCS has no static group, so the
+        -- engine's multi-unit target becomes N objects the client counts.
+        local count = tmpl.count or 1
+        names = {}
+        local failure = nil
+        for i = 1, count do
+            local member = (count > 1) and (name .. "_" .. i) or name
+            local built, data = pcall(build_static_data, frame, tmpl, member, i)
+            if not built then
+                failure = "bad spawn payload: " .. tostring(data)
+                break
+            end
+            local ok, err = pcall(coalition.addStaticObject, country_id, data)
+            if not ok then
+                failure = "addStaticObject failed: " .. tostring(err)
+                break
+            end
+            names[#names + 1] = member
+        end
+        if failure then
+            -- Unwind: a half-built target would report fewer units than the
+            -- engine issued, and the engine would book the difference as a
+            -- loss nobody caused.
+            for j = 1, #names do
+                local obj = try(StaticObject.getByName, names[j])
+                if obj then guard("destroy " .. names[j], obj.destroy, obj) end
+            end
+            log_err("spawn " .. sid .. ": " .. failure)
+            send_ack(frame.ref, false, failure)
+            return
+        end
+        unit_count = count
     else
         if maps.category[frame.category] == nil then
             send_ack(frame.ref, false, "unknown category: " .. tostring(frame.category))
             return
         end
-        built, data = pcall(build_group_data, frame, tmpl, name)
-        unit_count = built and #data.units or 0
-    end
-
-    if not built then
-        send_ack(frame.ref, false, "bad spawn payload: " .. tostring(data))
-        return
-    end
-
-    local ok, err
-    if tmpl.static then
-        ok, err = pcall(coalition.addStaticObject, country_id, data)
-    else
-        ok, err = pcall(coalition.addGroup, country_id, maps.category[frame.category], data)
-    end
-
-    if not ok then
-        log_err("spawn " .. sid .. ": " .. tostring(err))
-        send_ack(frame.ref, false, "addGroup failed: " .. tostring(err))
-        return
+        unit_count = unit_count_for(tmpl, frame.tasking)
+        local built, data = pcall(build_group_data, frame, tmpl, name, unit_count)
+        if not built then
+            send_ack(frame.ref, false, "bad spawn payload: " .. tostring(data))
+            return
+        end
+        local ok, err =
+            pcall(coalition.addGroup, country_id, maps.category[frame.category], data)
+        if not ok then
+            log_err("spawn " .. sid .. ": " .. tostring(err))
+            send_ack(frame.ref, false, "addGroup failed: " .. tostring(err))
+            return
+        end
     end
 
     S.spawns[sid] = {
         name = name,
+        names = names,
         units_initial = unit_count,
         category = tmpl.static and "static" or frame.category,
         coalition = frame.coalition,
     }
 
-    log_info("spawned " .. name .. " from " .. tostring(frame.template))
+    log_info("spawned " .. name .. " from " .. tostring(frame.template)
+             .. " (" .. unit_count .. " unit(s))")
     send_ack(frame.ref, true)
 end
 
@@ -688,8 +773,11 @@ end
 
 local function destroy_entity(rec)
     if rec.category == "static" then
-        local obj = try(StaticObject.getByName, rec.name)
-        if obj then guard("destroy " .. rec.name, obj.destroy, obj) end
+        local names = rec.names or {rec.name}
+        for i = 1, #names do
+            local obj = try(StaticObject.getByName, names[i])
+            if obj then guard("destroy " .. names[i], obj.destroy, obj) end
+        end
     else
         local grp = try(Group.getByName, rec.name)
         if grp then guard("destroy " .. rec.name, grp.destroy, grp) end
@@ -705,13 +793,21 @@ local function snapshot_of(sid, rec)
     }
 
     if rec.category == "static" then
-        local obj = try(StaticObject.getByName, rec.name)
-        if obj and try(obj.isExist, obj) then
-            local p = try(obj.getPoint, obj)
-            snap.alive = true
-            snap.units = 1
-            if p then snap.pos = json.array({p.x, p.y, p.z}) end
+        -- Count the objects that are still there. This is the whole reason a
+        -- multi-object template exists: it is what lets the engine see a
+        -- target half-flattened instead of only intact or gone.
+        local names = rec.names or {rec.name}
+        local alive, first = 0, nil
+        for i = 1, #names do
+            local obj = try(StaticObject.getByName, names[i])
+            if obj and try(obj.isExist, obj) then
+                alive = alive + 1
+                if not first then first = try(obj.getPoint, obj) end
+            end
         end
+        snap.units = alive
+        snap.alive = alive > 0
+        if first then snap.pos = json.array({first.x, first.y, first.z}) end
         return snap
     end
 

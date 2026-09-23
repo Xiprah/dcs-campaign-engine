@@ -14,14 +14,22 @@ events were delivered would make package schedules diverge between a run with
 events and a run without, and the whole point is that they cannot.
 
 **Determinism.** Nothing here reads a wall clock or an unseeded random source.
-Time enters through frame `t` and through `tick(now)`; chance enters through
-`self.rng`, whose full state round-trips through `save`/`load`. A campaign is
-therefore a pure function of its log, which is what makes a whole war
-replayable and a bug reproducible.
+Time enters through frame `t`; chance enters through `self.rng`, whose full
+state round-trips through `save`/`load`. A campaign is therefore a pure
+function of its log, which is what makes a whole war replayable and a bug
+reproducible. `tick(now)` is a bare pulse and its argument is deliberately
+unused -- see :meth:`Campaign.tick`.
+
+**Two clocks.** Frames carry *mission* time, which DCS resets to zero on every
+restart. The campaign runs on its own monotonic clock and rebases the mission
+clock onto it at each `hello` (:attr:`Campaign.mission_epoch`). Without that,
+a campaign 1200 seconds old meeting a freshly restarted mission would stand
+still until mission time caught up, losing exactly one restart's worth of war.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import random
 from pathlib import Path
@@ -115,8 +123,11 @@ class Campaign:
         self.tracker = AttritionTracker(vanish_grace=state_period)
         self.packages: dict[str, Package] = {}
 
-        #: Single non-decreasing campaign clock, in mission seconds.
+        #: Single non-decreasing campaign clock, in campaign seconds.
         self.clock: float = 0.0
+        #: Campaign time that the current connection's mission time zero maps
+        #: to. Re-derived at every `hello`, so a DCS restart costs nothing.
+        self.mission_epoch: float = 0.0
         self._spawn_counter: int = 0
         self._package_counter: int = 0
         self._out_seq: int = 1
@@ -152,13 +163,36 @@ class Campaign:
         self._out_seq += 1
         return seq
 
-    def _advance(self, t: float) -> None:
-        self.clock = max(self.clock, t)
+    def campaign_time(self, mission_t: float) -> float:
+        """Campaign seconds for a mission time carried by an inbound frame."""
+        return mission_t + self.mission_epoch
+
+    def mission_time(self, campaign_t: float | None = None) -> float:
+        """Mission seconds for a campaign time, for outbound frames.
+
+        Every `t` on the wire is mission time: docs/protocol.md defines the
+        envelope's `t` as `timer.getTime()`, and a client that has just
+        restarted has no idea what campaign time is.
+        """
+        clock = self.clock if campaign_t is None else campaign_t
+        return clock - self.mission_epoch
+
+    def _advance(self, mission_t: float) -> None:
+        self.clock = max(self.clock, self.campaign_time(mission_t))
+
+    def _rebase(self, frame: Any) -> Any:
+        """The same frame with its `t` moved from mission time to campaign time.
+
+        Everything downstream of the handlers -- the attrition ledger above
+        all -- reasons in campaign time. Converting once, here, keeps a DCS
+        restart from writing a loss timestamped before the losses it follows.
+        """
+        return dataclasses.replace(frame, t=self.campaign_time(frame.t))
 
     def _message(self, text: str, to: str | None = None) -> Message:
         return Message(
             seq=self._seq(),
-            t=self.clock,
+            t=self.mission_time(),
             to=to or self.player_coalition,
             text=text,
         )
@@ -179,6 +213,10 @@ class Campaign:
             raise ProtocolError(
                 f"client protocol {msg.protocol} != engine {PROTOCOL_VERSION}"
             )
+        # Rebase before advancing: the mission clock this client reports from
+        # is pinned to wherever the campaign has already got to, so the war
+        # neither jumps forward nor stalls while a restarted mission catches up.
+        self.mission_epoch = self.clock - msg.t
         self._advance(msg.t)
         self.connected = True
         # New connection, new frame stream: seq restarts and any ref still
@@ -190,7 +228,7 @@ class Campaign:
         frames: list[Downlink] = [
             Sync(
                 seq=self._seq(),
-                t=self.clock,
+                t=self.mission_time(),
                 campaign_time=self.clock,
                 protocol=PROTOCOL_VERSION,
                 state_period=self.state_period,
@@ -206,12 +244,43 @@ class Campaign:
                 self.live.discard(spawn_id)
                 continue
             frames.append(frame)
+        frames.extend(self._brief_open_packages())
+        return frames
+
+    def _brief_open_packages(self) -> list[Downlink]:
+        """Tell a client that has just arrived what is already in the air.
+
+        A package can be fragged before any client connects -- the engine runs
+        whether DCS does or not -- and the message that announced it went
+        nowhere, because there was no socket to write it to. Without this, the
+        player's picture of the war depends on whether the engine happened to
+        be started first.
+        """
+        frames: list[Downlink] = []
+        for package in sorted(self.packages.values(), key=lambda p: p.id):
+            if not package.is_open:
+                continue
+            target = self.theater.targets.get(package.target_id)
+            frames.append(
+                self._message(
+                    f"{package.callsign} on task: strike on "
+                    f"{target.name if target else package.target_id}, "
+                    f"TOT {self.mission_time(package.t_tot):.0f}."
+                )
+            )
         return frames
 
     def on_observer(self, msg: ObserverReport) -> list[Downlink]:
+        """Bubble input, and the campaign's heartbeat.
+
+        Observer frames are the densest thing on the wire that carries mission
+        time, so this is where the campaign actually moves. `tick` cannot be:
+        its cadence is wall time, and a mission running at any rate other than
+        1x would get a war that runs at a different rate than it does.
+        """
         self._advance(msg.t)
         self.observers = [o.pos for o in msg.observers]
-        return self._sync_bubble()
+        return self._pulse()
 
     def on_event(self, msg: Event) -> list[Downlink]:
         """Attribution only.
@@ -221,17 +290,17 @@ class Campaign:
         event stream would change the campaign, and the reconciliation rule
         would be a comment rather than a property.
         """
-        self.tracker.note_event(msg)
+        self.tracker.note_event(self._rebase(msg))
         return []
 
     def on_state(self, msg: StateReport) -> list[Downlink]:
         """Ground truth. The only path by which the campaign may lose anything."""
         self._advance(msg.t)
         frames: list[Downlink] = []
-        for loss in self.tracker.ingest(msg):
+        for loss in self.tracker.ingest(self._rebase(msg)):
             frames.extend(self._apply_loss(loss))
         frames.extend(self._close_out_dead_packages())
-        frames.extend(self._sync_bubble())
+        frames.extend(self._pulse())
         return frames
 
     def on_ack(self, msg: Ack) -> list[Downlink]:
@@ -250,7 +319,22 @@ class Campaign:
         return []
 
     def tick(self, now: float) -> list[Downlink]:
-        self._advance(now)
+        """Periodic work. `now` is read for nothing, on purpose.
+
+        `api.CampaignEngine.tick` documents `now` as monotonic wall seconds,
+        and the transport supplies exactly that. Wall seconds are not mission
+        seconds: DCS can be paused, time-compressed, or not running at all,
+        and the engine may be started long before the sim connects. Folding
+        `now` into the campaign clock made the first hour of a mission run in
+        the campaign's past whenever the engine was launched an hour early,
+        and made a time-compressed run's schedule depend on how fast the host
+        happened to be. Mission time arrives on frames; this is only the
+        prompt to act on it, so it stays safe to call at any cadence.
+        """
+        return self._pulse()
+
+    def _pulse(self) -> list[Downlink]:
+        """Walk packages forward, task a new one, reconcile the bubble."""
         frames: list[Downlink] = []
         frames.extend(self._advance_packages())
         frames.extend(self._plan())
@@ -321,7 +405,7 @@ class Campaign:
             return [
                 self._message(
                     f"{package.callsign} fragged: {package.flight_size}-ship strike "
-                    f"on {target.name}, TOT {package.t_tot:.0f}."
+                    f"on {target.name}, TOT {self.mission_time(package.t_tot):.0f}."
                 )
             ]
         return []
@@ -520,7 +604,15 @@ class Campaign:
         self.tracker.mark_removed(spawn_id)
         seq = self._seq()
         self.pending[seq] = (_DESPAWN, spawn_id)
-        return [Despawn(seq=seq, t=self.clock, ref=seq, spawn_id=spawn_id, reason=reason)]
+        return [
+            Despawn(
+                seq=seq,
+                t=self.mission_time(),
+                ref=seq,
+                spawn_id=spawn_id,
+                reason=reason,
+            )
+        ]
 
     def _spawn_rejected(self, spawn_id: str, error: str) -> list[Downlink]:
         """The client refused a spawn. Unwind rather than leak."""
@@ -573,7 +665,7 @@ class Campaign:
         self.pending[seq] = (_SPAWN, package.spawn_id)
         return Spawn(
             seq=seq,
-            t=self.clock,
+            t=self.mission_time(),
             ref=seq,
             spawn_id=package.spawn_id,
             coalition=squadron.coalition,
@@ -583,12 +675,14 @@ class Campaign:
             heading=heading,
             route=[
                 Waypoint(pos=pos, alt=alt, speed=speed, action=action)
-                for pos, alt, speed, action in package_route(base, target)
+                for pos, alt, speed, action in package_route(
+                    package, base, target, self.clock
+                )
             ],
             tasking={
                 "kind": "strike",
                 "target": group_name(target.spawn_id) if target.spawn_id else target.id,
-                "tot": package.t_tot,
+                "tot": self.mission_time(package.t_tot),
                 "callsign": package.callsign,
                 # The spawn frame has no unit-count field, but a flight that
                 # re-enters the bubble after losing a wingman must not come
@@ -602,7 +696,7 @@ class Campaign:
         self.pending[seq] = (_SPAWN, target.spawn_id)
         return Spawn(
             seq=seq,
-            t=self.clock,
+            t=self.mission_time(),
             ref=seq,
             spawn_id=target.spawn_id,
             coalition=target.coalition,
@@ -645,6 +739,7 @@ class Campaign:
             "seed": self.seed,
             "rng_state": [version, list(internal), gauss],
             "clock": self.clock,
+            "mission_epoch": self.mission_epoch,
             "spawn_counter": self._spawn_counter,
             "package_counter": self._package_counter,
             "out_seq": self._out_seq,
@@ -686,6 +781,7 @@ class Campaign:
         version, internal, gauss = raw["rng_state"]
         campaign.rng.setstate((version, tuple(internal), gauss))
         campaign.clock = float(raw["clock"])
+        campaign.mission_epoch = float(raw["mission_epoch"])
         campaign._spawn_counter = int(raw["spawn_counter"])
         campaign._package_counter = int(raw["package_counter"])
         campaign._out_seq = int(raw["out_seq"])

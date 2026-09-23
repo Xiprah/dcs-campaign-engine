@@ -44,6 +44,11 @@ DEPARTURE_ALLOWANCE = 420.0
 #: Fixed padding on the recovery leg for approach and rollout.
 RECOVERY_ALLOWANCE = 300.0
 
+#: Band the schedule-derived route speed is held inside. A flight re-spawned
+#: a few seconds before its TOT would otherwise be asked to fly at Mach 9.
+MIN_ROUTE_SPEED = 100.0
+MAX_ROUTE_SPEED = 300.0
+
 #: Package callsigns, drawn with the campaign's seeded RNG so a replayed log
 #: produces the same names as the original run.
 CALLSIGNS: tuple[str, ...] = (
@@ -272,17 +277,63 @@ def package_heading(package: Package, base: Airbase, target: Target, now: float)
     return bearing(target.pos, base.pos)
 
 
-def package_route(base: Airbase, target: Target) -> list[tuple[Vec3, float, float, str]]:
-    """Ingress, target and egress points as (pos, alt, speed, action) tuples.
+def _schedule_speed(distance: float, span: float) -> float:
+    """Ground speed that covers `distance` in `span` seconds, within reason."""
+    if span <= 0.0 or distance <= 0.0:
+        return CRUISE_SPEED
+    return min(MAX_ROUTE_SPEED, max(MIN_ROUTE_SPEED, distance / span))
+
+
+def package_route(
+    package: Package, base: Airbase, target: Target, now: float
+) -> list[tuple[Vec3, float, float, str]]:
+    """The legs still ahead of the flight at `now`, as (pos, alt, speed, action).
 
     Returned as plain tuples rather than protocol Waypoints so the planner
     stays a pure ATO module; the Campaign wraps them for the wire.
+
+    Two things a fixed base-target-base route gets wrong, both of which show
+    up as a flight thrashing in and out of the bubble:
+
+    * The route has to start where the flight *is*. The bubble re-instantiates
+      a flight wherever it happens to be on its paper track, and a route that
+      begins at the departure base sends it home again.
+    * The leg speeds have to be the ones the schedule implies, not the nominal
+      cruise speed. `CRUISE_SPEED` sizes the legs, but the departure and
+      recovery allowances then stretch the schedule around them, so a client
+      flying `CRUISE_SPEED` reaches the target minutes before the paper track
+      says it should. The engine then believes the flight is somewhere it is
+      not, and despawns it while the player is looking at it.
     """
-    return [
-        ((base.pos[0], CRUISE_ALTITUDE, base.pos[2]), CRUISE_ALTITUDE, CRUISE_SPEED, "turning_point"),
-        ((target.pos[0], CRUISE_ALTITUDE, target.pos[2]), CRUISE_ALTITUDE, CRUISE_SPEED, "attack"),
-        ((base.pos[0], CRUISE_ALTITUDE, base.pos[2]), CRUISE_ALTITUDE, CRUISE_SPEED, "landing"),
+    here = package_position(package, base, target, now)
+    base_point = (base.pos[0], CRUISE_ALTITUDE, base.pos[2])
+    legs: list[tuple[Vec3, float, float, str]] = [
+        (here, CRUISE_ALTITUDE, CRUISE_SPEED, "turning_point")
     ]
+    if now < package.t_tot:
+        target_point = (target.pos[0], CRUISE_ALTITUDE, target.pos[2])
+        legs.append(
+            (
+                target_point,
+                CRUISE_ALTITUDE,
+                _schedule_speed(
+                    ground_distance(here, target.pos), package.t_tot - now
+                ),
+                "attack",
+            )
+        )
+        egress_from, egress_span = target.pos, package.t_rtb - package.t_tot
+    else:
+        egress_from, egress_span = here, package.t_rtb - now
+    legs.append(
+        (
+            base_point,
+            CRUISE_ALTITUDE,
+            _schedule_speed(ground_distance(egress_from, base.pos), egress_span),
+            "landing",
+        )
+    )
+    return legs
 
 
 def estimated_mission_duration(base: Airbase, target: Target) -> float:
