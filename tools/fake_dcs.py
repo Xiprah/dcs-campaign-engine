@@ -41,7 +41,7 @@ import logging
 import math
 import random
 import sys
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -89,6 +89,8 @@ TARGET_XZ = (-3_000.0, 41_000.0)
 # per-unit types - belongs behind this map, not in the campaign.
 DEFAULT_AIR_UNITS = 2
 DEFAULT_GROUND_UNITS = 4
+#: Inbound frames handled per sim tick, mirroring the real client's cap.
+MAX_FRAMES_PER_TICK = 32
 _AIR_CATEGORIES = frozenset({"plane", "helicopter"})
 
 
@@ -189,6 +191,18 @@ class FakeDCS:
         self._write_lock = asyncio.Lock()
         self._sync: asyncio.Event = asyncio.Event()
         self._drop_now = False
+        # Inbound frames are queued here and handled at one fixed point in the
+        # sim tick, never straight off the socket. Handling them in the reader
+        # task raced the tick: `_on_despawn` sends a state snapshot, so the
+        # snapshot's `t` and contents depended on which coroutine the event
+        # loop happened to resume first. Events-on runs serialised themselves
+        # by accident (every `_emit_event` is an await) while --drop-events
+        # did not, so two identical no-event runs could disagree and the save
+        # differ blamed the event stream for what was really a harness race.
+        # It is also what the real client does: DCS Lua drains its socket
+        # inside timer.scheduleFunction, and cannot have a reader running
+        # concurrently with its own tick.
+        self._inbox: deque[Downlink] = deque()
         self._observer_pos = [cfg.observer_from[0], cfg.observer_alt, cfg.observer_from[1]]
         self._next_state = 0.0
         self._next_observer = 0.0
@@ -243,7 +257,18 @@ class FakeDCS:
                     return
                 self.received[frame.type] += 1
                 log.debug("<- %s", frame)
-                await self._handle(frame)
+                self._inbox.append(frame)
+
+    async def _drain_inbox(self) -> None:
+        """Handle queued downlink frames at a fixed point in the tick.
+
+        The real client caps this per tick and lets a backlog grow rather than
+        hitch the sim; the cap here exists to keep that behaviour honest.
+        """
+        for _ in range(MAX_FRAMES_PER_TICK):
+            if not self._inbox:
+                return
+            await self._handle(self._inbox.popleft())
 
     async def _handle(self, frame: Downlink) -> None:
         if isinstance(frame, Sync):
@@ -593,6 +618,7 @@ class FakeDCS:
         # DCS restarted: the client owns no persistent state, and the engine
         # re-issues every spawn that should be live.
         self.groups.clear()
+        self._inbox.clear()
         reader_task = asyncio.create_task(self._reader_loop(reader), name="fake-dcs-reader")
         try:
             await self._send(
@@ -605,9 +631,16 @@ class FakeDCS:
                     mission_start_epoch=self.cfg.epoch,
                 )
             )
-            try:
-                await asyncio.wait_for(self._sync.wait(), timeout=10.0)
-            except TimeoutError:
+            # Sync arrives through the inbox like everything else, so the
+            # handshake has to drain rather than wait on the event alone.
+            for _ in range(1000):
+                await self._drain_inbox()
+                if self._sync.is_set():
+                    break
+                if reader_task.done():
+                    raise SystemExit("engine hung up before answering hello")
+                await asyncio.sleep(0.01)
+            else:
                 raise SystemExit("engine never answered hello with sync")
             if self.finished:
                 return "done"
@@ -641,6 +674,7 @@ class FakeDCS:
             if reader_task.done():
                 return "closed"
             self.t += cfg.step
+            await self._drain_inbox()
             self._move_observer(cfg.step)
             await self._fly(cfg.step)
             await self._resolve_strikes()

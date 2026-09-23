@@ -33,6 +33,7 @@ from campaign.audit import attributions, strip_event_derived
 from campaign.campaign import Campaign
 from campaign.planner import COMPLETE
 from campaign.server import CampaignServer
+from campaign.protocol import Message, encode
 from tools.fake_dcs import Config, FakeDCS
 
 #: Long enough for the slice's own strike to take off, hit and land again.
@@ -278,10 +279,82 @@ class TestTheHarnessDoesNotHideItsOwnFailures(unittest.TestCase):
         self.assertTrue(campaign.tracker.losses, "no losses reached the ledger")
 
 
+class TestTheReaderNeverActsOnItsOwn(unittest.TestCase):
+    """Inbound frames are handled at one point in the tick, never off the socket.
+
+    The bug this guards: `_reader_loop` used to call `_handle` directly, and
+    `_on_despawn` sends a state snapshot. That snapshot therefore raced the sim
+    tick, and its `t` and contents depended on which coroutine the event loop
+    resumed first. Every `_emit_event` is an await, so runs with events
+    serialised themselves by accident and looked deterministic; --drop-events
+    removed those awaits and exposed the race. Two identical silent runs then
+    disagreed and diff_saves reported RECONCILIATION BROKEN -- blaming the
+    event stream for a fault that had nothing to do with reconciliation, on the
+    one command the README gives you to validate the core invariant.
+
+    It is also a fidelity bug. The real client cannot do this: DCS Lua drains
+    its socket inside timer.scheduleFunction and has no concurrent reader.
+    """
+
+    @staticmethod
+    def _read(frames, then_drain: bool = False):
+        """Feed `frames` through the reader; optionally drain afterwards."""
+
+        async def go():
+            sim = FakeDCS(Config())
+            handled = []
+
+            async def record(frame):
+                handled.append(frame)
+
+            sim._handle = record
+            reader = asyncio.StreamReader()
+            for frame in frames:
+                reader.feed_data(encode(frame))
+            reader.feed_eof()
+            await sim._reader_loop(reader)
+            queued = len(sim._inbox)
+            if then_drain:
+                await sim._drain_inbox()
+            return queued, handled, len(sim._inbox)
+
+        return asyncio.run(go())
+
+    def test_reading_a_frame_queues_it_and_handles_nothing(self):
+        queued, handled, _ = self._read(
+            [
+                Message(seq=1, t=0.0, to="blue", text="one"),
+                Message(seq=2, t=0.0, to="blue", text="two"),
+            ]
+        )
+        self.assertEqual(handled, [], "the reader handled a frame off the socket")
+        self.assertEqual(queued, 2, "frames did not reach the inbox")
+
+    def test_draining_is_what_hands_frames_over(self):
+        _, handled, left = self._read(
+            [Message(seq=1, t=0.0, to="blue", text="one")], then_drain=True
+        )
+        self.assertEqual(len(handled), 1)
+        self.assertEqual(left, 0)
+
+
 class TestDeterminism(unittest.TestCase):
     def test_two_identical_runs_produce_the_same_campaign(self):
         a, _ = run_loop()
         b, _ = run_loop()
+        self.assertEqual(a.to_dict(), b.to_dict())
+
+    def test_the_silent_run_is_deterministic_too(self):
+        """Determinism has to hold on the no-event path, not just the busy one.
+
+        Weaker than it looks, and deliberately kept anyway: in-process the
+        event loop schedules the same way every time, so this passed even with
+        the socket race described in TestTheReaderNeverActsOnItsOwn below. The
+        race only showed cross-process. This asserts the invariant; the test
+        below is the one that catches the regression.
+        """
+        a, _ = run_loop(drop_events=True)
+        b, _ = run_loop(drop_events=True)
         self.assertEqual(a.to_dict(), b.to_dict())
 
     def test_wall_clock_time_before_the_sim_connects_changes_nothing(self):
