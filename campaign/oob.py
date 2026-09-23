@@ -80,6 +80,10 @@ class Squadron:
     coalition: Coalition
     airframe: str
     #: Client-side template name handed to DCS in a spawn frame.
+    #:
+    #: TODO(seam): real DCS unit-template fidelity -- correct loadouts, skill,
+    #: liveries and per-airframe group composition -- lives behind this name.
+    #: The slice treats it as an opaque string the client resolves.
     template: str
     home_base: str
     airframes_total: int

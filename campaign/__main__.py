@@ -29,10 +29,43 @@ def build_engine(save: Path) -> CampaignEngine:
     """Load the campaign from `save`, or start a new one if it is absent."""
     from campaign.campaign import Campaign  # INTEGRATION SEAM: the real brain
 
-    return Campaign.load(save) if save.exists() else Campaign.new(save)
+    return Campaign.load(save) if save.exists() else Campaign()
 
 
 # ---------------------------------------------------------------------------
+
+
+class _Persisting:
+    """Wraps an engine so the campaign is written to disk when DCS goes away.
+
+    `CampaignEngine` has no save hook and should not grow one: the campaign
+    does not know where it lives. The process entry point does, so the
+    file-path half of persistence belongs here.
+    """
+
+    def __init__(self, engine: CampaignEngine, save: Path) -> None:
+        self._engine = engine
+        self._save = save
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._engine, name)
+
+    def on_disconnect(self) -> None:
+        self._engine.on_disconnect()
+        self.persist()
+
+    def persist(self) -> None:
+        saver = getattr(self._engine, "save", None)
+        if saver is None:
+            logging.getLogger("campaign").warning(
+                "engine has no save(path); campaign state will not persist"
+            )
+            return
+        try:
+            saver(self._save)
+            logging.getLogger("campaign").info("campaign saved to %s", self._save)
+        except Exception:
+            logging.getLogger("campaign").exception("saving to %s failed", self._save)
 
 
 def _load_engine_factory(spec: str) -> CampaignEngine:
@@ -75,14 +108,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def _run(args: argparse.Namespace, engine: CampaignEngine) -> None:
+async def _run(args: argparse.Namespace, engine: _Persisting) -> None:
     server = CampaignServer(
         engine, host=args.host, port=args.port, tick_period=args.tick_period
     )
+    # Bind before anything is written: a busy port must not overwrite a live
+    # campaign with the empty one this process just built.
+    await server.start()
     try:
         await server.serve_forever()
     finally:
         await server.close()
+        engine.persist()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -105,9 +142,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     args.save.parent.mkdir(parents=True, exist_ok=True)
     try:
-        asyncio.run(_run(args, engine))
+        asyncio.run(_run(args, _Persisting(engine, args.save)))
     except KeyboardInterrupt:
-        logging.getLogger("campaign").info("interrupted; campaign state is on disk")
+        pass
+    except OSError as exc:
+        print(f"cannot listen on {args.host}:{args.port}: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 

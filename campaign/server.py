@@ -50,6 +50,23 @@ DEFAULT_TICK_PERIOD: Final = 1.0
 #: the cap, not a frame, so small reads keep a burst of legal frames legal.
 _READ_CHUNK: Final = 8192
 
+def _elapsed_clock() -> Callable[[], float]:
+    """Monotonic seconds since the server started, not since the host booted.
+
+    `api.CampaignEngine.tick` asks for monotonic seconds and says nothing about
+    the origin. `time.monotonic()` on Windows counts from boot, so an engine
+    that folds `tick(now)` into the same clock as a frame's mission-time `t`
+    would be shoved years into the future by the first tick. Starting at zero
+    keeps both inputs on the same scale and is still monotonic.
+    """
+    start = time.monotonic()
+
+    def now() -> float:
+        return time.monotonic() - start
+
+    return now
+
+
 _HANDLERS: Final[dict[type, str]] = {
     Hello: "on_hello",
     ObserverReport: "on_observer",
@@ -86,13 +103,13 @@ class CampaignServer:
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         tick_period: float = DEFAULT_TICK_PERIOD,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._engine = engine
         self._host = host
         self._port = port
         self._tick_period = tick_period
-        self._clock = clock
+        self._clock = clock if clock is not None else _elapsed_clock()
         self._server: asyncio.Server | None = None
         self._tick_task: asyncio.Task[None] | None = None
         self._conn: _Connection | None = None
@@ -194,7 +211,15 @@ class CampaignServer:
                     # dropping a mid-sortie connection over.
                     logger.debug("ignoring empty line from %s", conn.peer)
                     continue
-                frame = decode_uplink(raw)
+                try:
+                    frame = decode_uplink(raw)
+                except ProtocolError:
+                    raise
+                except Exception as exc:
+                    # protocol.py only converts a TypeError from the *outer*
+                    # dataclass into a ProtocolError; a malformed nested member
+                    # still escapes raw. Undecodable is undecodable.
+                    raise ProtocolError(f"undecodable frame: {exc!r}") from exc
                 await self._dispatch(conn, frame)
                 if not conn.alive:
                     return

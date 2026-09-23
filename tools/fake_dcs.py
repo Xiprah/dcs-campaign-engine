@@ -73,16 +73,20 @@ from campaign.protocol import (  # noqa: E402  (path bootstrap must run first)
 
 log = logging.getLogger("fake_dcs")
 
-# TODO(world): these are placeholders for the Syria map positions of Incirlik
-# and the target area near Bassel al-Assad. They only need to agree with the
-# engine's world model closely enough that the package starts inside the
-# bubble; --observer-from / --observer-to override them, and --chase keeps the
-# observer with the package once one exists.
-INCIRLIK_XZ = (-40000.0, -50000.0)
-TARGET_XZ = (-100000.0, 10000.0)
+# The observer is the only thing this harness positions itself, and the bubble
+# is computed from it, so these have to agree with the engine's world model.
+# They mirror campaign/theater.py's slice: the player starts at Incirlik and
+# flies toward the Latakia fuel depot. --observer-from / --observer-to override
+# them, and --chase keeps the observer with the package once one exists.
+# TODO(world): read these from the theater once the engine publishes one,
+# instead of keeping a second copy of the map here.
+INCIRLIK_XZ = (142_000.0, -38_000.0)
+TARGET_XZ = (-3_000.0, 41_000.0)
 
 #: Group sizes the protocol cannot tell us: `spawn` names a template, and in
 #: DCS the template decides how many units come with it.
+# TODO(templates): real DCS unit-template fidelity - loadouts, liveries, skill,
+# per-unit types - belongs behind this map, not in the campaign.
 DEFAULT_AIR_UNITS = 2
 DEFAULT_GROUND_UNITS = 4
 _AIR_CATEGORIES = frozenset({"plane", "helicopter"})
@@ -171,6 +175,7 @@ class FakeDCS:
         self.received: Counter[str] = Counter()
         self.outcomes: list[dict] = []
         self.messages: list[str] = []
+        self.struck: set[str] = set()
         self.restarted = False
         self.finished = False
         self.saw_spawn = False
@@ -268,7 +273,17 @@ class FakeDCS:
             frame.bubble_radius,
         )
 
-    def _units_for(self, template: str, category: str) -> int:
+    def _units_for(self, template: str, category: str, tasking: dict) -> int:
+        """How many units a spawn actually brings.
+
+        `spawn` has no unit-count field: in DCS the template decides. The
+        engine does put one in `tasking` when it knows better - a package that
+        already lost a jet comes back as a single-ship - and that is more
+        truthful than any template default, so it wins.
+        """
+        declared = tasking.get("units")
+        if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
+            return declared
         if template in self.cfg.template_units:
             return self.cfg.template_units[template]
         return self.cfg.air_units if category in _AIR_CATEGORIES else self.cfg.ground_units
@@ -277,7 +292,8 @@ class FakeDCS:
         if frame.spawn_id in self.groups:
             await self._ack(frame.ref, False, f"duplicate spawn_id: {frame.spawn_id}")
             return
-        units = self._units_for(frame.template, frame.category)
+        tasking = dict(frame.tasking)
+        units = self._units_for(frame.template, frame.category, tasking)
         group = SimGroup(
             spawn_id=frame.spawn_id,
             coalition=frame.coalition,
@@ -286,10 +302,14 @@ class FakeDCS:
             pos=list(frame.position),
             heading=frame.heading,
             route=list(frame.route),
-            tasking=dict(frame.tasking),
+            tasking=tasking,
             units=units,
             units_initial=units,
             born_at=self.t,
+            # An entity that already put its bombs on target does not do it
+            # again when the bubble re-instantiates it. spawn_id is stable for
+            # the life of the entity, so this survives a reconnect too.
+            resolved=frame.spawn_id in self.struck,
         )
         self.groups[frame.spawn_id] = group
         self.saw_spawn = True
@@ -321,6 +341,9 @@ class FakeDCS:
     # -- simulation --------------------------------------------------------
 
     def _advance_group(self, group: SimGroup, dt: float) -> None:
+        # TODO(ground war): ground groups walk their route exactly like aircraft
+        # here. A front line, contested movement and a logistics network all
+        # need this to become a real ground movement model.
         if not group.alive or group.landed:
             return
         remaining = dt
@@ -379,6 +402,10 @@ class FakeDCS:
                 continue
             tasking = group.tasking
             if tasking.get("kind") != "strike":
+                # TODO(packages): SEAD, escort, tanker and AWACS taskings land
+                # here as new `kind`s, each with its own resolution. Package
+                # deconfliction (who shoots first when two arrive together) is
+                # the engine's problem, not this loop's.
                 continue
             target_name = tasking.get("target")
             target_id = spawn_id_of(target_name) if isinstance(target_name, str) else None
@@ -392,6 +419,7 @@ class FakeDCS:
 
     async def _strike(self, flight: SimGroup, target: SimGroup | None, target_name: object) -> None:
         flight.resolved = True
+        self.struck.add(flight.spawn_id)
         cfg = self.cfg
         await self._emit_event(
             "shot",
@@ -436,6 +464,8 @@ class FakeDCS:
                 )
                 await self._emit_event("dead", initiator=flight.name)
                 ejected = self.rng.random() < 0.5
+                # TODO(pilots): pilot records - who ejected, who was captured,
+                # who flies again next sortie - hang off these two events.
                 await self._emit_event("eject" if ejected else "pilot_dead", initiator=flight.name)
 
         self.outcomes.append(
@@ -613,8 +643,9 @@ class FakeDCS:
                 return "restart"
             if self._writer is None:
                 return "closed"
-            if pause:
-                await asyncio.sleep(pause)
+            # Always yield, even at --speed 0: the reader task has to get a
+            # turn or downlink frames would never be processed.
+            await asyncio.sleep(pause)
         self.finished = True
         return "done"
 

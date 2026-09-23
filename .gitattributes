@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.py text eol=lf
+*.lua text eol=lf
+*.md text eol=lf
+*.miz binary
+*.jpg binary
+*.png binary
