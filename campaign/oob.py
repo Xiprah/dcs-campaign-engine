@@ -300,16 +300,23 @@ class SideInventory:
             squadron.check_invariant()
 
     def to_dict(self) -> dict[str, Any]:
+        # A list, not a dict keyed by id, because declaration order is load
+        # bearing: `find_capable` and `squadrons_at` return the first match in
+        # this order. `Campaign.save` writes with sort_keys=True for diffable
+        # saves, which would silently alphabetise a dict here -- so a reload
+        # would start tasking a different squadron than the one that flew
+        # before it, with nothing anywhere reporting a change. Order kept as
+        # data survives that, the way the attrition tracker already does it.
         return {
             "coalition": self.coalition,
-            "squadrons": {k: v.to_dict() for k, v in self.squadrons.items()},
+            "squadrons": [v.to_dict() for v in self.squadrons.values()],
         }
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> SideInventory:
         return cls(
             coalition=raw["coalition"],
-            squadrons={k: Squadron.from_dict(v) for k, v in raw["squadrons"].items()},
+            squadrons={s["id"]: Squadron.from_dict(s) for s in raw["squadrons"]},
         )
 
 

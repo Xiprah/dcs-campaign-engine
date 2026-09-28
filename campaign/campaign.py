@@ -81,7 +81,7 @@ from campaign.theater import Target, Theater, build_slice_theater, enemy_of
 
 #: Serialisation format of a saved campaign. Bump on any breaking change to
 #: :meth:`Campaign.to_dict`.
-SAVE_VERSION = 1
+SAVE_VERSION = 2
 
 #: Default seed. Explicit, because an implicit one is an unseeded one.
 DEFAULT_SEED = 20240923

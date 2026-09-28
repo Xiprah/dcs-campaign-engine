@@ -19,6 +19,7 @@ the engine issuing different frames.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import math
 import random
@@ -41,6 +42,7 @@ from campaign.attrition import (
 from campaign.bubble import BubbleConfigError, bubble_delta, resolve_bubble
 from campaign.campaign import Campaign
 from campaign.oob import (
+    SideInventory,
     InsufficientInventory,
     Squadron,
     UnknownReservation,
@@ -414,6 +416,50 @@ class TestGeometry(unittest.TestCase):
 def _fresh_squadron() -> Squadron:
     blue, _ = build_slice_oob()
     return blue.squadron("vfa_incirlik_f16")
+
+
+class TestSquadronOrderSurvivesAReload(unittest.TestCase):
+    """Declaration order is what `find_capable` returns, so it must persist.
+
+    `Campaign.save` writes with sort_keys=True so saves stay diffable. While
+    squadrons were serialised as a dict keyed by id, that quietly alphabetised
+    them, and `from_dict` rebuilt in file order -- so a reload began tasking a
+    different squadron than the one flying before it, with nothing reporting a
+    change. Unreachable with the slice's single squadron and certain the day
+    there are two, which is the kind of bug that lands months from now looking
+    like the planner has gone mad.
+    """
+
+    def _two(self) -> SideInventory:
+        """The slice's squadron, plus a clone declared after it.
+
+        The clone's id sorts first, so alphabetising is distinguishable from
+        keeping declaration order -- with the real one first, both orderings
+        agree and the test would prove nothing.
+        """
+        blue, _ = build_slice_oob()
+        first = blue.squadron("vfa_incirlik_f16")
+        blue.add(copy.deepcopy(dataclasses.replace(first, id="aaa_incirlik_f16")))
+        return blue
+
+    def test_a_json_round_trip_keeps_the_declared_order(self):
+        before = self._two()
+        # Through real JSON with sort_keys, which is what save() does; going
+        # dict -> dict in memory would not reproduce the bug.
+        after = SideInventory.from_dict(
+            json.loads(json.dumps(before.to_dict(), sort_keys=True))
+        )
+        self.assertEqual(
+            [s.id for s in after.squadrons_at("incirlik")],
+            [s.id for s in before.squadrons_at("incirlik")],
+            "the reload reordered the squadrons",
+        )
+        self.assertEqual(
+            after.find_capable(2, "GBU-38", 4).id,
+            before.find_capable(2, "GBU-38", 4).id,
+            "the reload would task a different squadron than the one that flew",
+        )
+        self.assertEqual(after.find_capable(2, "GBU-38", 4).id, "vfa_incirlik_f16")
 
 
 class TestInventoryConservation(unittest.TestCase):

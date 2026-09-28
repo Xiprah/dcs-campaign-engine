@@ -1462,11 +1462,26 @@ local function is_ip_literal(host)
     return true
 end
 
+--- The address to dial for `host`, or nil if it would have to be resolved.
+---
+--- "localhost" is the one name worth honouring: it is what people write, and
+--- it is answerable here without asking anything, so refusing it would be
+--- friction with no safety bought. Every other name goes to the resolver, so
+--- it is refused.
+local function dial_address(host)
+    if is_ip_literal(host) then return host end
+    if type(host) == "string" and string.lower(host) == "localhost" then
+        return "127.0.0.1"
+    end
+    return nil
+end
+
 local function begin_connect(now)
-    if not is_ip_literal(CONFIG.host) then
+    local address = dial_address(CONFIG.host)
+    if not address then
         if now - S.last_fail_log > CONFIG.log_throttle then
             S.last_fail_log = now
-            log_err("CONFIG.host must be an IPv4 address, not \""
+            log_err("CONFIG.host must be an IPv4 address or \"localhost\", not \""
                     .. tostring(CONFIG.host) .. "\": resolving a name blocks "
                     .. "the simulation thread. Use the engine's IP address.")
         end
@@ -1492,7 +1507,7 @@ local function begin_connect(now)
     end
 
     sock:settimeout(0)
-    local ok, err = sock:connect(CONFIG.host, CONFIG.port)
+    local ok, err = sock:connect(address, CONFIG.port)
 
     -- A non-blocking connect all but always reports "timeout", or an
     -- in-progress message whose text differs per platform, and finishes

@@ -1401,6 +1401,29 @@ class TestTheHostMustBeAnAddress(unittest.TestCase):
         )
         self.assertIn("campaign-engine.invalid", complaints[0])
 
+    def test_localhost_connects_without_asking_a_resolver(self):
+        """The one name worth honouring, because it needs no resolver.
+
+        Refusing it would be friction bought with no safety: everyone writes
+        localhost, and the answer is known here. What must not happen is the
+        client handing the string itself to connect(), which would resolve it
+        on the simulation thread like any other name.
+        """
+        mission = Mission(observer_pos=NOWHERE, config={"host": "localhost"})
+        self.addCleanup(mission.close)
+        mission.step(10)
+        self.assertEqual(mission.engine.connections, 1, "localhost was refused")
+        self.assertEqual(
+            [m for m in mission.mock.logs("error") if "IPv4" in m],
+            [],
+            "localhost was treated as an unresolvable name",
+        )
+        self.assertEqual(
+            mission.mock.sockets.connected_to,
+            [("127.0.0.1", mission.engine.port)],
+            "the client handed the name to connect() instead of the address",
+        )
+
 
 @requires_lua
 class TestAnAttritedEntityComesBackAttrited(unittest.TestCase):

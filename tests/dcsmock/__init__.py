@@ -78,6 +78,9 @@ class LuaSocketBridge:
         self.send_limit: int | None = None
         #: Every socket handed out, for leak assertions.
         self.opened = 0
+        #: (host, port) exactly as the Lua handed them to connect(), so a
+        #: test can tell an address from a name the resolver would see.
+        self.connected_to: list[tuple[str, int]] = []
         self.closed = 0
 
     # -- helpers -----------------------------------------------------------
@@ -120,6 +123,7 @@ class LuaSocketBridge:
         sock = self._sock(handle)
         if sock is None:
             return (None, "closed")
+        self.connected_to.append((str(host), int(port)))
         code = sock.connect_ex((str(host), int(port)))
         if code == 0 or code in _ALREADY_CONNECTED:
             return (1, None)
