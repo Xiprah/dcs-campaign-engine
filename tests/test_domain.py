@@ -69,6 +69,8 @@ from campaign.protocol import (
     group_name,
 )
 from campaign.theater import (
+    Target,
+    Theater,
     build_slice_theater,
     enemy_of,
     ground_distance,
@@ -677,9 +679,20 @@ class TestBubbleHysteresis(unittest.TestCase):
             )
 
     def test_delta_is_sorted_for_deterministic_frame_order(self):
-        to_spawn, to_despawn = bubble_delta({"c", "a"}, {"a", "b"})
-        self.assertEqual(to_spawn, ["b"])
-        self.assertEqual(to_despawn, ["c"])
+        """Set iteration order is per-process; frame order may not be.
+
+        Both lists need several members before sorting is observable at all: a
+        one-element list comes out of `sorted` unchanged, so a delta that
+        returned raw set differences would look correct here and still emit
+        spawns in a different order on a replay in another process. Four and
+        three, rather than two apiece, because a small set can happen to
+        iterate in sorted order and the point is to catch that it is luck.
+        """
+        to_spawn, to_despawn = bubble_delta(
+            {"c", "a", "e", "g"}, {"a", "b", "d", "f", "h"}
+        )
+        self.assertEqual(to_spawn, ["b", "d", "f", "h"])
+        self.assertEqual(to_despawn, ["c", "e", "g"])
 
 
 def _transitions(flags: list[bool]) -> int:
@@ -1045,6 +1058,16 @@ class TestSaveLoad(unittest.TestCase):
             reloaded.to_dict(),
             "a reloaded campaign reached different state than an uninterrupted one",
         )
+        # The first package dies in the scenario and a second is fragged after
+        # the split, so both comparisons above span a callsign drawn from the
+        # reloaded campaign's RNG. Without a draw on the far side of the save
+        # they would hold against an engine that re-seeded rather than restored.
+        self.assertEqual(
+            len(reloaded.packages),
+            2,
+            "nothing was tasked after the split, so no seeded choice was made "
+            "from the restored RNG state",
+        )
 
     def test_save_is_json_and_carries_the_rng_and_spawn_counter(self):
         campaign = Campaign()
@@ -1347,6 +1370,10 @@ class TestCampaignLoop(unittest.TestCase):
         pkg_b = next(iter(b.packages.values()))
         self.assertEqual(pkg_a.t_tot, pkg_b.t_tot)
         self.assertEqual(pkg_a.spawn_id, pkg_b.spawn_id)
+        # The other half of the name. Without this the test says only that the
+        # seed changes nothing, which a campaign that never consulted its RNG
+        # would satisfy perfectly.
+        self.assertNotEqual(pkg_a.callsign, pkg_b.callsign)
 
 
 # ---------------------------------------------------------------------------
@@ -1355,12 +1382,50 @@ class TestCampaignLoop(unittest.TestCase):
 
 
 class TestPlanner(unittest.TestCase):
-    def test_select_target_prefers_priority_and_skips_rubble(self):
-        theater = build_slice_theater()
-        depot = theater.targets["latakia_fuel_depot"]
-        self.assertIs(select_target(theater, enemy_of("blue")), depot)
+    @staticmethod
+    def _target(target_id: str, priority: int) -> Target:
+        return Target(
+            id=target_id,
+            name=target_id,
+            coalition="red",
+            pos=(0.0, 0.0, 0.0),
+            priority=priority,
+            template="fuel_depot_medium",
+            category="structure",
+            units_initial=4,
+            units_alive=4,
+        )
 
-        depot.units_alive = 0
+    @staticmethod
+    def _theater_of(*targets: Target) -> Theater:
+        return Theater(name="test", targets={t.id: t for t in targets})
+
+    def test_select_target_prefers_priority_and_skips_rubble(self):
+        """Priority first, id only to break a tie, and never rubble.
+
+        The slice's theater holds exactly one target, and against one target
+        `max` and `min` are the same function -- so the ordering has to be
+        exercised on a theater built for it. The high-priority target here is
+        also the lexicographically *smaller* id, so picking on id alone, or
+        picking the minimum, chooses the wrong one.
+        """
+        low = self._target("zzz_low", priority=10)
+        high = self._target("aaa_high", priority=90)
+        theater = self._theater_of(low, high)
+        self.assertIs(select_target(theater, enemy_of("blue")), high)
+
+        # Equal priority: the id decides, so two engines fed the same log make
+        # the same choice rather than whichever the dict happened to yield.
+        tie_low, tie_high = self._target("aaa_tie", 90), self._target("bbb_tie", 90)
+        self.assertIs(
+            select_target(self._theater_of(tie_low, tie_high), enemy_of("blue")),
+            tie_high,
+        )
+
+        # Rubble is not a target, even when it outranks everything still alive.
+        high.units_alive = 0
+        self.assertIs(select_target(theater, enemy_of("blue")), low)
+        low.units_alive = 0
         self.assertIsNone(select_target(theater, enemy_of("blue")))
 
     def test_build_package_returns_none_when_inventory_cannot_cover_it(self):

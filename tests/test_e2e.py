@@ -33,7 +33,7 @@ from campaign.audit import attributions, strip_event_derived
 from campaign.campaign import Campaign
 from campaign.planner import COMPLETE
 from campaign.server import CampaignServer
-from campaign.protocol import Message, encode
+from campaign.protocol import PROTOCOL_VERSION, Hello, Message, encode
 from tools.fake_dcs import Config, FakeDCS
 
 #: Long enough for the slice's own strike to take off, hit and land again.
@@ -181,8 +181,16 @@ class TestTheLoopCloses(unittest.TestCase):
             self.assertEqual(raw["save_version"], 1)
         reloaded = Campaign.load(path)
         self.assertEqual(reloaded.to_dict(), self.campaign.to_dict())
-        # And it keeps running rather than merely deserialising.
-        self.assertEqual(reloaded.tick(0.0), [])
+        # And it is an engine rather than a deserialised blob. `tick` cannot
+        # show that here: the war is over, so [] is both the healthy answer and
+        # the answer a stub would give. A `hello` can -- the client that
+        # connects now has to be told where the campaign already is, and has to
+        # be issued nothing, the depot being rubble and the flight home.
+        frames = reloaded.on_hello(
+            Hello(seq=1, t=0.0, protocol=PROTOCOL_VERSION, theater="Syria")
+        )
+        self.assertEqual([f.type for f in frames], ["sync"])
+        self.assertEqual(frames[0].campaign_time, self.campaign.clock)
 
 
 class TestEventsAreAttributionOnly(unittest.TestCase):
@@ -249,7 +257,33 @@ class TestReconnect(unittest.TestCase):
         package = next(iter(campaign.packages.values()))
         self.assertEqual(package.state, COMPLETE)
         self.assertTrue(campaign.theater.targets[DEPOT].destroyed)
-        campaign.inventories["blue"].squadron(SQUADRON).check_invariant()
+
+        # Inventory, against the run that was never interrupted. On its own
+        # check_invariant says only that the books balance, and they balance
+        # just as well if the reconnect wrote off the jet that came home: two
+        # lost, ten available, and the package still completes.
+        uninterrupted, _ = run_loop()
+        sqn = campaign.inventories["blue"].squadron(SQUADRON)
+        clean = uninterrupted.inventories["blue"].squadron(SQUADRON)
+        sqn.check_invariant()
+        self.assertEqual(sqn.airframes_lost, 1)
+        self.assertEqual(sqn.airframes_lost, clean.airframes_lost)
+        self.assertEqual(sqn.airframes_available, clean.airframes_available)
+        self.assertEqual(sqn.munitions_expended, clean.munitions_expended)
+        self.assertEqual(sqn.munitions_lost, clean.munitions_lost)
+        self.assertEqual(
+            sqn.munitions_expended["GBU-38"] + sqn.munitions_lost["GBU-38"],
+            4,
+            "the four bombs the two-ship carried are not accounted for",
+        )
+
+        # And the ledger itself: a restart may neither invent a casualty nor
+        # forget one, whatever the totals say.
+        ledger = [(x.cause, x.entity_kind) for x in campaign.tracker.losses]
+        self.assertEqual(
+            ledger, [(x.cause, x.entity_kind) for x in uninterrupted.tracker.losses]
+        )
+        self.assertEqual(len(ledger), 5, "the reference run's ledger changed shape")
 
 
 class TestTheHarnessDoesNotHideItsOwnFailures(unittest.TestCase):
