@@ -22,6 +22,18 @@ The tests are ordered by what they would catch:
   nothing, and nothing else in the suite can see it.
 * `TestReconnect` -- a dropped socket must not leave duplicated or resurrected
   groups behind.
+* `TestFramesCarryMissionTimeNotCampaignTime` -- after a restart the two
+  clocks differ by a whole session, and the wire carries the client's.
+* `TestARejectedSpawnIsNeverRetried`,
+  `TestAFlightLostEarlyIsClosedOutAtOnce`,
+  `TestACampaignThatCannotTaskStandsStill` -- campaign guards whose failure
+  mode is a frame storm, a blocked planner or a runaway counter rather than a
+  wrong answer, driven through the real client because that is where the cost
+  actually lands.
+* `TestTheEventHotPathIsCheapBeforeItIsThorough`,
+  `TestSceneryDoesNotPutANumberOnTheWire`, `TestTheHostMustBeAnAddress` --
+  the sim thread: what the client may do per event, what it may put on the
+  wire, and the last call that could block it.
 * `TestJsonEmptyTables` / `TestJsonStrings` -- `{}` versus `[]`, and the
   strings entity names are made of, round-tripped against
   `campaign/protocol.py`'s own decoder.
@@ -46,7 +58,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from campaign.campaign import Campaign
-from campaign.planner import COMPLETE, CRUISE_ALTITUDE
+from campaign.planner import COMPLETE, CRUISE_ALTITUDE, DESTROYED
 from campaign.protocol import (
     Ack,
     Despawn,
@@ -742,6 +754,87 @@ class TestReconnect(unittest.TestCase):
 
 
 @requires_lua
+class TestFramesCarryMissionTimeNotCampaignTime(unittest.TestCase):
+    """Every envelope `t` is `timer.getTime()`, per docs/protocol.md.
+
+    The campaign runs on its own clock and rebases the mission clock onto it
+    at each hello, so the two diverge by exactly one restart's worth of war.
+    A client that has just restarted knows nothing about campaign time: the
+    engine converts back on the way out, and if it stopped doing so every
+    spawn, despawn and message would be stamped ahead of the client's clock
+    and the player would be briefed a time on target that is not the one the
+    flight is flying to.
+    """
+
+    def test_a_restarted_mission_is_told_its_own_clock(self):
+        first = sortie_with_observer_over_the_target()
+        self.addCleanup(first.close)
+        first.run_until(
+            lambda m: bool(
+                m.campaign.packages
+                and m.mock.group(group_name(m.package.spawn_id)) is not None
+            ),
+            limit=1400.0,
+        )
+        campaign = first.campaign
+        package = first.package
+        self.assertGreater(campaign.clock, 600.0, "the campaign clock never moved")
+        first.engine.drop()
+        first.step(3)
+        first.close()
+
+        # DCS restarted: a new mission whose clock starts at zero, the same
+        # campaign, everything that should be live re-issued.
+        second = Mission(
+            observer_pos=(-3_000.0, CRUISE_ALTITUDE, 41_000.0), campaign=campaign
+        )
+        self.addCleanup(second.close)
+        second.run_until(
+            lambda m: bool(
+                m.mock.status()["synced"]
+                and [
+                    s
+                    for s in m.engine.downlink_of(Spawn)
+                    if s.spawn_id == package.spawn_id
+                ]
+            ),
+            limit=120.0,
+        )
+
+        sync = second.engine.downlink_of(Sync)[-1]
+        self.assertAlmostEqual(
+            sync.campaign_time,
+            campaign.clock,
+            delta=second.tick,
+            msg="sync did not carry the campaign clock",
+        )
+        self.assertLess(
+            sync.t,
+            60.0,
+            "the engine stamped the new mission's sync with campaign time: "
+            "t=%r against a mission clock of %r" % (sync.t, second.mock.time),
+        )
+
+        spawn = [
+            s for s in second.engine.downlink_of(Spawn) if s.spawn_id == package.spawn_id
+        ][-1]
+        self.assertLessEqual(
+            abs(spawn.t - second.mock.time),
+            5 * second.tick,
+            "a re-issued spawn was stamped %r against a mission clock of %r"
+            % (spawn.t, second.mock.time),
+        )
+        self.assertAlmostEqual(
+            spawn.tasking["tot"],
+            package.t_tot - campaign.mission_epoch,
+            places=6,
+            msg="the flight was briefed a TOT on the campaign's clock; the "
+            "cockpit reads the mission's",
+        )
+        second.assert_lua_was_clean(self)
+
+
+@requires_lua
 class TestJsonEmptyTables(unittest.TestCase):
     """`{}` versus `[]`, checked against campaign/protocol.py's own decoder.
 
@@ -1136,6 +1229,180 @@ class TestEventsAndObservers(unittest.TestCase):
 
 
 @requires_lua
+class TestTheEventHotPathIsCheapBeforeItIsThorough(unittest.TestCase):
+    """Every S_EVENT in the mission runs through this, on the sim thread.
+
+    `object_name` costs up to three pcall'd round trips into the DCS object
+    model per object, and a mission with AI ground combat alongside the slice
+    fires `shot` and `hit` in the thousands per second -- nearly all of them
+    about units the engine does not own. The ownership filter is correct; what
+    matters is that it runs before the expensive part rather than after it.
+    """
+
+    def setUp(self) -> None:
+        self.mission = Mission(observer_pos=NOWHERE)
+        self.addCleanup(self.mission.close)
+        self.mission.run_until(lambda m: m.mock.status()["synced"], limit=60.0)
+        self.assertTrue(self.mission.mock.status()["synced"], "never synced")
+
+    def _probe(self, name: str):
+        """A DCS object that counts the group lookups made against it."""
+        return self.mission.mock.lua.eval(
+            """
+            (function(name)
+                local o = {group_lookups = 0}
+                function o:getName() return name end
+                function o:getGroup()
+                    o.group_lookups = o.group_lookups + 1
+                    return nil
+                end
+                return o
+            end)(%r)
+            """
+            % name
+        )
+
+    def test_someone_elses_shot_is_dropped_without_resolving_its_group(self):
+        shooter = self._probe("red_sa6_bassel_1")
+        victim = self._probe("blue_farp_truck_3")
+        self.mission.mock.fire_event(
+            self.mission.mock.event_id("S_EVENT_SHOT"),
+            initiator=shooter,
+            target=victim,
+        )
+        self.mission.step(2)
+        self.assertEqual(
+            (int(shooter.group_lookups), int(victim.group_lookups)),
+            (0, 0),
+            "the client walked into the DCS object model for an event it "
+            "discarded a line later",
+        )
+        self.assertEqual(
+            self.mission.engine.uplink_of(Event), [], "the event was forwarded"
+        )
+
+    def test_an_owned_units_shot_is_still_forwarded_under_its_group_name(self):
+        """The control: the cheap filter must not drop what the engine wants."""
+        self.mission.engine.send(
+            [
+                Spawn(
+                    seq=9100,
+                    t=self.mission.mock.time,
+                    ref=9100,
+                    spawn_id="beef",
+                    coalition="blue",
+                    category="plane",
+                    template="F-16C_strike_jdam",
+                    position=(1000.0, 5000.0, 2000.0),
+                    heading=0.0,
+                    route=[],
+                    tasking={},
+                )
+            ]
+        )
+        self.mission.step(3)
+        self.assertIn("cmp_beef", self.mission.mock.group_names())
+        self.mission.mock.fire_event(
+            self.mission.mock.event_id("S_EVENT_SHOT"),
+            initiator=self.mission.mock.unit("cmp_beef_1"),
+        )
+        self.mission.step(3)
+        events = self.mission.engine.uplink_of(Event)
+        self.assertTrue(events, "an event about an engine-owned unit was dropped")
+        self.assertEqual(events[-1].initiator, "cmp_beef")
+
+
+@requires_lua
+class TestSceneryDoesNotPutANumberOnTheWire(unittest.TestCase):
+    """`initiator` and `target` are strings, per docs/protocol.md.
+
+    DCS scenery answers `getName` with its numeric object id, and an
+    engine-owned jet clipping a building is an ordinary occurrence. The number
+    survives JSON, lands in `Event.target` -- which nothing validates -- and
+    the engine's attribution path tests it with a string prefix.
+    """
+
+    def setUp(self) -> None:
+        self.mission = Mission(observer_pos=NOWHERE)
+        self.addCleanup(self.mission.close)
+        self.mission.run_until(lambda m: m.mock.status()["synced"], limit=60.0)
+        self.mission.engine.send(
+            [
+                Spawn(
+                    seq=9200,
+                    t=self.mission.mock.time,
+                    ref=9200,
+                    spawn_id="beef",
+                    coalition="blue",
+                    category="plane",
+                    template="F-16C_strike_jdam",
+                    position=(1000.0, 5000.0, 2000.0),
+                    heading=0.0,
+                    route=[],
+                    tasking={},
+                )
+            ]
+        )
+        self.mission.step(3)
+        self.assertIn("cmp_beef", self.mission.mock.group_names())
+
+    def test_a_hit_on_a_building_carries_no_name_rather_than_a_number(self):
+        scenery = self.mission.mock.lua.eval(
+            "(function() local o = {} function o:getName() return 140521 end "
+            "return o end)()"
+        )
+        self.mission.mock.fire_event(
+            self.mission.mock.event_id("S_EVENT_HIT"),
+            initiator=self.mission.mock.unit("cmp_beef_1"),
+            target=scenery,
+        )
+        self.mission.step(3)
+        events = self.mission.engine.uplink_of(Event)
+        self.assertTrue(events, "the hit never reached the engine")
+        self.assertEqual(events[-1].initiator, "cmp_beef")
+        self.assertIsNone(
+            events[-1].target,
+            "a scenery object id went out where the wire says string",
+        )
+        self.mission.assert_lua_was_clean(self)
+
+
+@requires_lua
+class TestTheHostMustBeAnAddress(unittest.TestCase):
+    """`settimeout(0)` bounds the handshake, not the name resolution.
+
+    LuaSocket's `connect` calls getaddrinfo synchronously before any socket
+    timeout applies, so a `host` that does not resolve costs Windows a DNS
+    round trip, then LLMNR, then NetBIOS -- one to three seconds of frozen sim
+    per reconnect attempt, for as long as the engine is unreachable. `host` is
+    documented as user-overridable, which makes it the last path by which this
+    client can block the simulation thread.
+    """
+
+    def test_a_hostname_is_refused_instead_of_being_resolved(self):
+        mission = Mission(
+            observer_pos=NOWHERE, config={"host": "campaign-engine.invalid"}
+        )
+        self.addCleanup(mission.close)
+        mission.step(10)
+        self.assertEqual(
+            mission.mock.sockets.opened,
+            0,
+            "the client handed a name to connect(), which resolves it on the "
+            "simulation thread",
+        )
+        self.assertEqual(mission.engine.connections, 0)
+        self.assertEqual(mission.mock.status()["phase"], "idle")
+        complaints = [m for m in mission.mock.logs("error") if "IPv4" in m]
+        self.assertEqual(
+            len(complaints),
+            1,
+            "the refusal was not logged exactly once: %r" % (complaints,),
+        )
+        self.assertIn("campaign-engine.invalid", complaints[0])
+
+
+@requires_lua
 class TestAnAttritedEntityComesBackAttrited(unittest.TestCase):
     """Re-instantiation must not hand the campaign back what it wrote off.
 
@@ -1198,6 +1465,160 @@ class TestAnAttritedEntityComesBackAttrited(unittest.TestCase):
             1,
             "the group table itself still asks for two aircraft",
         )
+        mission.assert_lua_was_clean(self)
+
+
+@requires_lua
+class TestARejectedSpawnIsNeverRetried(unittest.TestCase):
+    """`Campaign.blocked`, which nothing else drives.
+
+    A rejected spawn is a bad template: the entity cannot be instantiated and
+    nothing about the next bubble sync will change that. Without the guard the
+    engine re-offers it on every pulse -- an observer pulse every 5 s and a
+    census every 30 s -- and each frame is a spawn attempt the client runs on
+    the DCS simulation thread. That is a frame-rate problem in the sim, not
+    merely wasted bytes.
+
+    The only other rejection test refuses a *flight*, and an aborted package
+    stops being a bubble candidate for unrelated reasons, so it never reaches
+    the retry path. A refused target stays a candidate for as long as it is
+    alive, which is what makes it the case that matters.
+    """
+
+    def test_a_target_the_client_refuses_is_offered_exactly_once(self):
+        mission = sortie_with_observer_over_the_target()
+        self.addCleanup(mission.close)
+        # The content mistake this guard exists for: a TEMPLATES key that does
+        # not match the name the engine puts on the wire.
+        mission.mock.client.TEMPLATES["fuel_depot_medium"] = None
+
+        depot_id = mission.depot.spawn_id
+        # Well short of TOT, so the depot is still standing and still a
+        # candidate for every pulse in between.
+        mission.run_to(900.0)
+
+        offers = [
+            f for f in mission.engine.downlink_of(Spawn) if f.spawn_id == depot_id
+        ]
+        self.assertEqual(
+            len(offers),
+            1,
+            "the engine re-offered a spawn the client had already refused, "
+            "%d times over 900 mission seconds" % len(offers),
+        )
+        refusals = [
+            a
+            for a in mission.engine.uplink_of(Ack)
+            if a.ref == offers[0].ref and not a.ok
+        ]
+        self.assertTrue(refusals, "the client did not refuse the bad template")
+        self.assertIn("unknown template", refusals[0].error or "")
+        self.assertEqual(mission.campaign.blocked, {depot_id})
+        self.assertFalse(
+            mission.depot.destroyed, "the depot stopped being a candidate"
+        )
+        mission.assert_lua_was_clean(self)
+
+
+@requires_lua
+class TestAFlightLostEarlyIsClosedOutAtOnce(unittest.TestCase):
+    """A package whose flight dies stops being open there and then.
+
+    `_close_out_dead_packages` is what makes that true. Without it a two-ship
+    shot down shortly after takeoff stays `is_open` for the rest of its
+    scheduled sortie -- which blocks planning, because the slice frags one
+    package at a time -- and keeps its airframes and munitions reserved for
+    the whole of it, while the player is never told the flight is gone.
+    """
+
+    def test_the_package_closes_settles_and_is_replaced_before_its_rtb(self):
+        mission = sortie_with_observer_over_the_target()
+        self.addCleanup(mission.close)
+        mission.run_until(
+            lambda m: bool(
+                m.campaign.packages
+                and m.mock.group(group_name(m.package.spawn_id)) is not None
+            ),
+            limit=1400.0,
+        )
+        package = mission.package
+        self.assertTrue(package.is_open, "the flight was never airborne")
+
+        mission.mock.kill_group(group_name(package.spawn_id))
+        # Long enough for one census, which is the only thing that may record
+        # the loss, and the pulse that follows it.
+        mission.step(40)
+
+        squadron = mission.campaign.inventories["blue"].squadron(SQUADRON)
+        self.assertLess(
+            mission.campaign.clock,
+            package.t_rtb,
+            "the flight outlived its scheduled sortie; nothing was proven",
+        )
+        self.assertEqual(package.state, DESTROYED)
+        self.assertNotIn(
+            package.reservation_id,
+            squadron.open_reservations,
+            "a flight that is gone still holds its airframes and bombs",
+        )
+        self.assertTrue(
+            any("is lost" in text for text in mission.engine.messages()),
+            "the player was never told the flight was lost: %r"
+            % (mission.engine.messages(),),
+        )
+        replacements = [p for p in mission.campaign.packages.values() if p is not package]
+        self.assertEqual(
+            len(replacements),
+            1,
+            "no replacement was fragged; planning stayed blocked until t_rtb",
+        )
+        squadron.check_invariant()
+        mission.assert_lua_was_clean(self)
+
+
+@requires_lua
+class TestACampaignThatCannotTaskStandsStill(unittest.TestCase):
+    """A squadron out of ordnance must cost nothing to keep running.
+
+    `_plan` allocates a package id and a spawn id before it knows whether the
+    squadron can cover the package, and gives them back when it cannot. That
+    restore is what keeps a stalled campaign from burning two ids per pulse --
+    one per observer frame -- for the rest of the war: left running overnight
+    the counters reach the hundreds of thousands, and the next real package
+    gets a five-digit spawn id that no longer fits the `%04x` the rest of the
+    engine is written around.
+    """
+
+    def test_ids_do_not_creep_while_the_squadron_is_dry(self):
+        campaign = Campaign()
+        squadron = campaign.inventories["blue"].squadron(SQUADRON)
+        # Bombed out, with conservation intact: the rounds were expended, not
+        # deleted. Nothing can be tasked from here.
+        for munition, total in squadron.munitions_total.items():
+            squadron.munitions_available[munition] = 0
+            squadron.munitions_expended[munition] = total
+        squadron.check_invariant()
+
+        mission = Mission(
+            observer_pos=(-3_000.0, CRUISE_ALTITUDE, 41_000.0), campaign=campaign
+        )
+        self.addCleanup(mission.close)
+        mission.run_until(lambda m: m.mock.status()["synced"], limit=60.0)
+        spawn_counter = campaign._spawn_counter
+        package_counter = campaign._package_counter
+
+        mission.run_to(900.0)
+
+        self.assertEqual(campaign.packages, {}, "a package was fragged with no bombs")
+        self.assertEqual(
+            (campaign._spawn_counter, campaign._package_counter),
+            (spawn_counter, package_counter),
+            "the id counters crept on every pulse a stalled campaign failed "
+            "to plan",
+        )
+        dry = [m for m in mission.engine.messages() if "Cannot task" in m]
+        self.assertEqual(len(dry), 1, "the stall was announced %d times" % len(dry))
+        squadron.check_invariant()
         mission.assert_lua_was_clean(self)
 
 

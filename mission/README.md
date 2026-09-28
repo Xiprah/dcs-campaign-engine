@@ -87,9 +87,13 @@ In the Mission Editor, add **one** trigger:
   1. `DO SCRIPT` → `dofile("C:\\dcs-campaign-engine\\mission\\json.lua")`
   2. `DO SCRIPT` → `dofile("C:\\dcs-campaign-engine\\mission\\campaign_client.lua")`
 
-Note the doubled backslashes, and note that `dofile` needs `io`/`lfs`
-desanitised — if you took the advice above and left `io` sanitised, use
-Option B instead, which does not need it.
+Note the doubled backslashes. This needs nothing desanitised beyond what
+Option B needs. `dofile` and `loadfile` are Lua base-library functions that go
+through C stdio, and the sanitise block does not remove them: it nils the
+`os`, `io` and `lfs` tables and `require`, `loadlib` and `package`, none of
+which `dofile` goes through. Both options need exactly `require`, `package`
+and `lfs`, and they need them for LuaSocket rather than for loading the file.
+The difference between the two is only where the `.lua` lives.
 
 ### Option B — embed in the mission (shipping)
 
@@ -144,6 +148,13 @@ CAMPAIGN_CLIENT_CONFIG = {
     reconnect_max = 30.0,       -- cap on the reconnect backoff
 }
 ```
+
+`host` must be an IPv4 address, never a name. `settimeout(0)` bounds the TCP
+handshake but not name resolution: LuaSocket hands the string to `getaddrinfo`
+synchronously, and a name Windows cannot resolve costs DNS, then LLMNR, then
+NetBIOS — one to three seconds of frozen sim, on every reconnect attempt, for
+as long as the engine is unreachable. The client refuses a non-address `host`
+rather than blocking on it, and says so once in `dcs.log`.
 
 `state_period`, `observer_period` and `bubble_radius` are **not** configurable
 here. The engine sends them in `sync` and the client obeys; that is the whole
@@ -274,4 +285,5 @@ These are deliberate for the first vertical slice, not oversights:
 | `load mission/json.lua before this file` | trigger actions are in the wrong order |
 | `unknown template: X` in an `ack` | the engine asked for a template that is not in `TEMPLATES` |
 | `engine speaks protocol N` | version mismatch; the engine closes the connection and the client backs off to `reconnect_max` |
+| `CONFIG.host must be an IPv4 address` | `host` was overridden with a name; resolving one would block the sim thread, so the client refuses to dial it — use the address |
 | nothing at all in `dcs.log` | the trigger never fired — a `MISSION START` rule must carry **no condition**; `TIME MORE (1)` is false at mission start and the rule is never evaluated again |

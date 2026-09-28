@@ -90,6 +90,11 @@ class _Connection:
         self.writer = writer
         self.peer = str(writer.get_extra_info("peername") or "?")
         self.alive = True
+        #: Set once this socket's `hello` has reached the engine. Nothing may
+        #: be written before that: the engine restarts its downlink stream at
+        #: every hello, so a frame sent ahead of one is a frame outside every
+        #: stream. See `_send`.
+        self.synced = False
         self.closed = asyncio.Event()
         self.write_lock = asyncio.Lock()
 
@@ -290,6 +295,11 @@ class CampaignServer:
         except Exception:
             logger.exception("%s raised; campaign continues", name)
             return
+        if isinstance(frame, Hello):
+            # The engine has now rebased this connection's stream, so the
+            # reply and everything after it may go out. Set before the send,
+            # because the `sync` is itself one of the gated frames.
+            conn.synced = True
         try:
             await self._send(conn, out or ())
         except Exception:
@@ -308,6 +318,21 @@ class CampaignServer:
             return
         if conn is None or not conn.alive:
             logger.debug("no client; dropped %d downlink frame(s)", len(frames))
+            return
+        if not conn.synced:
+            # An accepted socket is not yet a client. The mission client starts
+            # a non-blocking connect on one tick and sends `hello` on the next,
+            # so there is always a window where the TCP connection exists and
+            # the engine has not been told about it -- and a tick landing in
+            # that window would write frames from the *previous* stream: their
+            # seq and ref are about to be reset by `on_hello`, and a spawn
+            # issued there is re-issued by the hello that follows it, which the
+            # protocol obliges the client to refuse as a duplicate spawn_id.
+            # The engine then blocks that entity for the rest of the campaign.
+            # Dropping is safe for the same reason dropping with no client at
+            # all is: `hello` re-issues everything that should be live.
+            logger.debug("%s has not said hello; dropped %d frame(s)",
+                         conn.peer, len(frames))
             return
         blob = bytearray()
         for frame in frames:

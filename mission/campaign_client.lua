@@ -220,10 +220,16 @@ local function object_name(obj)
         end
     end
     local name = try(obj.getName, obj)
-    if type(name) == "string" then
-        local stem = string.match(name, "^(.*)_%d+$")
-        if stem and is_owned(stem) then return stem end
+    if type(name) ~= "string" then
+        -- Scenery answers getName with its numeric object id, and the wire
+        -- says these fields are strings. A number survives JSON intact and
+        -- reaches the engine's attribution path, which tests it with a string
+        -- prefix and raises: a traceback in the engine log per such event,
+        -- and the attribution it carried lost anyway. Nameless is honest.
+        return nil
     end
+    local stem = string.match(name, "^(.*)_%d+$")
+    if stem and is_owned(stem) then return stem end
     return name
 end
 
@@ -1176,6 +1182,13 @@ local PLAYER_GONE = {
     ejection = true, dead = true, unit_lost = true,
 }
 
+--- An object's own name, with no group lookup. See the filter in
+--- on_event_body: this is the cheap half of object_name.
+local function raw_name(obj)
+    if not obj then return nil end
+    return try(obj.getName, obj)
+end
+
 --- The spawn record a DCS object belongs to, plus that object's own name.
 ---
 --- `object_name` resolves a unit to its *group* name, which is what maps to a
@@ -1234,16 +1247,27 @@ local function on_event_body(e)
     if not kind then return end
     if S.phase ~= "open" or not S.synced then return end
 
-    local initiator = object_name(ini)
-    local target = object_name(e.target)
-
-    -- Traffic control. The engine ignores anything without the cmp_ prefix
-    -- anyway, and a busy mission generates far more events than the
-    -- campaign cares about. Dropping them here is safe precisely because
-    -- events are attribution only -- losses come from state snapshots.
-    if not (ALWAYS_SEND[kind] or is_owned(initiator) or is_owned(target)) then
+    -- Traffic control, on the objects' own names. The engine ignores
+    -- anything without the cmp_ prefix anyway, and a busy mission generates
+    -- far more events than the campaign cares about -- AI ground combat
+    -- alone fires shot and hit in the thousands per second. Dropping them
+    -- here is safe precisely because events are attribution only: losses
+    -- come from state snapshots.
+    --
+    -- Deliberately ahead of object_name, which costs up to three pcall'd
+    -- trips into the DCS object model per object and runs on the sim thread.
+    -- It is exactly equivalent: an engine-owned entity carries the prefix on
+    -- its unit and object names too (`cmp_<id>_<n>`, see build_group_data
+    -- and build_static_data), so anything object_name would resolve to an
+    -- owned group name is already owned by its own name.
+    if not (ALWAYS_SEND[kind]
+            or is_owned(raw_name(ini))
+            or is_owned(raw_name(e.target))) then
         return
     end
+
+    local initiator = object_name(ini)
+    local target = object_name(e.target)
 
     local weapon = nil
     if e.weapon then weapon = try(e.weapon.getTypeName, e.weapon) end
@@ -1418,7 +1442,38 @@ local function send_hello()
     })
 end
 
+--- Is `host` an IPv4 literal LuaSocket can use without resolving it?
+---
+--- settimeout(0) bounds the TCP handshake and nothing else: connect() hands
+--- the string to getaddrinfo first, and that call is synchronous. A name
+--- that does not resolve costs Windows a DNS round trip, then LLMNR, then
+--- NetBIOS -- one to three seconds of frozen sim, on every backoff, for as
+--- long as the engine is unreachable. It is the one path left by which this
+--- file can block, so a name is refused rather than tried. socket.tcp() is
+--- IPv4 only, which makes a dotted quad the whole of what is useful here.
+local function is_ip_literal(host)
+    if type(host) ~= "string" then return false end
+    local octets = {string.match(host, "^(%d+)%.(%d+)%.(%d+)%.(%d+)$")}
+    if #octets ~= 4 then return false end
+    for i = 1, 4 do
+        local n = tonumber(octets[i])
+        if not n or n > 255 or #octets[i] > 3 then return false end
+    end
+    return true
+end
+
 local function begin_connect(now)
+    if not is_ip_literal(CONFIG.host) then
+        if now - S.last_fail_log > CONFIG.log_throttle then
+            S.last_fail_log = now
+            log_err("CONFIG.host must be an IPv4 address, not \""
+                    .. tostring(CONFIG.host) .. "\": resolving a name blocks "
+                    .. "the simulation thread. Use the engine's IP address.")
+        end
+        back_off(now)
+        return
+    end
+
     local sock_lib = load_socket()
     if not sock_lib then
         if now - S.last_fail_log > CONFIG.log_throttle then

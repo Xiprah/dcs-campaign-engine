@@ -266,6 +266,80 @@ class HelloTests(TransportTestCase):
         self.assertEqual(len({f.ref for f in frames[1:]}), 2)
 
 
+class PreHelloTests(TransportTestCase):
+    """Nothing goes out on a socket that has not said hello yet.
+
+    An accepted socket is not yet a client. The mission client starts a
+    non-blocking connect on one tick and sends `hello` on the next, so there
+    is always a window where the connection exists and the engine has not been
+    told. The engine restarts its downlink stream at every hello -- seq back to
+    1, refs reissued -- so a tick landing in that window writes frames from the
+    stream that is about to be discarded: two frames with the same seq and ref
+    on one connection, and a `spawn` the hello re-issues under a second ref.
+    The client is obliged to refuse that as a duplicate spawn_id, and the
+    engine then blocks the entity for the rest of the campaign -- a target it
+    can never instantiate again and never stops fragging packages at.
+    """
+
+    tick_period = 0.01
+
+    async def test_a_tick_before_hello_is_not_written_to_the_socket(self) -> None:
+        client = await self.client()
+        self.engine.tick_frames = [
+            Message(seq=99, t=0.0, to="blue", text="from the stream before hello")
+        ]
+        await self.wait_for(
+            lambda: not self.engine.tick_frames, "a tick to consume the frames"
+        )
+        await client.send(
+            Hello(seq=1, t=0.0, protocol=PROTOCOL_VERSION, theater="Syria")
+        )
+        first = await client.recv()
+        self.assertIsInstance(
+            first, Sync, "a frame reached the client before its sync"
+        )
+
+    async def test_a_spawn_before_hello_does_not_come_back_as_a_duplicate(self) -> None:
+        client = await self.client()
+        # The campaign's own sequence when a tick lands in the window: it
+        # issues the spawn, records the id as live, and the hello that follows
+        # re-issues that same id under a fresh ref.
+        self.engine.live_spawns = [SPAWN_TEMPLATE]
+        self.engine.tick_frames = [dataclasses.replace(SPAWN_TEMPLATE, seq=41, ref=41)]
+        await self.wait_for(
+            lambda: not self.engine.tick_frames, "a tick to consume the spawn"
+        )
+        await client.send(
+            Hello(seq=1, t=0.0, protocol=PROTOCOL_VERSION, theater="Syria")
+        )
+        frames = await client.recv_many(2)
+        self.assertIsInstance(
+            frames[0],
+            Sync,
+            "a spawn was written before the hello that re-issues it; the "
+            "client must refuse the second one as a duplicate spawn_id",
+        )
+        spawns = [f for f in frames if isinstance(f, Spawn)]
+        self.assertEqual(
+            [f.spawn_id for f in spawns], ["a91f"], "the spawn_id arrived twice"
+        )
+
+    async def test_a_handler_reply_before_hello_is_dropped_too(self) -> None:
+        client = await self.client()
+        # Out of order by the spec, but the engine answers anything it is
+        # handed, and that answer belongs to the stream hello is about to
+        # discard just as much as a tick's does.
+        await client.send(StateReport(seq=1, t=30.0, groups=[]))
+        await self.wait_for(lambda: self.engine.frames_of("state"), "the state frame")
+        await client.send(
+            Hello(seq=2, t=31.0, protocol=PROTOCOL_VERSION, theater="Syria")
+        )
+        first = await client.recv()
+        self.assertIsInstance(
+            first, Sync, "a reply reached the client before its sync"
+        )
+
+
 class DispatchTests(TransportTestCase):
     async def test_every_uplink_type_reaches_its_handler(self) -> None:
         client = await self.client()
