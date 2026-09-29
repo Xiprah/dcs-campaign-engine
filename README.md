@@ -28,8 +28,9 @@ DCS's mission-scripting environment is a bad place to keep a campaign.
   sees.
 * **It cannot be tested.** Anything inside the mission environment needs DCS
   running to execute one line. The engine is standard-library Python: the
-  whole loop, including the transport, runs in under three seconds in CI with
-  no DCS installed.
+  whole loop, including the transport, runs in a few seconds on any machine
+  with no DCS installed. (There is no CI yet; `python -m unittest discover -s
+  tests -t .` is the whole of the check.)
 * **It is not the whole map.** The campaign simulates a theater; DCS can only
   hold the part of it a player is near. That split — a paper track everywhere,
   real units inside a bubble — only works if something outside DCS owns the
@@ -71,7 +72,13 @@ finish in *identical* state, with the loss ledger the same length, the same
 entries, in the same order — differing only in each loss's `attribution`,
 which becomes `"unknown"`. A loss is never dropped for want of an explanation.
 
-This is checkable, and it is checked, both in `tests/test_e2e.py` and by hand:
+This is checkable, and it is checked. The proof that counts is in
+`tests/test_e2e.py`, which runs the real engine, the real transport and the
+real harness over a real socket in **one process**, where a single event loop
+orders everything — so the with-events and no-events runs are genuinely the
+same war, and any difference is the rule breaking.
+
+It can also be checked by hand across two processes:
 
 ```
 $ python tools/diff_saves.py saves/with-events.json saves/no-events.json
@@ -80,6 +87,17 @@ campaign state identical: 5 loss record(s)
   loss 1: attribution 'hit/cmp_0002/GBU-38'     -> 'unknown'
   ...
 ```
+
+But read that result with care. Two processes are not in lockstep: the
+harness advances mission time while the engine's replies are still in flight,
+so *when* a spawn lands depends on OS scheduling. Run unpaced (`--speed 0`)
+and two runs with **identical** inputs — events on in both — disagree about
+one time in three, with the strike landing twenty or thirty seconds apart.
+`diff_saves` cannot tell that apart from the rule breaking, and will say
+RECONCILIATION BROKEN. So before trusting a failure by hand, diff two
+identical with-events runs first; if *those* disagree, the rig is racing and
+the comparison means nothing. Pacing (the harness default) makes divergence
+rare, not impossible. For an answer you can rely on, use the test.
 
 Determinism serves the same end. Nothing in campaign logic reads a wall clock
 or an unseeded random source: time arrives on frames as mission time, chance
