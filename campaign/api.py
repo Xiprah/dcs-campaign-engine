@@ -12,7 +12,7 @@ side.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, runtime_checkable
 
 from campaign.protocol import (
     Ack,
@@ -22,6 +22,22 @@ from campaign.protocol import (
     ObserverReport,
     StateReport,
 )
+
+#: Campaign seconds in one offline paper step. With no mission client
+#: connected, the war moves in steps of exactly this size and no other, so the
+#: state after N steps is a pure function of the start state and N however the
+#: wall clock happened to deliver them (docs/design.md, section 2).
+#:
+#: Five seconds because that is the resolution the connected war already has:
+#: the observer frame is the campaign's heartbeat while DCS is attached, and
+#: it arrives every DEFAULT_OBSERVER_PERIOD (5 s). Offline, a takeoff, a TOT or
+#: an RTB lands at most one step late, the same as online. A finer step buys
+#: precision the observed war never had; a coarser one lets a flight overfly
+#: its TOT, and a day of war is still only 17,280 steps.
+#:
+#: Changing it changes what a saved war does next, so it is a constant here
+#: rather than a per-campaign setting.
+PAPER_STEP: Final = 5.0
 
 
 @runtime_checkable
@@ -58,9 +74,21 @@ class CampaignEngine(Protocol):
         ...
 
     def tick(self, now: float) -> list[Downlink]:
-        """Advance the campaign to wall-clock `now` (seconds, monotonic).
+        """Periodic pulse. `now` is monotonic wall seconds.
 
-        Called on a fixed cadence by the transport, and directly by tests.
+        Called on a fixed cadence by the transport, and directly by tests. It
+        does not move campaign time: connected, time arrives on frames;
+        disconnected, it arrives through :meth:`advance`.
+        """
+        ...
+
+    def advance(self, dt: float) -> list[Downlink]:
+        """Move the war forward `dt` campaign seconds with nobody watching.
+
+        `dt` is a whole number of :data:`PAPER_STEP`. The transport calls this
+        only while no mission client is synced, and the engine must refuse it
+        (a no-op) while one is: mission time is authoritative then, and an
+        engine that advanced itself would outrun the sim.
         """
         ...
 

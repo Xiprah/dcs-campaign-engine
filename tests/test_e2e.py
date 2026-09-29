@@ -29,6 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from campaign.api import PAPER_STEP
 from campaign.audit import attributions, strip_event_derived
 from campaign.campaign import Campaign
 from campaign.planner import COMPLETE
@@ -55,6 +56,7 @@ TICK_PERIOD = 0.05
 
 SQUADRON = "vfa_incirlik_f16"
 DEPOT = "latakia_fuel_depot"
+SA6 = "latakia_north_sa6"
 
 
 def _config(port: int, **overrides: object) -> Config:
@@ -70,15 +72,27 @@ def _config(port: int, **overrides: object) -> Config:
 
 
 async def _drive(
-    campaign: Campaign, idle_first: float = 0.0, **overrides: object
+    campaign: Campaign,
+    idle_first: float = 0.0,
+    time_compression: float = 0.0,
+    **overrides: object,
 ) -> FakeDCS:
     """Serve `campaign` on an ephemeral port and run one fake mission at it.
 
     `idle_first` leaves the engine running with nothing connected, which is
     the ordinary case of starting the engine before launching DCS.
+
+    `time_compression` defaults to 0 -- the war waits for DCS -- because
+    these runs are about the connected regime. At any other value the war
+    moves while the harness is still connecting, by however much wall time
+    that took, and two identical runs would differ by the host's scheduling.
     """
     server = CampaignServer(
-        campaign, host="127.0.0.1", port=0, tick_period=TICK_PERIOD
+        campaign,
+        host="127.0.0.1",
+        port=0,
+        tick_period=TICK_PERIOD,
+        time_compression=time_compression,
     )
     await server.start()
     try:
@@ -95,11 +109,14 @@ async def _drive(
 
 
 def run_loop(
-    campaign: Campaign | None = None, idle_first: float = 0.0, **overrides: object
+    campaign: Campaign | None = None,
+    idle_first: float = 0.0,
+    time_compression: float = 0.0,
+    **overrides: object,
 ):
     """One end-to-end mission. Returns (campaign, fake DCS)."""
     campaign = Campaign() if campaign is None else campaign
-    sim = asyncio.run(_drive(campaign, idle_first, **overrides))
+    sim = asyncio.run(_drive(campaign, idle_first, time_compression, **overrides))
     return campaign, sim
 
 
@@ -175,6 +192,23 @@ class TestTheLoopCloses(unittest.TestCase):
             "a finished package is still holding inventory",
         )
 
+    def test_the_sa6_site_on_the_route_was_instantiated_and_reported(self):
+        """The threat site is bubble-instantiable like any other entity.
+
+        The observer chases the strike flight, which passes within a few km of
+        the SA-6, so the site must have been spawned, accepted by the harness
+        and reported in a snapshot -- not refused and blocked for the rest of
+        the war, which is what a harness that did not know the template's
+        size would do.
+        """
+        site = self.campaign.theater.threats[SA6]
+        self.assertNotIn(site.spawn_id, self.campaign.blocked)
+        self.assertTrue(
+            self.campaign.tracker.groups[site.spawn_id].ever_seen,
+            "no snapshot ever reported the SA-6 site",
+        )
+        self.assertEqual(site.units_alive, site.units_initial)
+
     def test_the_war_is_over_and_the_client_was_told(self):
         self.assertIn(
             "All assigned strategic targets destroyed.",
@@ -186,7 +220,7 @@ class TestTheLoopCloses(unittest.TestCase):
             path = Path(self.enterContext(_tempdir())) / "campaign.json"
             self.campaign.save(path)
             raw = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(raw["save_version"], 2)
+            self.assertEqual(raw["save_version"], 3)
         reloaded = Campaign.load(path)
         self.assertEqual(reloaded.to_dict(), self.campaign.to_dict())
         # And it is an engine rather than a deserialised blob. `tick` cannot
@@ -452,6 +486,22 @@ class TestTheHarnessRefusesWhatTheClientRefuses(unittest.TestCase):
         self.assertTrue(acks[0].ok)
         self.assertEqual(sim.groups["beef"].units, 4)
 
+    def test_the_sa6_battery_is_accepted_at_its_full_size_and_no_larger(self):
+        sam = dict(
+            spawn_id="5a60",
+            coalition="red",
+            category="ground",
+            template="SA-6_Kub_site",
+            position=(16000.0, 0.0, 25000.0),
+            tasking={"kind": "air_defence"},
+        )
+        sim, acks = self._spawn(units=5, **sam)
+        self.assertTrue(acks[0].ok, acks[0].error)
+        self.assertEqual(sim.groups["5a60"].units, 5)
+        sim, acks = self._spawn(units=6, **sam)
+        self.assertFalse(acks[0].ok)
+        self.assertIn("units 6 exceeds template SA-6_Kub_site capacity of 5", acks[0].error)
+
     def test_a_malformed_airdrome_id_is_refused(self):
         sim, acks = self._spawn(
             route=[Waypoint(pos=(0.0, 0.0, 0.0), airdrome_id="Incirlik")]
@@ -501,6 +551,42 @@ class TestAVersion1ClientIsRefused(unittest.TestCase):
         )
 
 
+class TestTheWarMovesBeforeDCSArrives(unittest.TestCase):
+    """The offline clock, through the real transport and a real hello.
+
+    The engine runs at high time compression with nothing connected, so the
+    war is some hundreds of paper seconds old when the harness connects at
+    mission time zero. How many is up to the host's scheduling; that it is a
+    whole number of paper steps, and that the client is rebased onto it
+    rather than rewinding it, is not.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.campaign, cls.sim = run_loop(idle_first=0.3, time_compression=2000.0)
+
+    def test_the_war_had_moved_in_whole_paper_steps_before_the_hello(self):
+        epoch = self.campaign.mission_epoch
+        self.assertGreater(epoch, 0.0, "the war did not move while DCS was away")
+        self.assertEqual(epoch % PAPER_STEP, 0.0, "a partial step reached the campaign")
+
+    def test_the_client_joined_the_war_where_it_was(self):
+        # At least the whole mission on top of the offline stretch, never
+        # less: the hello rebased mission time zero onto the war's clock
+        # instead of rewinding it. (More, usually -- the war carries on in
+        # paper steps once the harness hangs up, until the server closes.)
+        self.assertGreaterEqual(
+            self.campaign.clock,
+            self.campaign.mission_epoch + MISSION_SECONDS - 5.0,
+        )
+
+    def test_the_loop_still_closes(self):
+        self.assertTrue(self.campaign.theater.targets[DEPOT].destroyed)
+        package = next(iter(self.campaign.packages.values()))
+        self.assertEqual(package.state, COMPLETE)
+        self.campaign.inventories["blue"].check_invariant()
+
+
 class TestDeterminism(unittest.TestCase):
     def test_two_identical_runs_produce_the_same_campaign(self):
         a, _ = run_loop()
@@ -526,6 +612,10 @@ class TestDeterminism(unittest.TestCase):
         The transport ticks on a wall clock. If any of that leaked into the
         campaign clock, an engine launched before DCS would come out of the
         same mission in a different state -- and no log could reproduce it.
+
+        Run at time compression 0, so the only way wall time could reach the
+        campaign is through `tick(now)`. The war moving offline on purpose is
+        TestTheWarMovesBeforeDCSArrives's business.
         """
         prompt, prompt_sim = run_loop()
         early, early_sim = run_loop(idle_first=1.0)

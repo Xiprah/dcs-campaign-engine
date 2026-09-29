@@ -6,15 +6,19 @@ hours of DCS dropping events on the floor.
 
 The rule, restated because it is easy to erode by accident:
 
-    `state` snapshots are the only thing that may record a loss.
-    `event` frames supply attribution and nothing else.
+    `state` snapshots are the only thing that may record a loss for an entity
+    DCS is holding. The engine's own resolution is the only thing that may
+    record one for an entity it is not. `event` frames supply attribution and
+    nothing else.
 
-Concretely, :meth:`AttritionTracker.ingest` is the only method that appends to
-the loss ledger, and :meth:`AttritionTracker.note_event` touches nothing but
-the attribution hint queues. Delete every event frame from a campaign log and
-the ledger comes out the same length, with the same entries, differing only in
-the `attribution` field -- which becomes ``"unknown"``. A loss is never
-dropped for want of an explanation.
+Concretely, :meth:`AttritionTracker.ingest` and
+:meth:`AttritionTracker.record_unobserved` are the only methods that append to
+the loss ledger -- the second refuses any group DCS is holding, so the two
+can never both speak for one entity -- and :meth:`AttritionTracker.note_event`
+touches nothing but the attribution hint queues. Delete every event frame from
+a campaign log and the ledger comes out the same length, with the same
+entries, differing only in the `attribution` field -- which becomes
+``"unknown"``. A loss is never dropped for want of an explanation.
 
 Three things can be true of a group between one snapshot and the next, and the
 tracker must tell them apart, because they mean different things to the war:
@@ -60,6 +64,7 @@ ATTRIBUTION_UNOBSERVED = "unobserved"
 
 KIND_FLIGHT = "flight"
 KIND_TARGET = "target"
+KIND_THREAT = "threat"
 
 #: Event kinds whose *target* is the thing that died.
 _VICTIM_IS_TARGET = frozenset({"kill", "hit"})
@@ -400,6 +405,45 @@ class AttritionTracker:
             self._resolve(group)
 
         return revealed
+
+    # -- resolution (paper) -----------------------------------------------
+
+    def record_unobserved(self, spawn_id: str, count: int, t: float) -> list[LossRecord]:
+        """Book `count` units lost where nobody was watching.
+
+        The paper counterpart of :meth:`ingest`, and the only other way into
+        the ledger. It does what a snapshot does to the group -- fewer units
+        alive, resolved at zero -- so that everything reading the tracker
+        afterwards (the next spawn's unit count above all) sees the paper
+        damage, exactly as it would see observed damage.
+
+        Refuses, recording nothing, for a group DCS is holding: that group's
+        losses come only from snapshots (docs/design.md, section 1), and a
+        loss booked here as well would be the same unit dying twice.
+        """
+        group = self.groups.get(spawn_id)
+        if group is None or group.resolved or group.instantiated:
+            return []
+        lost = min(max(0, count), group.units_alive)
+        if lost == 0:
+            return []
+        records = [
+            LossRecord(
+                t=t,
+                spawn_id=group.spawn_id,
+                entity_id=group.entity_id,
+                entity_kind=group.entity_kind,
+                coalition=group.coalition,
+                cause=CAUSE_UNOBSERVED,
+                attribution=ATTRIBUTION_UNOBSERVED,
+            )
+            for _ in range(lost)
+        ]
+        self.losses.extend(records)
+        group.units_alive -= lost
+        if group.units_alive == 0:
+            self._resolve(group)
+        return records
 
     def _record(
         self, group: TrackedGroup, count: int, t: float, cause: str

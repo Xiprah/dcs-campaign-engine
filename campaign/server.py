@@ -23,7 +23,7 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Final
 
-from campaign.api import CampaignEngine
+from campaign.api import PAPER_STEP, CampaignEngine
 from campaign.protocol import (
     Ack,
     Downlink,
@@ -45,6 +45,19 @@ DEFAULT_PORT: Final = 7777
 
 #: How often :meth:`CampaignEngine.tick` is called, in seconds.
 DEFAULT_TICK_PERIOD: Final = 1.0
+
+#: Campaign seconds per wall second while no mission client is synced. 1 is
+#: real time: the war carries on while you are away at the pace it would have
+#: had with you there. 0 stops it, which is what the engine did before it had
+#: an offline clock.
+DEFAULT_TIME_COMPRESSION: Final = 1.0
+
+#: Most paper steps one tick may run. Paper steps are cheap, but a host
+#: resumed from a night's sleep owes the war thousands of them, and running
+#: them all in one tick would stall a DCS that connects in that moment. The
+#: rest are carried to later ticks, which changes when they run and not what
+#: they do. 720 is an hour of war per tick.
+MAX_PAPER_STEPS_PER_TICK: Final = 720
 
 #: Deliberately far below MAX_FRAME_BYTES: FrameBuffer rejects a *buffer* over
 #: the cap, not a frame, so small reads keep a burst of legal frames legal.
@@ -71,6 +84,50 @@ def _elapsed_clock() -> Callable[[], float]:
         return time.monotonic() - start
 
     return now
+
+
+class PaperPacer:
+    """Turns elapsed wall time into a count of whole paper steps.
+
+    The wall clock is allowed to decide *how many* steps the war takes and
+    never *what* a step is: the campaign only ever receives
+    `advance(PAPER_STEP)`. Fractions of a step are carried, not rounded, so
+    however the elapsed time is chunked -- one long tick or a thousand jittery
+    short ones -- the same total wall time yields the same number of steps,
+    and so the same war (docs/design.md, section 2).
+    """
+
+    def __init__(
+        self,
+        compression: float,
+        *,
+        step: float = PAPER_STEP,
+        max_steps: int = MAX_PAPER_STEPS_PER_TICK,
+    ) -> None:
+        if not (compression >= 0.0 and compression != float("inf")):
+            raise ValueError(f"time compression must be finite and >= 0, not {compression}")
+        self.compression = compression
+        self.step = step
+        self.max_steps = max_steps
+        #: Campaign seconds owed and not yet stepped.
+        self.backlog = 0.0
+
+    def feed(self, elapsed: float) -> int:
+        """Credit `elapsed` wall seconds; return how many steps to run now."""
+        if elapsed > 0.0:
+            self.backlog += elapsed * self.compression
+        steps = min(int(self.backlog // self.step), self.max_steps)
+        self.backlog -= steps * self.step
+        return steps
+
+    def reset(self) -> None:
+        """A client is synced: mission time owns the clock, and owes nothing.
+
+        Whatever was owed is dropped rather than paid later. Paying it once
+        the client left again would advance the war for time the sim already
+        accounted for.
+        """
+        self.backlog = 0.0
 
 
 _HANDLERS: Final[dict[type, str]] = {
@@ -119,12 +176,14 @@ class CampaignServer:
         port: int = DEFAULT_PORT,
         tick_period: float = DEFAULT_TICK_PERIOD,
         clock: Callable[[], float] | None = None,
+        time_compression: float = DEFAULT_TIME_COMPRESSION,
     ) -> None:
         self._engine = engine
         self._host = host
         self._port = port
         self._tick_period = tick_period
         self._clock = clock if clock is not None else _elapsed_clock()
+        self._pacer = PaperPacer(time_compression)
         self._server: asyncio.Server | None = None
         self._tick_task: asyncio.Task[None] | None = None
         self._conn: _Connection | None = None
@@ -140,6 +199,16 @@ class CampaignServer:
     @property
     def connected(self) -> bool:
         return self._conn is not None
+
+    @property
+    def synced(self) -> bool:
+        """A mission client has said hello on a live connection.
+
+        The line between the two clock regimes. An accepted socket that has
+        not said hello yet is not a client: nothing is attached to the war.
+        """
+        conn = self._conn
+        return conn is not None and conn.alive and conn.synced
 
     async def start(self) -> None:
         """Bind, listen, and start the tick task. Returns once accepting."""
@@ -358,13 +427,44 @@ class CampaignServer:
 
     # -- tick --------------------------------------------------------------
 
+    def advance_offline(self, elapsed: float) -> int:
+        """Credit `elapsed` wall seconds to the war if nobody is connected.
+
+        Returns the number of paper steps taken. Called by the tick loop with
+        the wall time since the previous tick; exposed so the pacing can be
+        driven without waiting on a real clock.
+
+        The steps' output is dropped. With no synced client there is nobody to
+        send it to, and nothing is lost: the hello that ends the offline
+        stretch re-issues everything live and re-briefs every open package.
+        """
+        if self.synced:
+            self._pacer.reset()
+            return 0
+        steps = self._pacer.feed(elapsed)
+        for taken in range(steps):
+            try:
+                self._engine.advance(PAPER_STEP)
+            except Exception:
+                # Same policy as a raising tick: log, keep the transport alive.
+                # The rest of this batch is dropped, not retried, so a step
+                # that always raises cannot pin the loop.
+                logger.exception("advance raised; campaign continues")
+                self._pacer.reset()
+                return taken
+        return steps
+
     async def _tick_loop(self) -> None:
         deadline = self._clock()
+        last = deadline
         while True:
             deadline += self._tick_period
             await asyncio.sleep(max(0.0, deadline - self._clock()))
+            now = self._clock()
+            elapsed, last = now - last, now
+            self.advance_offline(elapsed)
             try:
-                frames = self._engine.tick(self._clock())
+                frames = self._engine.tick(now)
             except Exception:
                 logger.exception("tick raised; campaign continues")
                 continue
@@ -383,9 +483,16 @@ async def serve(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     tick_period: float = DEFAULT_TICK_PERIOD,
+    time_compression: float = DEFAULT_TIME_COMPRESSION,
 ) -> None:
     """Run a :class:`CampaignServer` until cancelled."""
-    server = CampaignServer(engine, host=host, port=port, tick_period=tick_period)
+    server = CampaignServer(
+        engine,
+        host=host,
+        port=port,
+        tick_period=tick_period,
+        time_compression=time_compression,
+    )
     try:
         await server.serve_forever()
     finally:
@@ -396,6 +503,9 @@ __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "DEFAULT_TICK_PERIOD",
+    "DEFAULT_TIME_COMPRESSION",
+    "MAX_PAPER_STEPS_PER_TICK",
     "CampaignServer",
+    "PaperPacer",
     "serve",
 ]

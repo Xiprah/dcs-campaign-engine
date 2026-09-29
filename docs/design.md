@@ -46,12 +46,54 @@ of any step. Chunking, jitter and a slow machine change how far the war has
 got at a given moment, never where it goes.
 
 `advance` is a no-op while connected; the campaign enforces this itself rather
-than trusting the transport to only call it at the right time.
+than trusting the transport to only call it at the right time. It accepts only
+a whole number of steps and runs them one at a time, so `advance(3 * step)`
+and three `advance(step)` calls are the same war.
+
+**The step is 5 seconds** (`campaign.api.PAPER_STEP`), because that is the
+resolution the connected war already has: the observer frame is the
+campaign's heartbeat while DCS is attached, and it arrives every 5 s. Offline,
+a takeoff, a TOT or an RTB lands at most one step late, the same as online. A
+finer step buys precision the observed war never had; a coarser one lets a
+flight overfly its TOT. A day of war is 17,280 steps, well under a second of
+CPU. It is a constant, not a setting, because changing it changes what a
+saved war does next.
+
+A step **settles the present before it moves**: it pulses at the current
+clock, then advances and pulses again. A pulse at an unchanged clock does
+nothing the second time, so this is free whenever something already pulsed
+there. When nothing has — a campaign just created or loaded — it stops the
+result depending on whether the transport happened to tick before the first
+step, which would otherwise decide whether the first package is planned now or
+one step later.
+
+**Observers do not survive the war moving on.** When DCS goes away the players
+go with it. The last observer positions are kept through a disconnect, so a
+quick restart re-issues the same bubble, but the first paper step clears them.
+From then on they say where the players *were*: a bubble built from them
+would keep instantiating things for nobody, and the next `hello` would
+re-issue that stale picture to a mission whose players are somewhere else.
+Clearing them empties the bubble through the ordinary despawn path, which
+also marks every group as no longer held by DCS. That matters for a save
+written by a process that was killed while connected: its groups still read
+as instantiated, and without the despawn they would defer to snapshots that
+can never arrive, so nothing offline could hit them or shoot at them. The
+next observer frame rebuilds the bubble around where the players are now.
+
+`connected` describes a socket in one process, so it is not saved. A campaign
+loaded from disk has no client.
 
 The transport paces offline advancement at `--time-compression N` (default 1:
-the war carries on at real speed while you are away, which is the BMS feel).
+the war carries on at real speed while you are away, which is the BMS feel; 0
+makes the war wait for DCS, as the first slice did). It carries fractions of a
+step between ticks rather than rounding them, so any chunking of the same wall
+time yields the same number of steps. It runs at most 720 steps in one tick
+and carries the rest, so a host waking from sleep catches up over a few ticks
+instead of stalling a DCS that connects in that moment. Whatever is still owed
+when a client says hello is dropped: from then on mission time owns the clock.
 `python -m campaign --save war.json --simulate SECONDS` fast-forwards a save
-with no server at all, for testing and for catching a war up overnight.
+with no server at all, for testing and for catching a war up overnight. It
+runs whole steps; a remainder shorter than one step is not run.
 
 Rejected: advancing on the wall clock directly. That makes the war's content
 depend on scheduling jitter, and a campaign that cannot be replayed is a
@@ -84,10 +126,38 @@ diverges from the first early kill onward.
 
 Paper flight losses go through the attrition tracker — decrementing the
 tracked group *and* debiting the squadron reservation — so airframe
-conservation holds exactly as it does for observed losses.
+conservation holds exactly as it does for observed losses. A flight lost whole
+on paper closes out the way one lost in a snapshot does. The tracker's paper
+entry point refuses any group DCS is holding, so section 1 is enforced in the
+tracker as well as by the caller. Paper damage to a *target* goes through the
+same entry point. Before this it reached the ledger and the theater but not
+the tracker, and a spawn reads its unit count from the tracker, so a target
+damaged offline came back into DCS whole.
+
+**The route** is the paper track's single leg, base to target. Egress retraces
+it, so one pass through each envelope stands for the whole sortie. A site's
+envelope is one ground radius around it.
+
+**The authority is decided at the TOT**, as section 1 requires, and that has a
+consequence worth knowing. A flight DCS held for part of its route but not at
+its TOT is rolled for the whole route. A flight DCS holds at its TOT is not
+rolled at all, even if it flew most of the way unwatched. Exposure is one
+event, not a running integral along the track.
 
 Kill probabilities are flat placeholders. A real threat model (altitude bands,
-terrain masking, EW, per-type envelopes) replaces them behind the same seam.
+terrain masking, EW, per-type envelopes) replaces them behind the same seam:
+`campaign.resolver.resolve_exposure` takes one probability per site and only
+rolls them, so whatever computes those probabilities — including the
+suppression a SEAD element buys (section 5) — changes nothing downstream.
+`Theater.live_threats_along` is the question the SEAD planner asks ("is this
+route exposed?"), and the enemy is taken from the flight's own coalition, not
+from `player_coalition`, so a red flight will face blue's sites (section 4)
+through the same code.
+
+The slice has one threat site: an SA-6 battery (one radar, four launchers),
+with invented coordinates like everything else on the map. It is placed about
+5 km off the Incirlik–Latakia leg so the slice's only strike route runs
+through its envelope.
 
 ## 4. The enemy: both sides fight
 

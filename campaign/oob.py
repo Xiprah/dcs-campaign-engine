@@ -254,8 +254,10 @@ class Squadron:
 class SideInventory:
     """Everything one coalition can put in the air.
 
-    TODO(seam): ground formations, SAM batteries and the supply that feeds
-    them belong alongside `squadrons`. Not in this slice.
+    TODO(seam): ground formations and the supply that feeds them -- SAM
+    reloads included -- belong alongside `squadrons`. Not in this slice. Fixed
+    air-defence sites are on the map instead (`theater.ThreatSite`): they are
+    places a route passes, not stock a planner draws from.
     """
 
     coalition: Coalition
@@ -323,8 +325,9 @@ class SideInventory:
 def build_slice_oob() -> tuple[SideInventory, SideInventory]:
     """Blue gets one F-16C squadron at Incirlik. Red flies nothing yet.
 
-    TODO(seam): red air, and the threat model that would make blue plan
-    around it, go here. Out of scope.
+    TODO(seam): red air goes here (docs/design.md, section 4). Red's air
+    defences already exist, as `theater.ThreatSite`s on the map rather than
+    inventory; blue planning around them is section 5.
     """
     blue = SideInventory(coalition="blue")
     blue.add(

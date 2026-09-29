@@ -22,6 +22,11 @@ asking whether the target is instantiated right then. A target hit on paper and
 spawned later comes into the world already carrying its damage, because a spawn
 sends the target's current `units_alive`.
 
+The same rule runs the other way at the same instant. A strike flight DCS is
+not holding at its TOT is flown through the enemy's air defences on paper
+(:func:`resolve_exposure`) before it releases anything, so an unwatched sortie
+can be lost as well as won.
+
 This is also the one place the campaign's seeded RNG earns its keep. Every roll
 here comes off `Campaign.rng`, whose state round-trips through the save, so an
 unobserved war is as replayable as an observed one.
@@ -74,3 +79,46 @@ def resolve_strike(
         if hit and killed < target_units_alive:
             killed += 1
     return StrikeOutcome(units_killed=killed, rounds_rolled=rounds)
+
+
+@dataclass(frozen=True)
+class ExposureOutcome:
+    """What an unwatched flight's pass through enemy air defences cost it."""
+
+    aircraft_lost: int
+    rolls: int
+
+
+def resolve_exposure(
+    *,
+    aircraft: int,
+    kill_probabilities: list[float],
+    rng: random.Random,
+) -> ExposureOutcome:
+    """Roll a flight's exposure to the threat sites along its route.
+
+    `kill_probabilities` has one entry per site whose envelope the route
+    enters, in the order the sites are to fire. Every site rolls once for
+    every aircraft, and an aircraft is lost if any site's roll against it
+    succeeds.
+
+    Every aircraft is rolled against every site even once it is already dead,
+    so the draws taken from `rng` are exactly `aircraft * len(sites)` whatever
+    the dice say -- the same discipline as :func:`resolve_strike`, for the same
+    reason: an early kill must not shift every later roll in the campaign.
+
+    TODO(threat-model): the probabilities are flat per-site placeholders. A
+    real model -- altitude bands, terrain masking, EW, per-type envelopes, and
+    the suppression a SEAD element buys (docs/design.md, section 5) -- decides
+    the numbers passed in here; this function only has to roll them.
+    """
+    if aircraft <= 0:
+        return ExposureOutcome(aircraft_lost=0, rolls=0)
+    lost = [False] * aircraft
+    for pk in kill_probabilities:
+        for i in range(aircraft):
+            if rng.random() < pk:
+                lost[i] = True
+    return ExposureOutcome(
+        aircraft_lost=sum(lost), rolls=aircraft * len(kill_probabilities)
+    )

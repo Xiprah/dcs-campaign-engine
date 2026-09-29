@@ -446,15 +446,43 @@ class TestFullSortie(unittest.TestCase):
         sqn = self.mission.campaign.inventories["blue"].squadron(SQUADRON)
         self.assertEqual(sqn.open_reservations, {})
 
+    def test_the_sa6_site_was_built_as_a_red_ground_group_radar_first(self):
+        site = self.mission.campaign.theater.threats["latakia_north_sa6"]
+        calls = {c.get("name"): c for c in self.mission.mock.spawn_calls()}
+        call = calls.get(group_name(site.spawn_id))
+        self.assertIsNotNone(call, "the SA-6 over the target was never spawned")
+        g = self.mission.mock.lua.globals()
+        self.assertEqual(call["country"], g.country.id.RUSSIA)
+        self.assertEqual(call["category"], g.Group.Category.GROUND)
+        units = call["data"]["units"]
+        self.assertEqual(
+            [u["type"] for u in units], ["Kub 1S91 str"] + ["Kub 2P25 ln"] * 4
+        )
+        self.assertTrue(all("payload" not in u for u in units), "a SAM carries a payload")
+        # The engine heard back: acked, and reported by a snapshot.
+        self.assertTrue(self.mission.campaign.tracker.groups[site.spawn_id].ever_seen)
+
+        # Aircraft still carry theirs; the ground rule must not strip them.
+        flight = calls[group_name(self.mission.package.spawn_id)]
+        self.assertTrue(all("payload" in u for u in flight["data"]["units"]))
+
     def test_everything_the_engine_owned_was_despawned_from_dcs(self):
-        self.assertTrue(self.mission.engine.downlink_of(Despawn))
-        leftovers = [
+        despawned = {f.spawn_id for f in self.mission.engine.downlink_of(Despawn)}
+        package = self.mission.package
+        depot = self.mission.campaign.theater.targets[DEPOT]
+        self.assertIn(package.spawn_id, despawned)
+        self.assertIn(depot.spawn_id, despawned)
+        leftovers = sorted(
             n
             for n in self.mission.mock.group_names() + self.mission.mock.static_names()
             if n.startswith("cmp_")
-        ]
-        self.assertEqual(leftovers, [], "engine-owned objects outlived their despawn")
-        self.assertEqual(self.mission.mock.status()["live_spawns"], 0)
+        )
+        # The SA-6 covering the target is still standing, and the observer is
+        # still over it, so it is rightly still in DCS. Nothing else may be.
+        still_live = sorted(group_name(s) for s in self.mission.campaign.live)
+        self.assertEqual(leftovers, still_live, "engine-owned objects outlived their despawn")
+        self.assertNotIn(group_name(package.spawn_id), leftovers)
+        self.assertEqual(self.mission.mock.status()["live_spawns"], len(still_live))
 
     def test_a_despawn_reports_ground_truth_before_it_destroys_anything(self):
         """The ordering the protocol calls out: state, then Group.destroy.

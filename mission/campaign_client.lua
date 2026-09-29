@@ -451,9 +451,9 @@ local RAMP_START = {"TakeOffParking", "From Parking Area"}
 -- strike. Fill these from mission-editor exported group data:
 --   pylons = {[3] = {CLSID = "<clsid>"}, [7] = {CLSID = "<clsid>"}}
 --
--- TODO(seam): ground-war templates (front-line brigades, SAM sites,
--- logistics convoys) would be added here with category "ground". Out of
--- scope for the vertical slice; the engine does not ask for them yet.
+-- TODO(seam): ground-war templates (front-line brigades, logistics
+-- convoys) would be added here with category "ground", the way the SA-6
+-- site below is. Out of scope for the vertical slice.
 -- ------------------------------------------------------------------
 
 local DEFAULT_PAYLOAD = {
@@ -499,7 +499,25 @@ local TEMPLATES = {
         count = 4,
         spread = 60,
     },
+    -- A red air-defence site (campaign/theater.py: ThreatSite.template). A
+    -- ground group, so the sim shoots with it when it is instantiated; the
+    -- engine only rolls it on paper for flights DCS is not holding.
+    --
+    -- `lead_type` is unit 1: the 1S91 "Straight Flush" radar that the 2P25
+    -- launchers need to engage at all. A battery re-issued with fewer units
+    -- is built from the front, so it keeps its radar and loses launchers.
+    ["SA-6_Kub_site"] = {
+        lead_type = "Kub 1S91 str",
+        unit_type = "Kub 2P25 ln",
+        count = 5,
+        task = "Ground Nothing",
+        skill = "High",
+    },
 }
+
+--- Categories that fly. Only these carry a payload: a weapons table on a
+--- vehicle is meaningless to DCS at best.
+local AIRBORNE = {plane = true, airplane = true, helicopter = true}
 
 -- ------------------------------------------------------------------
 -- Spawn
@@ -689,6 +707,8 @@ local function build_group_data(spawn, tmpl, name, count)
     local units = {}
     local gx, gy, galt = pos_xy(spawn.position)
     local heading = tonumber(spawn.heading) or 0
+    local payload = nil
+    if AIRBORNE[spawn.category] then payload = tmpl.payload or DEFAULT_PAYLOAD end
 
     for i = 1, count do
         units[i] = {
@@ -696,7 +716,7 @@ local function build_group_data(spawn, tmpl, name, count)
             -- an event is still recognisably ours even though the engine
             -- resolves entities by group name.
             name = name .. "_" .. i,
-            type = tmpl.unit_type,
+            type = (i == 1 and tmpl.lead_type) or tmpl.unit_type,
             -- 50 m lateral stagger: a formation stacked on one point is a
             -- mid-air the moment it spawns.
             x = gx + (i - 1) * 50,
@@ -706,7 +726,7 @@ local function build_group_data(spawn, tmpl, name, count)
             heading = heading,
             speed = 200,
             skill = tmpl.skill or "High",
-            payload = tmpl.payload or DEFAULT_PAYLOAD,
+            payload = payload,
         }
     end
 

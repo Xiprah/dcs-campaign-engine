@@ -84,7 +84,7 @@ It can also be checked by hand across two processes:
 $ python tools/diff_saves.py saves/with-events.json saves/no-events.json
 campaign state identical: 5 loss record(s)
   loss 0: attribution 'hit/red_sa6_bassel/9M33' -> 'unknown'
-  loss 1: attribution 'hit/cmp_0002/GBU-38'     -> 'unknown'
+  loss 1: attribution 'hit/cmp_0003/GBU-38' -> 'unknown'
   ...
 ```
 
@@ -100,9 +100,14 @@ the comparison means nothing. Pacing (the harness default) makes divergence
 rare, not impossible. For an answer you can rely on, use the test.
 
 Determinism serves the same end. Nothing in campaign logic reads a wall clock
-or an unseeded random source: time arrives on frames as mission time, chance
-comes from one seeded `random.Random` whose state round-trips through the
-save. A whole war replays from its log.
+or an unseeded random source, and chance comes from one seeded
+`random.Random` whose state round-trips through the save. Time arrives two
+ways (docs/design.md, section 2). While DCS is connected it arrives on frames
+as mission time, and the engine never moves itself. While it is not, the war
+carries on in fixed five-second paper steps (`Campaign.advance`). The wall
+clock decides only *how many* steps the transport delivers, and never what a
+step is. So a war is a pure function of its log and its step count, however
+the host's scheduling chunked them, and it replays from both.
 
 ---
 
@@ -124,28 +129,55 @@ the spawns it is given, and resolves the strike:
 python tools/fake_dcs.py --port 7777
 ```
 
-What a healthy run looks like:
+What a healthy run looks like (abridged):
 
 ```
 sync: campaign_time=0 state=30s observer=5s bubble=75000m
 MSG [blue] VIPER on task: strike on Latakia Fuel Depot, TOT 1471.
-spawned cmp_0002 (F-16C_strike_jdam, plane) 2 unit(s), 3 waypoint(s)
-spawned cmp_0001 (fuel_depot_medium, structure) 4 unit(s)
-strike at t=1407: cmp_0002 -> cmp_0001, target destroyed, flight 1/2 remaining
+spawned cmp_0003 (F-16C_strike_jdam, plane) 2 unit(s), 3 waypoint(s)
+spawned cmp_0002 (SA-6_Kub_site, ground) 5 unit(s), 0 waypoint(s)
+spawned cmp_0001 (fuel_depot_medium, structure) 4 unit(s), 0 waypoint(s)
+strike at t=1407: cmp_0003 -> cmp_0001, target destroyed, flight 1/2 remaining
 MSG [blue] Latakia Fuel Depot destroyed.
 MSG [blue] VIPER off target, 1 aircraft egressing.
-despawned cmp_0002 (mission_complete)
+despawned cmp_0002 (left_bubble)
+despawned cmp_0003 (mission_complete)
 MSG [blue] VIPER recovered, 1 aircraft home.
 MSG [blue] All assigned strategic targets destroyed.
 ```
 
 (`on task` rather than `fragged` because the engine planned the package before
-the client connected; a client that is already there hears it fragged live.)
+the client connected; a client that is already there hears it fragged live.
+`cmp_0002` is the SA-6 battery covering the approach to Latakia. The observer
+chasing the flight brings it into the bubble, so here DCS, not the engine,
+decides what it shoots down. The harness's scripted loss stands in for that.)
 
 and in the save afterwards: the depot at `units_alive: 0`, the
 squadron at 11 of 12 airframes with 1 lost, 2 GBU-38 expended and 2 lost with
 the jet that carried them, the package `complete`, and no reservation left
 open. Start the engine again on the same save and it carries on from there.
+
+### With DCS closed
+
+The war does not wait for you. With no mission client connected, the engine
+advances the campaign itself in five-second paper steps at
+`--time-compression N` campaign seconds per wall second (default 1, real
+time; 0 makes the war wait for DCS). Everything is outside the bubble then,
+so the engine resolves everything on paper: strikes against their targets,
+and the strike flights against the air defences on their route. When DCS
+connects again, mission time zero is pinned to wherever the war has got to.
+
+To catch a war up without a server, for testing or overnight:
+
+```
+$ python -m campaign --save saves/campaign.json --simulate 86400
+simulated 17280 paper step(s) of 5s; campaign clock 0s -> 86400s
+```
+
+Run against a fresh save, that day is four sorties. The depot is flattened,
+and one F-16 falls to the SA-6 on the way in, with its two bombs. That is the
+point of section 3 of docs/design.md: an unwatched war can be lost as well as
+won.
 
 Three flags earn their keep:
 
@@ -195,13 +227,14 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
 | `campaign/protocol.py` | frame types, encode/decode, framing. The executable half of the spec. |
 | `campaign/api.py` | the `CampaignEngine` seam between campaign logic and sockets. |
 | `campaign/campaign.py` | the brain. Owns identity, time, chance, and all state. |
-| `campaign/theater.py` | the map: airbases, targets, and the one correct way to measure distance. |
+| `campaign/theater.py` | the map: airbases, targets, threat sites, and the one correct way to measure distance. |
 | `campaign/oob.py` | order of battle. Inventory is conserved, not merely decremented. |
 | `campaign/planner.py` | the minimal ATO: select a target, build a package, schedule a TOT. |
 | `campaign/bubble.py` | what DCS is allowed to know about, with hysteresis so it does not thrash. |
 | `campaign/attrition.py` | reconciliation. The load-bearing module. |
+| `campaign/resolver.py` | what happened where nobody was looking: unobserved strikes, and flights through air defences. |
 | `campaign/audit.py` | the reconciliation rule as something a machine can check. |
-| `campaign/server.py` | asyncio TCP transport. Owns every socket, knows nothing about war. |
+| `campaign/server.py` | asyncio TCP transport. Owns every socket and paces the offline clock; knows nothing about war. |
 | `campaign/__main__.py` | `python -m campaign`. Wiring only. |
 | `mission/campaign_client.lua` | the DCS client: socket, tick loop, spawning, snapshots. |
 | `tools/fake_dcs.py` | the offline DCS stand-in. |
@@ -226,19 +259,35 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
 - Reconnect after a sim restart: re-sync, re-issue every live spawn at the
   unit count attrition has already recorded, and rebase the mission clock so
   the campaign loses no time.
+- The war with DCS closed: the engine advances itself in fixed paper steps at
+  `--time-compression`, or `--simulate` fast-forwards a save with no server.
+  A client connecting afterwards joins the war where it is.
+- Out-of-bubble resolution, both ways: a strike nobody is watching is rolled
+  against its target, and the flight is first rolled against every live enemy
+  air-defence site its route passes. Paper losses go through the same tracker
+  and the same conserved inventory as observed ones. A flight DCS is holding
+  is never rolled.
+- One threat site, an SA-6 battery under the strike route, instantiated in the
+  bubble like anything else. `mission/validate_templates.lua` probes its
+  template.
 
 **What is stubbed, faked or deliberately missing:**
 
-- **Out-of-bubble strike resolution.** A strike nobody is near currently does
-  no damage at all, because damage may only come from a snapshot. This is the
-  one place the campaign's seeded RNG is meant to matter, and it is not
-  written yet. Seam: `Campaign._release_weapons`.
-- **One package at a time.** No multi-package deconfliction, no SEAD, escort,
-  tanker or AWACS. Seams: `Campaign._plan`, `planner`'s module docstring.
+- **A real threat model.** Each site is one ground radius and one flat
+  per-aircraft kill probability, with no altitude bands, terrain masking or
+  EW. Exposure is rolled once, at the TOT, for the whole route. Seams:
+  `theater.ThreatSite`, `resolver.resolve_exposure`.
+- **One package at a time**, and the planner does not plan around threats:
+  no SEAD or DEAD, no routing around an envelope, no escort, tanker or AWACS.
+  Seams: `Campaign._plan`, `Theater.live_threats_along`, `planner`'s module
+  docstring. SEAD packages are docs/design.md section 5.
+- **Nothing on paper can hurt a threat site.** A site loses units only to
+  snapshots, so only when DCS holds it and something in the sim shoots at it.
+  That is DEAD, section 5.
 - **No ground war**, front line, base capture or logistics network. Seams:
   `theater.Airbase`, `theater.Theater`, `oob.SideInventory`.
-- **No red air.** Red flies nothing; blue plans against no threat. Seam:
-  `oob.build_slice_oob`.
+- **No red air.** Red flies nothing and plans nothing. Its only teeth are the
+  SA-6. Seam: `oob.build_slice_oob`; docs/design.md section 4.
 - **No pilots.** A package draws anonymous airframes; ejections and deaths are
   events nobody records. Seam: `oob.Squadron`.
 - **Placeholder DCS templates.** `TEMPLATES` in `campaign_client.lua` maps
@@ -260,5 +309,10 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   That is the correct reading, but it makes partial reports a trap.
 - `CampaignEngine.tick(now)` is documented as taking monotonic wall seconds,
   and the campaign deliberately ignores the value: wall seconds are not
-  mission seconds. `tick` is a pulse, and the campaign advances on the mission
-  time carried by frames. See `Campaign.tick`.
+  mission seconds. `tick` is a pulse. The campaign advances on the mission
+  time carried by frames while DCS is connected, and on `advance` while it is
+  not. See `Campaign.tick`.
+- When the war moves on without DCS, the players' last positions are
+  forgotten, so the bubble is empty when DCS comes back until the first
+  observer frame arrives, 5 s later. A restart with no paper time in between
+  keeps them.

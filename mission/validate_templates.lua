@@ -10,7 +10,8 @@
   WHY IT EXISTS
 
   campaign_client.lua names a lot of DCS *content* that nothing can check
-  from outside a DCS install: the unit type "F-16C_50", the static
+  from outside a DCS install: the unit type "F-16C_50", the SA-6 battery's
+  "Kub 1S91 str" / "Kub 2P25 ln" and its "Ground Nothing" task, the static
   type/category pair ("Tank" / "Fortifications"), three country ids, the
   Bombing and AttackGroup task schemas, the waypoint action and alt_type
   strings, and a payload whose pylon table is empty. The offline suite is
@@ -153,10 +154,22 @@ local SPEC = {
             count = 4,
             spread = 60,
         },
+        -- A red ground group: probed as the client builds it, for RUSSIA,
+        -- on the ground, with no payload, radar first.
+        ["SA-6_Kub_site"] = {
+            lead_type = "Kub 1S91 str",
+            unit_type = "Kub 2P25 ln",
+            count = 5,
+            task = "Ground Nothing",
+            skill = "High",
+            probe_category = "ground",
+            probe_country = "RUSSIA",
+        },
     },
 
     --- Iterated in this order so a run is reproducible.
-    template_order = {"F-16C_strike_jdam", "F-16C_cap", "fuel_depot_medium"},
+    template_order = {"F-16C_strike_jdam", "F-16C_cap", "fuel_depot_medium",
+                      "SA-6_Kub_site"},
 
     --- campaign_client.lua: dcs_maps().country
     country = {
@@ -413,14 +426,19 @@ local function waypoint(x, y, alt, wp_type, wp_action, alt_type)
     }
 end
 
---- opts: name, unit_type, count, task, skill, payload, x, y, alt,
----       wp_type, wp_action, alt_type, tasks, airdrome_id
+--- opts: name, unit_type, lead_type, count, task, skill, payload, ground,
+---       x, y, alt, wp_type, wp_action, alt_type, tasks, airdrome_id
+---
+--- `ground` mirrors the client's AIRBORNE test: a ground group's units
+--- carry no payload at all.
 local function build_group_data(opts)
     local units = {}
+    local payload = nil
+    if not opts.ground then payload = opts.payload or DEFAULT_PAYLOAD end
     for i = 1, (opts.count or 1) do
         units[i] = {
             name = opts.name .. "_" .. i,
-            type = opts.unit_type,
+            type = (i == 1 and opts.lead_type) or opts.unit_type,
             x = opts.x + (i - 1) * 50,
             y = opts.y + (i - 1) * 50,
             alt = opts.alt,
@@ -428,7 +446,7 @@ local function build_group_data(opts)
             heading = 0,
             speed = 200,
             skill = opts.skill or "High",
-            payload = opts.payload or DEFAULT_PAYLOAD,
+            payload = payload,
         }
     end
 
@@ -756,17 +774,20 @@ local function build_cases()
                     end,
                 })
             else
+                local ground = tmpl.probe_category == "ground"
+                local lead = tmpl.lead_type
+                              and (tostring(tmpl.lead_type) .. " + ") or ""
                 add({
                     id = "template." .. key,
                     kind = "group",
                     required = true,
-                    label = key .. " -> " .. tostring(tmpl.unit_type)
+                    label = key .. " -> " .. lead .. tostring(tmpl.unit_type)
                             .. " x" .. tostring(tmpl.count)
                             .. " task '" .. tostring(tmpl.task)
                             .. "' skill '" .. tostring(tmpl.skill) .. "'",
                     attempt = function(case, index)
                         local rec = new_case_record(case)
-                        local cid = country_id("USA")
+                        local cid = country_id(tmpl.probe_country or "USA")
                         local cat = group_category(
                             SPEC.category[tmpl.probe_category or "plane"])
                         if cid == nil or cat == nil then
@@ -775,14 +796,19 @@ local function build_cases()
                             return rec
                         end
                         local x, y = case_position(index)
+                        -- Ground groups sit on the ground at the case point,
+                        -- which is why the origin has to be land.
                         return try_group(rec, {data = build_group_data({
                             name = NAME_PREFIX .. key,
                             unit_type = tmpl.unit_type,
+                            lead_type = tmpl.lead_type,
                             count = tmpl.count,
                             task = tmpl.task,
                             skill = tmpl.skill,
                             payload = tmpl.payload,
-                            x = x, y = y, alt = CONFIG.altitude,
+                            ground = ground,
+                            x = x, y = y,
+                            alt = ground and 0 or CONFIG.altitude,
                         })}, cid, cat)
                     end,
                 })
@@ -1148,8 +1174,8 @@ end
 -- Cross-check against the live client, when there is one
 -- ------------------------------------------------------------------
 
-local TEMPLATE_FIELDS = {"unit_type", "count", "task", "skill", "static",
-                         "static_category", "spread"}
+local TEMPLATE_FIELDS = {"unit_type", "lead_type", "count", "task", "skill",
+                         "static", "static_category", "spread"}
 
 local function pylon_count(payload)
     if type(payload) ~= "table" or type(payload.pylons) ~= "table" then

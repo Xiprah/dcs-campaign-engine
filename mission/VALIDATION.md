@@ -1,8 +1,10 @@
 # Template validation
 
 `campaign_client.lua` names a lot of DCS **content** that nothing outside a
-DCS install can check: the unit type `F-16C_50`, the static type/category
-pair `Tank` / `Fortifications`, three `country.id` values, the `Bombing` and
+DCS install can check: the unit type `F-16C_50`, the SA-6 battery's
+`Kub 1S91 str` radar and `Kub 2P25 ln` launchers under a `Ground Nothing`
+group task, the static type/category pair `Tank` / `Fortifications`, three
+`country.id` values, the `Bombing` and
 `AttackGroup` task schemas, the waypoint `type`/`action`/`alt_type` strings,
 and a payload whose `pylons` table is empty. The offline suite is green
 whether or not DCS would accept any of them, because the mock in
@@ -35,6 +37,8 @@ out one crash at a time, a week apart, in the middle of a sortie.
   its check is looking a frame too early;
 - whether each `country.id` the client maps a coalition onto exists in this
   build, and whether a group filed under it spawns;
+- whether the SA-6 site spawns as the client builds it: a red (`RUSSIA`)
+  ground group on the ground, radar as unit 1, launchers after, no payload;
 - whether the waypoint `type`/`action` pairs, the `alt_type` strings, the
   group-level task strings, and the `Bombing` and `AttackGroup` task tables
   are accepted — including the ramp-start pair (`TakeOffParking` /
@@ -55,9 +59,11 @@ out one crash at a time, a week apart, in the middle of a sortie.
   flight flown, or at least watched;
 - which CLSID you *should* use. The probe list is candidates, and a miss is
   reported as `UNKNOWN`, not as a failure. Supply real values (§4);
-- anything about terrain. Statics need land: a sea origin rejects every
-  static case and the report would blame the template. Read the `origin`
-  line before believing a static failure (§3).
+- anything about terrain. Statics and ground groups need land: a sea origin
+  rejects every static case and the SA-6 case, and the report would blame the
+  template. Read the `origin` line before believing either failure (§3);
+- whether the SA-6 actually engages anything. It is spawned and destroyed a
+  tick later; that it would shoot is a question for a flown mission.
 
 ---
 

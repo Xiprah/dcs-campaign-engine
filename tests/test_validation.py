@@ -63,6 +63,7 @@ EXPECTED_IDS = {
     "template.F-16C_strike_jdam",
     "template.F-16C_cap",
     "template.fuel_depot_medium",
+    "template.SA-6_Kub_site",
     "country.USA",
     "country.RUSSIA",
     "country.SWITZERLAND",
@@ -289,6 +290,32 @@ class TestTheValidatorRuns(unittest.TestCase):
         self.assertTrue(strike["detail"]["retrievable_next"])
         self.assertEqual(strike["detail"]["units"], 2)
         self.assertEqual(strike["detail"]["wanted"], 2)
+
+    def test_the_sa6_case_is_a_red_ground_group_built_radar_first(self):
+        """Probed the way the client builds it, or the probe proves nothing.
+
+        A red site asked for as a blue aircraft group at 5 km would be
+        rejected or misplaced by DCS, and the report would blame the unit
+        types for the probe's own mistake.
+        """
+        case = self.by_id["template.SA-6_Kub_site"]
+        self.assertEqual(case["status"], "OK")
+        self.assertEqual(case["detail"]["units"], 5)
+        self.assertEqual(case["detail"]["wanted"], 5)
+        call = next(
+            c for c in self.runner.mock.spawn_calls()
+            if c.get("name") == "cmpval_SA-6_Kub_site"
+        )
+        g = self.runner.mock.lua.globals()
+        self.assertEqual(call["country"], g.country.id.RUSSIA)
+        self.assertEqual(call["category"], g.Group.Category.GROUND)
+        units = call["data"]["units"]
+        self.assertEqual(
+            [u["type"] for u in units], ["Kub 1S91 str"] + ["Kub 2P25 ln"] * 4
+        )
+        self.assertTrue(all("payload" not in u for u in units), "a SAM carries a payload")
+        self.assertTrue(all(u["alt"] == 0 for u in units))
+        self.assertEqual(call["data"]["task"], "Ground Nothing")
 
     def test_the_ramp_start_case_parks_on_a_real_airdrome(self):
         """The pair the client puts on waypoint 1 when it names an airdrome.

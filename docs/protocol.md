@@ -196,7 +196,11 @@ ids are per-map content nobody has validated — so today every flight is an
 air start.
 
 `tasking` for a strike carries `kind`, `target` (a DCS group name), `tot`
-(mission time) and `callsign`. A static target's is `{"kind":"static"}`.
+(mission time) and `callsign`. A static target's is `{"kind":"static"}`. An
+air-defence site — a `ground` group, such as the `SA-6_Kub_site` template —
+is `{"kind":"air_defence"}`: it has no route and no target, and the sim's own
+AI decides what it shoots at. A `kind` the client does not recognise carries
+no task, so adding one is not a protocol change.
 
 ### `despawn`
 Remove an entity. The engine is responsible for deciding this; the client just

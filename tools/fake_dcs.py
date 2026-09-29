@@ -90,6 +90,11 @@ TARGET_XZ = (-3_000.0, 41_000.0)
 # per-unit types - belongs behind this map, not in the campaign.
 DEFAULT_AIR_UNITS = 2
 DEFAULT_GROUND_UNITS = 4
+#: Templates whose size differs from their category's default above, with
+#: the `count` the client's TEMPLATES gives them. Without this the harness
+#: would refuse the slice's SA-6 battery that the client builds, and the
+#: engine would block it for the rest of the run.
+TEMPLATE_CAPACITY: dict[str, int] = {"SA-6_Kub_site": 5}
 #: Inbound frames handled per sim tick, mirroring the real client's cap.
 MAX_FRAMES_PER_TICK = 32
 _AIR_CATEGORIES = frozenset({"plane", "helicopter"})
@@ -314,6 +319,8 @@ class FakeDCS:
     def _capacity_for(self, template: str, category: str) -> int:
         if template in self.cfg.template_units:
             return self.cfg.template_units[template]
+        if template in TEMPLATE_CAPACITY:
+            return TEMPLATE_CAPACITY[template]
         return self.cfg.air_units if category in _AIR_CATEGORIES else self.cfg.ground_units
 
     def _refusal(self, frame: Spawn) -> str | None:

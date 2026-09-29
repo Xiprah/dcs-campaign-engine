@@ -14,11 +14,13 @@ events were delivered would make package schedules diverge between a run with
 events and a run without, and the whole point is that they cannot.
 
 **Determinism.** Nothing here reads a wall clock or an unseeded random source.
-Time enters through frame `t`; chance enters through `self.rng`, whose full
-state round-trips through `save`/`load`. A campaign is therefore a pure
-function of its log, which is what makes a whole war replayable and a bug
-reproducible. `tick(now)` is a bare pulse and its argument is deliberately
-unused -- see :meth:`Campaign.tick`.
+Time enters through frame `t` while a mission client is connected, and through
+:meth:`Campaign.advance` in fixed paper steps while none is; chance enters
+through `self.rng`, whose full state round-trips through `save`/`load`. A
+campaign is therefore a pure function of its log and its paper-step count,
+which is what makes a whole war replayable and a bug reproducible.
+`tick(now)` is a bare pulse and its argument is deliberately unused -- see
+:meth:`Campaign.tick`.
 
 **Two clocks.** Frames carry *mission* time, which DCS resets to zero on every
 restart. The campaign runs on its own monotonic clock and rebases the mission
@@ -35,17 +37,17 @@ import random
 from pathlib import Path
 from typing import Any
 
+from campaign.api import PAPER_STEP
 from campaign.attrition import (
-    ATTRIBUTION_UNOBSERVED,
-    CAUSE_UNOBSERVED,
     KIND_FLIGHT,
     KIND_TARGET,
+    KIND_THREAT,
     AttritionTracker,
     LossRecord,
 )
 from campaign.bubble import bubble_delta, resolve_bubble
 from campaign.oob import SideInventory, Squadron, UnknownReservation, build_slice_oob
-from campaign.resolver import resolve_strike
+from campaign.resolver import resolve_exposure, resolve_strike
 from campaign.planner import (
     ABORTED,
     COMPLETE,
@@ -77,11 +79,19 @@ from campaign.protocol import (
     Waypoint,
     group_name,
 )
-from campaign.theater import Target, Theater, build_slice_theater, enemy_of
+from campaign.theater import (
+    Target,
+    Theater,
+    ThreatSite,
+    build_slice_theater,
+    enemy_of,
+)
 
 #: Serialisation format of a saved campaign. Bump on any breaking change to
 #: :meth:`Campaign.to_dict`.
-SAVE_VERSION = 2
+#:
+#: 3: the theater carries threat sites, and `connected` is no longer saved.
+SAVE_VERSION = 3
 
 #: Default seed. Explicit, because an implicit one is an unseeded one.
 DEFAULT_SEED = 20240923
@@ -143,6 +153,13 @@ class Campaign:
         #: Spawn ids the client rejected. Not retried; a rejected spawn is a
         #: bad template, and retrying it every bubble sync is a frame storm.
         self.blocked: set[str] = set()
+        #: A mission client has said hello and not gone away. Decides which
+        #: clock regime the campaign is in (docs/design.md, section 2).
+        #: Deliberately not saved: it describes a socket in this process, and
+        #: a campaign loaded from disk has none. A save written mid-sortie
+        #: that restored it as True would refuse every paper step until a
+        #: client had come and gone -- and under `--simulate`, which never has
+        #: one, for good.
         self.connected: bool = False
         self._objectives_announced: bool = False
         #: Not persisted; see _announce_dry.
@@ -338,10 +355,63 @@ class Campaign:
         """
         return self._pulse()
 
+    def advance(self, dt: float) -> list[Downlink]:
+        """Move the war `dt` campaign seconds forward with nobody watching.
+
+        The disconnected regime of docs/design.md, section 2. `dt` must be a
+        whole number of :data:`campaign.api.PAPER_STEP`s, and the war moves
+        one step at a time through the same pulse that frames drive, so the
+        state after N steps is a function of the start state and N alone:
+        `advance(3 * PAPER_STEP)` and three calls of `advance(PAPER_STEP)` are
+        the same war. Anything else would let the wall clock's chunking into
+        the campaign.
+
+        A no-op while a client is connected, whoever calls it. Mission time is
+        authoritative then, and a clock that also moved itself would run ahead
+        of the sim and compute the bubble against a war DCS has not reached.
+        """
+        if dt < 0:
+            raise ValueError(f"cannot advance by {dt}: time does not run backwards")
+        steps = round(dt / PAPER_STEP)
+        if abs(dt - steps * PAPER_STEP) > 1e-9 * max(1.0, abs(dt)):
+            raise ValueError(
+                f"cannot advance by {dt}: not a whole number of {PAPER_STEP}s paper steps"
+            )
+        if self.connected:
+            return []
+        frames: list[Downlink] = []
+        for _ in range(steps):
+            frames.extend(self._paper_step())
+        return frames
+
+    def _paper_step(self) -> list[Downlink]:
+        # Nobody is connected, so nobody is anywhere. The last observer frame
+        # describes where the players *were* when DCS went away; a bubble
+        # built from it would keep instantiating things for no one, and the
+        # next hello would re-issue that stale picture to a mission whose
+        # players are somewhere else. Clearing it empties the bubble through
+        # the ordinary despawn path, and the next observer frame rebuilds it.
+        self.observers = []
+        # Settle the present before leaving it. A pulse at an unchanged clock
+        # does nothing the second time, so this costs nothing when a tick or
+        # the previous step already pulsed here. When nothing has -- a
+        # campaign just created or loaded -- it is what stops the result
+        # depending on whether the transport happened to tick before the
+        # first step: without it, that decides whether the first package is
+        # planned now or one step later.
+        frames = self._pulse()
+        self.clock += PAPER_STEP
+        frames.extend(self._pulse())
+        return frames
+
     def _pulse(self) -> list[Downlink]:
         """Walk packages forward, task a new one, reconcile the bubble."""
         frames: list[Downlink] = []
         frames.extend(self._advance_packages())
+        # A flight can now die on paper at its TOT as well as in a snapshot,
+        # and it has to close out before the planner looks for an open
+        # package, or its replacement waits a pulse for nothing.
+        frames.extend(self._close_out_dead_packages())
         frames.extend(self._plan())
         frames.extend(self._sync_bubble())
         return frames
@@ -352,7 +422,9 @@ class Campaign:
         `self.live` is kept on purpose: it is what the next `hello` re-issues.
         Observers are kept too, so the bubble does not collapse and rebuild in
         the seconds between the client reconnecting and its first observer
-        frame.
+        frame -- but only until the war moves without DCS. The first paper
+        step clears them (see `_paper_step`), because from then on they are
+        where the players were, not where they are.
         """
         self.connected = False
         self.pending.clear()
@@ -470,12 +542,12 @@ class Campaign:
         is watching, and `campaign.resolver` rolls the outcome on `self.rng`.
         Choosing once, here, is what keeps a target from being killed twice.
 
-        TODO(threat): unobserved strikes currently cost nothing. The flight
-        always comes home, because applying a flight loss on paper means
-        decrementing the tracked group as well as debiting the reservation,
-        and that belongs with a real threat model rather than a flat dice
-        roll. Until then an unflown strike is safer than a flown one.
+        The flight gets the same treatment first. Unwatched, it has to get
+        through the enemy's air defences on paper before it can release
+        anything (`_expose`), so an aircraft shot down on the way in takes its
+        bombs into the ground rather than onto the target.
         """
+        frames = self._expose(package)
         package.weapons_released = True
         survivors = self.tracker.units_alive(package.spawn_id)
         squadron = self._squadron_for(package)
@@ -486,13 +558,55 @@ class Campaign:
                 lost=False,
             )
         if survivors <= 0:
-            return []
-        frames = self._resolve_unobserved(package, survivors)
+            # Closed out by `_close_out_dead_packages`, the path every dead
+            # flight takes, observed or not.
+            return frames
+        frames.extend(self._resolve_unobserved(package, survivors))
         frames.append(
             self._message(
                 f"{package.callsign} off target, {survivors} aircraft egressing."
             )
         )
+        return frames
+
+    def _expose(self, package: Package) -> list[Downlink]:
+        """Fly an unwatched flight through the air defences on its route.
+
+        docs/design.md, section 3. Called at the TOT, before release, and only
+        for a flight DCS is not holding: one it is holding is shot at by DCS,
+        and its losses come from snapshots and nowhere else.
+
+        The route is the paper track's single leg, base to target; egress
+        retraces it, so one pass through each envelope stands for the sortie.
+        """
+        if self.tracker.is_instantiated(package.spawn_id):
+            return []  # DCS has it; the snapshot is the authority.
+        group = self.tracker.groups.get(package.spawn_id)
+        base = self.theater.airbases.get(package.base_id)
+        target = self.theater.targets.get(package.target_id)
+        if group is None or base is None or target is None:
+            return []
+        sites = self.theater.live_threats_along(
+            enemy_of(group.coalition), base.pos, target.pos
+        )
+        outcome = resolve_exposure(
+            aircraft=group.units_alive,
+            kill_probabilities=[site.kill_probability for site in sites],
+            rng=self.rng,
+        )
+        losses = self.tracker.record_unobserved(
+            package.spawn_id, outcome.aircraft_lost, self.clock
+        )
+        frames: list[Downlink] = []
+        for loss in losses:
+            frames.extend(self._apply_flight_loss(loss))
+        if losses:
+            frames.append(
+                self._message(
+                    f"{package.callsign} lost {len(losses)} aircraft to air "
+                    f"defences inbound."
+                )
+            )
         return frames
 
     def _resolve_unobserved(self, package: Package, survivors: int) -> list[Downlink]:
@@ -507,18 +621,13 @@ class Campaign:
             target_units_alive=target.units_alive,
             rng=self.rng,
         )
+        # Through the tracker, not straight onto the ledger: a target damaged
+        # here and spawned later must come into DCS with only what survived,
+        # and the spawn reads its unit count from the tracker.
         frames: list[Downlink] = []
-        for _ in range(outcome.units_killed):
-            loss = LossRecord(
-                t=self.clock,
-                spawn_id=target.spawn_id,
-                entity_id=target.id,
-                entity_kind=KIND_TARGET,
-                coalition=target.coalition,
-                cause=CAUSE_UNOBSERVED,
-                attribution=ATTRIBUTION_UNOBSERVED,
-            )
-            self.tracker.losses.append(loss)
+        for loss in self.tracker.record_unobserved(
+            target.spawn_id, outcome.units_killed, self.clock
+        ):
             frames.extend(self._apply_target_loss(loss))
         if outcome.missed:
             frames.append(
@@ -574,6 +683,8 @@ class Campaign:
             return self._apply_flight_loss(loss)
         if loss.entity_kind == KIND_TARGET:
             return self._apply_target_loss(loss)
+        if loss.entity_kind == KIND_THREAT:
+            return self._apply_threat_loss(loss)
         return []
 
     def _apply_flight_loss(self, loss: LossRecord) -> list[Downlink]:
@@ -606,6 +717,18 @@ class Campaign:
         frames.append(self._message(f"{target.name} destroyed."))
         return frames
 
+    def _apply_threat_loss(self, loss: LossRecord) -> list[Downlink]:
+        site = self.theater.threats.get(loss.entity_id)
+        if site is None:
+            return []
+        site.units_alive = max(0, site.units_alive - 1)
+        if not site.destroyed:
+            return []
+        frames = self._retire(site.spawn_id, "destroyed")
+        self.tracker.forget(site.spawn_id)
+        frames.append(self._message(f"{site.name} destroyed."))
+        return frames
+
     # ------------------------------------------------------------------
     # bubble
     # ------------------------------------------------------------------
@@ -635,6 +758,12 @@ class Campaign:
             if target.spawn_id in self.blocked:
                 continue
             out[target.spawn_id] = target.pos
+        for site in self.theater.threats.values():
+            if site.destroyed or not site.spawn_id:
+                continue
+            if site.spawn_id in self.blocked:
+                continue
+            out[site.spawn_id] = site.pos
         return out
 
     def _sync_bubble(self) -> list[Downlink]:
@@ -717,6 +846,9 @@ class Campaign:
         for target in self.theater.targets.values():
             if target.spawn_id == spawn_id and not target.destroyed:
                 return self._target_spawn_frame(target)
+        for site in self.theater.threats.values():
+            if site.spawn_id == spawn_id and not site.destroyed:
+                return self._threat_spawn_frame(site)
         return None
 
     def _flight_spawn_frame(self, package: Package) -> Spawn | None:
@@ -783,20 +915,53 @@ class Campaign:
             tasking={"kind": "static"},
         )
 
+    def _threat_spawn_frame(self, site: ThreatSite) -> Spawn:
+        seq = self._seq()
+        self.pending[seq] = (_SPAWN, site.spawn_id)
+        return Spawn(
+            seq=seq,
+            t=self.mission_time(),
+            ref=seq,
+            spawn_id=site.spawn_id,
+            coalition=site.coalition,
+            category=site.category,
+            template=site.template,
+            # As for a target: a battery that lost launchers comes back without
+            # them, or it would have to be suppressed twice.
+            units=self.tracker.units_alive(site.spawn_id),
+            position=site.pos,
+            heading=0.0,
+            route=[],
+            tasking={"kind": "air_defence"},
+        )
+
     def _ensure_targets_tracked(self) -> None:
-        for target in sorted(self.theater.targets.values(), key=lambda t: t.id):
-            if target.destroyed:
+        """Give every standing theater entity an identity and a tracked group.
+
+        Targets first, then threat sites, each in id order, so spawn ids come
+        out the same on every fresh campaign.
+        """
+        entities: list[tuple[Target | ThreatSite, str]] = [
+            (target, KIND_TARGET)
+            for target in sorted(self.theater.targets.values(), key=lambda t: t.id)
+        ]
+        entities += [
+            (site, KIND_THREAT)
+            for site in sorted(self.theater.threats.values(), key=lambda s: s.id)
+        ]
+        for entity, kind in entities:
+            if entity.destroyed:
                 continue
-            if not target.spawn_id:
-                target.spawn_id = self._next_spawn_id()
-            if target.spawn_id not in self.tracker.groups:
+            if not entity.spawn_id:
+                entity.spawn_id = self._next_spawn_id()
+            if entity.spawn_id not in self.tracker.groups:
                 self.tracker.track(
-                    target.spawn_id,
-                    entity_id=target.id,
-                    entity_kind=KIND_TARGET,
-                    coalition=target.coalition,
-                    units_initial=target.units_initial,
-                    units_alive=target.units_alive,
+                    entity.spawn_id,
+                    entity_id=entity.id,
+                    entity_kind=kind,
+                    coalition=entity.coalition,
+                    units_initial=entity.units_initial,
+                    units_alive=entity.units_alive,
                 )
 
     # ------------------------------------------------------------------
@@ -824,7 +989,6 @@ class Campaign:
             "live": sorted(self.live),
             "blocked": sorted(self.blocked),
             "pending": {str(k): list(v) for k, v in sorted(self.pending.items())},
-            "connected": self.connected,
             "objectives_announced": self._objectives_announced,
             "theater": self.theater.to_dict(),
             "inventories": {k: v.to_dict() for k, v in self.inventories.items()},
@@ -865,7 +1029,6 @@ class Campaign:
         campaign.pending = {
             int(k): (v[0], v[1]) for k, v in raw["pending"].items()
         }
-        campaign.connected = bool(raw["connected"])
         campaign._objectives_announced = bool(raw["objectives_announced"])
         campaign.packages = {
             k: Package.from_dict(v) for k, v in raw["packages"].items()

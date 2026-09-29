@@ -14,8 +14,14 @@ import os
 import sys
 from pathlib import Path
 
-from campaign.api import CampaignEngine
-from campaign.server import DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TICK_PERIOD, CampaignServer
+from campaign.api import PAPER_STEP, CampaignEngine
+from campaign.server import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    DEFAULT_TICK_PERIOD,
+    DEFAULT_TIME_COMPRESSION,
+    CampaignServer,
+)
 
 DEFAULT_SAVE = Path("saves/campaign.json")
 
@@ -56,7 +62,7 @@ class _Persisting:
         self._engine.on_disconnect()
         self.persist()
 
-    def persist(self) -> None:
+    def persist(self) -> bool:
         """Write the campaign out, via a temp file and an atomic rename.
 
         This runs on every DCS disconnect, so an interrupted write is not a rare
@@ -64,13 +70,17 @@ class _Persisting:
         version leaves a zero-length `campaign.json` that the next start cannot
         load. `os.replace` makes the previous save survive anything up to and
         including the process being killed mid-write.
+
+        Returns whether the save was written. The server path only logs a
+        failure -- it must not take the transport down -- but `--simulate`
+        exits non-zero on it, since writing the save is its whole job.
         """
         saver = getattr(self._engine, "save", None)
         if saver is None:
             logging.getLogger("campaign").warning(
                 "engine has no save(path); campaign state will not persist"
             )
-            return
+            return False
         # Same directory, so the replace is a rename within one filesystem.
         staging = self._save.with_name(self._save.name + ".partial")
         try:
@@ -81,6 +91,8 @@ class _Persisting:
             logging.getLogger("campaign").exception("saving to %s failed", self._save)
             with contextlib.suppress(OSError):
                 staging.unlink()
+            return False
+        return True
 
 
 def _load_engine_factory(spec: str) -> CampaignEngine:
@@ -91,6 +103,16 @@ def _load_engine_factory(spec: str) -> CampaignEngine:
     from importlib import import_module
 
     return getattr(import_module(module_name), attr)()
+
+
+def _non_negative(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"want a number, got {text!r}") from None
+    if not (0.0 <= value < float("inf")):
+        raise argparse.ArgumentTypeError(f"want a finite number >= 0, got {text!r}")
+    return value
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -110,6 +132,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds between engine ticks",
     )
     parser.add_argument(
+        "--time-compression",
+        type=_non_negative,
+        default=DEFAULT_TIME_COMPRESSION,
+        metavar="N",
+        help="campaign seconds per wall second while DCS is not connected; "
+        "1 is real time, 0 stops the war until DCS connects",
+    )
+    parser.add_argument(
+        "--simulate",
+        type=_non_negative,
+        default=None,
+        metavar="SECONDS",
+        help="load the save, advance the war SECONDS campaign seconds with no "
+        f"server, save and exit (whole {PAPER_STEP:g}s paper steps; any "
+        "remainder is not run)",
+    )
+    parser.add_argument(
         "--engine",
         default=None,
         help="override the integration seam with a 'module:callable' factory",
@@ -125,7 +164,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 async def _run(args: argparse.Namespace, engine: _Persisting) -> None:
     server = CampaignServer(
-        engine, host=args.host, port=args.port, tick_period=args.tick_period
+        engine,
+        host=args.host,
+        port=args.port,
+        tick_period=args.tick_period,
+        time_compression=args.time_compression,
     )
     # Bind before anything is written: a busy port must not overwrite a live
     # campaign with the empty one this process just built.
@@ -135,6 +178,32 @@ async def _run(args: argparse.Namespace, engine: _Persisting) -> None:
     finally:
         await server.close()
         engine.persist()
+
+
+def _simulate(seconds: float, engine: _Persisting) -> int:
+    """Fast-forward the war with no server, then save it.
+
+    The same fixed steps the transport would deliver at any compression, so a
+    war caught up here is the war that running the server for as long would
+    have produced -- minus whatever DCS would have changed, since nothing is
+    connected.
+    """
+    steps = int(seconds // PAPER_STEP)
+    before = getattr(engine, "clock", None)
+    for _ in range(steps):
+        engine.advance(PAPER_STEP)
+    if not engine.persist():
+        print(f"simulated {steps} paper step(s), but the save was not written",
+              file=sys.stderr)
+        return 1
+    after = getattr(engine, "clock", None)
+    clock = (
+        f"; campaign clock {before:.0f}s -> {after:.0f}s"
+        if isinstance(before, (int, float)) and isinstance(after, (int, float))
+        else ""
+    )
+    print(f"simulated {steps} paper step(s) of {PAPER_STEP:g}s{clock}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -171,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cannot read the campaign save at {args.save}: {exc}", file=sys.stderr)
         return 2
     args.save.parent.mkdir(parents=True, exist_ok=True)
+    if args.simulate is not None:
+        return _simulate(args.simulate, _Persisting(engine, args.save))
     try:
         asyncio.run(_run(args, _Persisting(engine, args.save)))
     except KeyboardInterrupt:

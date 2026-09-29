@@ -140,6 +140,11 @@ class StubEngine:
         frames, self.tick_frames = self.tick_frames, []
         return frames
 
+    def advance(self, dt: float) -> list[Downlink]:
+        self.calls.append(("advance", dt))
+        self._guard("advance")
+        return []
+
     def on_disconnect(self) -> None:
         self.disconnects += 1
         self.calls.append(("disconnect", None))
