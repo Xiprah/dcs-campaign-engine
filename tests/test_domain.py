@@ -31,6 +31,7 @@ from pathlib import Path
 from campaign.api import CampaignEngine
 from campaign.attrition import (
     ATTRIBUTION_UNKNOWN,
+    ATTRIBUTION_UNOBSERVED,
     CAUSE_ATTRITED,
     CAUSE_DESTROYED,
     CAUSE_UNOBSERVED,
@@ -386,6 +387,15 @@ def attributions(campaign: Campaign) -> list[str]:
     return [loss.attribution for loss in campaign.tracker.losses]
 
 
+def blue_packages(campaign: Campaign) -> list:
+    """Blue's packages, in planning order.
+
+    Red plans too (docs/design.md, section 4). These scenarios script DCS
+    against blue's strike, so a test about "the package" means blue's.
+    """
+    return [p for p in campaign.packages.values() if p.coalition == "blue"]
+
+
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
@@ -550,7 +560,7 @@ class TestInventoryConservation(unittest.TestCase):
         flight_losses = [
             loss
             for loss in campaign.tracker.losses
-            if loss.entity_kind == KIND_FLIGHT
+            if loss.entity_kind == KIND_FLIGHT and loss.coalition == "blue"
         ]
         self.assertEqual(
             sqn.airframes_lost,
@@ -569,7 +579,7 @@ class TestInventoryConservation(unittest.TestCase):
             Hello(seq=1, t=0.0, protocol=PROTOCOL_VERSION, theater="Syria")
         )
         campaign.tick(0.0)
-        package = next(iter(campaign.packages.values()))
+        package = blue_packages(campaign)[0]
         self.assertEqual(sqn.airframes_available, 10)
 
         # Fly on until the bubble puts the flight into DCS, then refuse it.
@@ -958,9 +968,29 @@ class TestReconciliation(unittest.TestCase):
         attributed = attributions(with_events)
         unattributed = attributions(without_events)
         self.assertEqual(len(attributed), len(unattributed))
+        # Red's raid on Incirlik is out of the bubble, so its losses are
+        # resolved on paper and say so. That label is not event-derived, and
+        # it must be the same with events or without.
+        observed = [
+            x.attribution for x in without_events.tracker.losses
+            if x.cause != CAUSE_UNOBSERVED
+        ]
+        paper = [
+            x.attribution for x in without_events.tracker.losses
+            if x.cause == CAUSE_UNOBSERVED
+        ]
+        self.assertTrue(observed, "no observed losses in the silent run; vacuous")
         self.assertTrue(
-            all(a == ATTRIBUTION_UNKNOWN for a in unattributed),
+            all(a == ATTRIBUTION_UNKNOWN for a in observed),
             "losses were attributed with no events delivered",
+        )
+        self.assertTrue(all(a == ATTRIBUTION_UNOBSERVED for a in paper))
+        self.assertEqual(
+            paper,
+            [
+                x.attribution for x in with_events.tracker.losses
+                if x.cause == CAUSE_UNOBSERVED
+            ],
         )
         self.assertTrue(
             any(a != ATTRIBUTION_UNKNOWN for a in attributed),
@@ -977,10 +1007,12 @@ class TestReconciliation(unittest.TestCase):
         depot = campaign.theater.targets["latakia_fuel_depot"]
         sqn = campaign.inventories["blue"].squadron("vfa_incirlik_f16")
 
+        # The depot's, not every target's: red's raid on Incirlik is resolved
+        # on paper in the same war.
         target_losses = [
             loss
             for loss in campaign.tracker.losses
-            if loss.entity_kind == KIND_TARGET
+            if loss.entity_kind == KIND_TARGET and loss.entity_id == depot.id
         ]
         self.assertEqual(len(target_losses), 3)
         self.assertEqual(depot.units_alive, 1, "target damage did not land")
@@ -999,7 +1031,7 @@ class TestReconciliation(unittest.TestCase):
         """
         campaign = Campaign()
         campaign.tick(100.0)
-        package = next(iter(campaign.packages.values()))
+        package = blue_packages(campaign)[0]
         before = fingerprint(campaign)
         clock_before = campaign.clock
 
@@ -1054,9 +1086,11 @@ class TestSaveLoad(unittest.TestCase):
             duration=split,
         )
 
+        # Red's second raid is climbing out of Bassel al-Assad, inside the
+        # bubble, at the split as well. What is pinned is blue's flight.
         airborne = [
             p
-            for p in original.packages.values()
+            for p in blue_packages(original)
             if p.state in OPEN_STATES and p.spawn_id in original.live
         ]
         self.assertEqual(
@@ -1111,7 +1145,7 @@ class TestSaveLoad(unittest.TestCase):
         # reloaded campaign's RNG. Without a draw on the far side of the save
         # they would hold against an engine that re-seeded rather than restored.
         self.assertEqual(
-            len(reloaded.packages),
+            len(blue_packages(reloaded)),
             2,
             "nothing was tasked after the split, so no seeded choice was made "
             "from the restored RNG state",
@@ -1208,7 +1242,7 @@ class TestCampaignLoop(unittest.TestCase):
             start=0,
             duration=1560,
         )
-        package = next(p for p in campaign.packages.values() if p.state in OPEN_STATES)
+        package = next(p for p in blue_packages(campaign) if p.state in OPEN_STATES)
         self.assertEqual(campaign.tracker.units_alive(package.spawn_id), 1)
 
         campaign.on_disconnect()
@@ -1238,7 +1272,7 @@ class TestCampaignLoop(unittest.TestCase):
             duration=1200,
             dcs=dcs,
         )
-        package = next(p for p in campaign.packages.values() if p.state in OPEN_STATES)
+        package = next(p for p in blue_packages(campaign) if p.state in OPEN_STATES)
         self.assertIn(
             package.spawn_id, campaign.live, "the flight never entered the bubble"
         )
@@ -1264,8 +1298,14 @@ class TestCampaignLoop(unittest.TestCase):
             [],
             "the engine invented losses for entities it removed itself",
         )
+        # This flight's, not every flight's: red's raid meets the Patriot on
+        # paper in the same stretch of war, and losing aircraft that way is
+        # the resolver working, not the engine inventing a casualty.
         self.assertFalse(
-            [loss for loss in campaign.tracker.losses if loss.entity_kind == KIND_FLIGHT],
+            [
+                loss for loss in campaign.tracker.losses
+                if loss.entity_kind == KIND_FLIGHT and loss.entity_id == package.id
+            ],
             "the flight was written off despite never being observed to die",
         )
         self.assertEqual(campaign.tracker.units_alive(package.spawn_id), 2)
@@ -1359,7 +1399,7 @@ class TestCampaignLoop(unittest.TestCase):
         campaign.save(path)
 
         reloaded = Campaign.load(path)
-        package = next(p for p in reloaded.packages.values() if p.state in OPEN_STATES)
+        package = next(p for p in blue_packages(reloaded) if p.state in OPEN_STATES)
         reloaded.on_hello(
             Hello(seq=1, t=0.0, protocol=PROTOCOL_VERSION, theater="Syria")
         )
@@ -1465,8 +1505,8 @@ class TestCampaignLoop(unittest.TestCase):
         b = Campaign(seed=2)
         a.tick(0.0)
         b.tick(0.0)
-        pkg_a = next(iter(a.packages.values()))
-        pkg_b = next(iter(b.packages.values()))
+        pkg_a = blue_packages(a)[0]
+        pkg_b = blue_packages(b)[0]
         self.assertEqual(pkg_a.t_tot, pkg_b.t_tot)
         self.assertEqual(pkg_a.spawn_id, pkg_b.spawn_id)
         # The other half of the name. Without this the test says only that the

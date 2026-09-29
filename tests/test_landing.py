@@ -21,6 +21,7 @@ import unittest
 
 from campaign.protocol import group_name
 from tests.test_mission_client import (
+    first_blue_package,
     requires_lua,
     sortie_with_observer_over_the_target,
 )
@@ -34,7 +35,7 @@ def _flight_in_the_air(test: unittest.TestCase):
     test.addCleanup(mission.close)
     mission.run_until(
         lambda m: bool(
-            m.campaign.packages
+            first_blue_package(m.campaign)
             and m.mock.group(group_name(m.package.spawn_id)) is not None
         ),
         limit=1400.0,

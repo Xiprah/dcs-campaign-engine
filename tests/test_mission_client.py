@@ -249,6 +249,15 @@ class EngineHarness:
 # --------------------------------------------------------------------------
 
 
+def first_blue_package(campaign: Campaign):
+    """Blue's first package, or None before blue has planned one.
+
+    Red plans too (docs/design.md, section 4). Every sortie in this file is
+    blue's strike on the depot, so "the package" means blue's.
+    """
+    return next((p for p in campaign.packages.values() if p.coalition == "blue"), None)
+
+
 class Mission:
     """A mock DCS, a campaign, and the socket between them."""
 
@@ -293,7 +302,9 @@ class Mission:
 
     @property
     def package(self):
-        return next(iter(self.campaign.packages.values()))
+        package = first_blue_package(self.campaign)
+        assert package is not None, "blue has not planned a package yet"
+        return package
 
     @property
     def depot(self):
@@ -346,7 +357,7 @@ class TestFullSortie(unittest.TestCase):
 
         def resolve(m: Mission) -> None:
             """Stand in for weapons and damage; nothing else here does."""
-            package = next(iter(m.campaign.packages.values()), None)
+            package = first_blue_package(m.campaign)
             if package is None:
                 return
             flight = group_name(package.spawn_id)
@@ -569,15 +580,19 @@ class TestStrikeIsActuallyTasked(unittest.TestCase):
         self.addCleanup(mission.close)
         found = mission.run_until(
             lambda m: bool(
-                m.campaign.packages
+                first_blue_package(m.campaign)
                 and m.mock.group(group_name(m.package.spawn_id)) is not None
             ),
             limit=1200.0,
         )
         self.assertTrue(found, "the flight was never instantiated at its own airbase")
         name = mission.flight_group()
+        # The depot's objects. Blue's own storage area is at Incirlik, under
+        # the observer, and is rightly instantiated; it is not this flight's
+        # target.
+        depot = group_name(mission.depot.spawn_id)
         self.assertEqual(
-            [n for n in mission.mock.static_names() if n.startswith("cmp_")],
+            [n for n in mission.mock.static_names() if n.startswith(depot)],
             [],
             "the target was instantiated after all; this test proves nothing",
         )
@@ -630,7 +645,7 @@ class TestStrikeIsActuallyTasked(unittest.TestCase):
         self.addCleanup(mission.close)
         found = mission.run_until(
             lambda m: bool(
-                m.campaign.packages
+                first_blue_package(m.campaign)
                 and m.mock.group(group_name(m.package.spawn_id)) is not None
             ),
             limit=1400.0,
@@ -655,6 +670,103 @@ class TestStrikeIsActuallyTasked(unittest.TestCase):
         )
 
 
+@requires_lua
+class TestRedRaidsThroughTheRealClient(unittest.TestCase):
+    """Red's raid on Incirlik, built by the Lua the way it is built in DCS.
+
+    The observer sits on Incirlik, so the client builds blue's storage area
+    and Patriot battery at once, and red's two Su-24Ms when they arrive. The
+    mock accepts any well-formed table; what is pinned is that the client
+    knows the templates at all, builds each for the right country with the
+    right unit types, and tasks the raid against the storage area.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        incirlik = (142_000.0, CRUISE_ALTITUDE, -38_000.0)
+        mission = Mission(observer_pos=incirlik)
+        cls.mission = mission
+        cls.addClassCleanup(mission.close)
+
+        def red_flight(campaign: Campaign):
+            # By the squadron that flies it, so an engine in which red never
+            # plans fails the assertions below rather than this lookup.
+            red = campaign.inventories["red"].squadrons
+            return next(
+                (p for p in campaign.packages.values() if p.squadron_id in red), None
+            )
+
+        cls.arrived = mission.run_until(
+            lambda m: red_flight(m.campaign) is not None
+            and m.mock.group(group_name(red_flight(m.campaign).spawn_id)) is not None,
+            limit=1500.0,
+        )
+        cls.raid = red_flight(mission.campaign)
+        mission.step(40)
+        cls.calls = {c.get("name"): c for c in mission.mock.spawn_calls()}
+        cls.g = mission.mock.lua.globals()
+
+    def setUp(self) -> None:
+        self.assertTrue(self.arrived, "the red raid never reached the bubble")
+
+    def test_every_spawn_was_acked_ok(self):
+        acks = {a.ref: a for a in self.mission.engine.uplink_of(Ack)}
+        for spawn in self.mission.engine.downlink_of(Spawn):
+            self.assertIn(spawn.ref, acks, f"{spawn.template} was never acked")
+            self.assertTrue(acks[spawn.ref].ok, f"{spawn.template}: {acks[spawn.ref].error}")
+        self.mission.assert_lua_was_clean(self)
+
+    def test_the_raid_is_two_su24ms_for_russia_tasked_at_the_storage_area(self):
+        call = self.calls.get(group_name(self.raid.spawn_id))
+        self.assertIsNotNone(call, "the red flight was never built")
+        self.assertEqual(call["country"], self.g.country.id.RUSSIA)
+        self.assertEqual(call["category"], self.g.Group.Category.AIRPLANE)
+        units = call["data"]["units"]
+        self.assertEqual([u["type"] for u in units], ["Su-24M", "Su-24M"])
+        self.assertTrue(all(u["payload"]["fuel"] == 11700 for u in units))
+        attacks = [
+            t for t in self.mission.mock.attack_tasks(group_name(self.raid.spawn_id))
+            if t["id"] in ("Bombing", "AttackGroup")
+        ]
+        self.assertEqual(len(attacks), 1, attacks)
+        storage = self.mission.campaign.theater.targets["incirlik_munitions_storage"]
+        point = attacks[0]["params"]["point"]
+        self.assertLess(
+            ground_distance((point["x"], 0.0, point["y"]), storage.pos), 200.0,
+            "the raid is not aimed at the storage area",
+        )
+
+    def test_the_storage_area_is_four_blue_warehouses(self):
+        storage = self.mission.campaign.theater.targets["incirlik_munitions_storage"]
+        prefix = group_name(storage.spawn_id)
+        objects = [c for name, c in self.calls.items() if name and name.startswith(prefix)]
+        self.assertEqual(len(objects), 4)
+        for call in objects:
+            self.assertEqual(call["kind"], "static")
+            self.assertEqual(call["country"], self.g.country.id.USA)
+            self.assertEqual(call["data"]["type"], "Warehouse")
+            self.assertEqual(call["data"]["category"], "Warehouses")
+
+    def test_the_patriot_is_a_blue_ground_group_radar_first(self):
+        site = self.mission.campaign.theater.threats["incirlik_patriot"]
+        call = self.calls.get(group_name(site.spawn_id))
+        self.assertIsNotNone(call, "the Patriot under the observer was never built")
+        self.assertEqual(call["country"], self.g.country.id.USA)
+        self.assertEqual(call["category"], self.g.Group.Category.GROUND)
+        units = call["data"]["units"]
+        self.assertEqual([u["type"] for u in units], ["Patriot str"] + ["Patriot ln"] * 4)
+        self.assertTrue(all("payload" not in u for u in units), "a SAM carries a payload")
+        self.assertTrue(self.mission.campaign.tracker.groups[site.spawn_id].ever_seen)
+
+    def test_the_blue_humans_were_told_nothing_of_the_raid(self):
+        shown = [m["text"] for m in self.mission.mock.messages()]
+        self.assertTrue(all(m["to"] == "blue" for m in self.mission.mock.messages()))
+        self.assertFalse(
+            [t for t in shown if self.raid.callsign in t and "Incirlik" in t],
+            f"the enemy's tasking reached the cockpit: {shown}",
+        )
+
+
 # --------------------------------------------------------------------------
 # 3. Reconnect
 # --------------------------------------------------------------------------
@@ -670,7 +782,7 @@ class TestReconnect(unittest.TestCase):
 
         mission.run_until(
             lambda m: bool(
-                m.campaign.packages
+                first_blue_package(m.campaign)
                 and m.mock.group(group_name(m.package.spawn_id)) is not None
             ),
             limit=1400.0,
@@ -752,7 +864,7 @@ class TestReconnect(unittest.TestCase):
         state = {"dropped": False, "resolved": False}
 
         def hook(m: Mission) -> None:
-            package = next(iter(m.campaign.packages.values()), None)
+            package = first_blue_package(m.campaign)
             if package is None:
                 return
             flight = group_name(package.spawn_id)
@@ -801,7 +913,7 @@ class TestFramesCarryMissionTimeNotCampaignTime(unittest.TestCase):
         self.addCleanup(first.close)
         first.run_until(
             lambda m: bool(
-                m.campaign.packages
+                first_blue_package(m.campaign)
                 and m.mock.group(group_name(m.package.spawn_id)) is not None
             ),
             limit=1400.0,
@@ -1538,7 +1650,7 @@ class TestAnAttritedEntityComesBackAttrited(unittest.TestCase):
         self.addCleanup(mission.close)
         mission.run_until(
             lambda m: bool(
-                m.campaign.packages
+                first_blue_package(m.campaign)
                 and m.mock.group(group_name(m.package.spawn_id)) is not None
             ),
             limit=1400.0,
@@ -1656,7 +1768,7 @@ class TestAFlightLostEarlyIsClosedOutAtOnce(unittest.TestCase):
         self.addCleanup(mission.close)
         mission.run_until(
             lambda m: bool(
-                m.campaign.packages
+                first_blue_package(m.campaign)
                 and m.mock.group(group_name(m.package.spawn_id)) is not None
             ),
             limit=1400.0,
@@ -1686,7 +1798,10 @@ class TestAFlightLostEarlyIsClosedOutAtOnce(unittest.TestCase):
             "the player was never told the flight was lost: %r"
             % (mission.engine.messages(),),
         )
-        replacements = [p for p in mission.campaign.packages.values() if p is not package]
+        replacements = [
+            p for p in mission.campaign.packages.values()
+            if p.coalition == "blue" and p is not package
+        ]
         self.assertEqual(
             len(replacements),
             1,
@@ -1713,11 +1828,14 @@ class TestACampaignThatCannotTaskStandsStill(unittest.TestCase):
         campaign = Campaign()
         squadron = campaign.inventories["blue"].squadron(SQUADRON)
         # Bombed out, with conservation intact: the rounds were expended, not
-        # deleted. Nothing can be tasked from here.
-        for munition, total in squadron.munitions_total.items():
-            squadron.munitions_available[munition] = 0
-            squadron.munitions_expended[munition] = total
-        squadron.check_invariant()
+        # deleted. Nothing can be tasked from here -- by either side: red
+        # plans too now, and a red package would move the same counters for
+        # reasons that have nothing to do with a stall.
+        for sqn in (squadron, campaign.inventories["red"].squadron("red_bassel_su24")):
+            for munition, total in sqn.munitions_total.items():
+                sqn.munitions_available[munition] = 0
+                sqn.munitions_expended[munition] = total
+            sqn.check_invariant()
 
         mission = Mission(
             observer_pos=(-3_000.0, CRUISE_ALTITUDE, 41_000.0), campaign=campaign
@@ -1761,7 +1879,7 @@ class TestDeterminism(unittest.TestCase):
         try:
 
             def resolve(m: Mission) -> None:
-                package = next(iter(m.campaign.packages.values()), None)
+                package = first_blue_package(m.campaign)
                 if package is None:
                     return
                 if m.campaign.clock >= package.t_tot and m.mock.static_names():

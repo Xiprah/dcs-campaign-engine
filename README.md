@@ -7,10 +7,11 @@ This repository is the first vertical slice. Its only job is to prove that one
 full loop closes: the engine picks a target, frags a package against it,
 instantiates the flight when a human is near enough to see it, learns what
 happened from ground-truth snapshots, charges the losses to a finite
-inventory, writes the war to disk, and picks it up again from there.
-Everything that would make it a *game* — a ground war, a front line, red air,
-pilots — is deliberately absent, and marked with `TODO(seam):` where it will
-attach.
+inventory, writes the war to disk, and picks it up again from there. Both
+sides run that loop under the same rules: red plans, strikes and bleeds
+exactly as blue does, and the war can be lost. Everything else that would
+make it a *game* — a ground war, a front line, fighters, pilots — is
+deliberately absent, and marked with `TODO(seam):` where it will attach.
 
 ---
 
@@ -82,11 +83,15 @@ It can also be checked by hand across two processes:
 
 ```
 $ python tools/diff_saves.py saves/with-events.json saves/no-events.json
-campaign state identical: 5 loss record(s)
+campaign state identical: 7 loss record(s)
   loss 0: attribution 'hit/red_sa6_bassel/9M33' -> 'unknown'
-  loss 1: attribution 'hit/cmp_0003/GBU-38' -> 'unknown'
+  loss 1: attribution 'hit/cmp_0005/GBU-38' -> 'unknown'
   ...
 ```
+
+(Losses the engine resolved on paper — here, red's raid on Incirlik, which
+nobody was watching — carry `unobserved` in both saves and are not listed:
+that label is not event-derived, so dropping events cannot touch it.)
 
 But read that result with care. Two processes are not in lockstep: the
 harness advances mission time while the engine's replies are still in flight,
@@ -123,7 +128,8 @@ python -m campaign --port 7777 --save saves/campaign.json
 
 In another, run the DCS stand-in. It speaks the mission-client half of the
 protocol over a real socket, flies a scripted observer out of Incirlik, obeys
-the spawns it is given, and resolves the strike:
+the spawns it is given, and resolves any strike that reaches a target it
+holds:
 
 ```
 python tools/fake_dcs.py --port 7777
@@ -133,29 +139,42 @@ What a healthy run looks like (abridged):
 
 ```
 sync: campaign_time=0 state=30s observer=5s bubble=75000m
-MSG [blue] VIPER on task: strike on Latakia Fuel Depot, TOT 1471.
-spawned cmp_0003 (F-16C_strike_jdam, plane) 2 unit(s), 3 waypoint(s)
-spawned cmp_0002 (SA-6_Kub_site, ground) 5 unit(s), 0 waypoint(s)
-spawned cmp_0001 (fuel_depot_medium, structure) 4 unit(s), 0 waypoint(s)
-strike at t=1407: cmp_0003 -> cmp_0001, target destroyed, flight 1/2 remaining
+MSG [blue] VIPER fragged: 2-ship strike on Latakia Fuel Depot, TOT 1471.
+spawned cmp_0001 (munitions_storage_medium, structure) 4 unit(s), 0 waypoint(s)
+spawned cmp_0003 (Patriot_site, ground) 5 unit(s), 0 waypoint(s)
+spawned cmp_0005 (F-16C_strike_jdam, plane) 2 unit(s), 3 waypoint(s)
+spawned cmp_0006 (Su-24M_strike_fab, plane) 2 unit(s), 3 waypoint(s)
+spawned cmp_0004 (SA-6_Kub_site, ground) 5 unit(s), 0 waypoint(s)
+spawned cmp_0002 (fuel_depot_medium, structure) 4 unit(s), 0 waypoint(s)
+despawned cmp_0006 (left_bubble)
+strike at t=1407: cmp_0005 -> cmp_0002, target destroyed, flight 1/2 remaining
 MSG [blue] Latakia Fuel Depot destroyed.
-MSG [blue] VIPER off target, 1 aircraft egressing.
-despawned cmp_0002 (left_bubble)
-despawned cmp_0003 (mission_complete)
-MSG [blue] VIPER recovered, 1 aircraft home.
 MSG [blue] All assigned strategic targets destroyed.
+MSG [blue] Incirlik Patriot engaged: 2 enemy aircraft down.
+MSG [blue] VIPER off target, 1 aircraft egressing.
+despawned cmp_0005 (mission_complete)
+MSG [blue] VIPER recovered, 1 aircraft home.
 ```
 
-(`on task` rather than `fragged` because the engine planned the package before
-the client connected; a client that is already there hears it fragged live.
-`cmp_0002` is the SA-6 battery covering the approach to Latakia. The observer
-chasing the flight brings it into the bubble, so here DCS, not the engine,
-decides what it shoots down. The harness's scripted loss stands in for that.)
+(`cmp_0001` and `cmp_0003` are blue's own munitions storage area and Patriot
+battery at Incirlik, in the bubble because the player starts there.
+`cmp_0006` is red's Su-24M two-ship out of Bassel al-Assad, fragged at the
+same moment as VIPER against the storage area; the player's side is never
+told that, and it passes through the bubble only where the two routes cross.
+By its time on target the observer is chasing VIPER near Latakia, so nobody
+is watching Incirlik, and the engine flies the raid through the Patriot on
+paper — which, this time, got both jets. `cmp_0004` is the SA-6 covering the
+approach to Latakia. The observer brings it into the bubble, so here DCS, not
+the engine, decides what it shoots down; the harness's scripted loss stands
+in for that. The war ends the moment the depot does: red's raid was already
+airborne and flies out its sortie, but nobody plans again.)
 
-and in the save afterwards: the depot at `units_alive: 0`, the
-squadron at 11 of 12 airframes with 1 lost, 2 GBU-38 expended and 2 lost with
-the jet that carried them, the package `complete`, and no reservation left
-open. Start the engine again on the same save and it carries on from there.
+and in the save afterwards: the depot at `units_alive: 0`, blue's squadron at
+11 of 12 airframes with 1 lost, 2 GBU-38 expended and 2 lost with the jet that
+carried them, red's at 10 of 12 with 4 FAB-500 lost, both packages closed, no
+reservation left open, and `war_result` naming red as defeated. Start the
+engine again on the same save and it carries on from there — which, the war
+being over, means it plans nothing.
 
 ### With DCS closed
 
@@ -174,10 +193,15 @@ $ python -m campaign --save saves/campaign.json --simulate 86400
 simulated 17280 paper step(s) of 5s; campaign clock 0s -> 86400s
 ```
 
-Run against a fresh save, that day is four sorties. The depot is flattened,
-and one F-16 falls to the SA-6 on the way in, with its two bombs. That is the
-point of section 3 of docs/design.md: an unwatched war can be lost as well as
-won.
+Run against a fresh save, that day is over in a little more than an hour of
+it. Blue flies two sorties, neither touched by the SA-6, and flattens the
+depot at 4000 s. Red flies two raids into the Patriot and loses three Su-24Ms
+of four, but the one that gets through puts two FAB-500s on Incirlik's
+storage area and destroys half of it; its third raid is still on the ramp
+when the war ends, and is stood down. Other seeds lose it: at seed 1 the
+storage area goes at 3945 s and the humans are told the war is lost. That is
+the point of sections 3 and 4 of docs/design.md: an unwatched war can be lost
+as well as won, and the enemy is fighting it too.
 
 Three flags earn their keep:
 
@@ -227,9 +251,9 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
 | `campaign/protocol.py` | frame types, encode/decode, framing. The executable half of the spec. |
 | `campaign/api.py` | the `CampaignEngine` seam between campaign logic and sockets. |
 | `campaign/campaign.py` | the brain. Owns identity, time, chance, and all state. |
-| `campaign/theater.py` | the map: airbases, targets, threat sites, and the one correct way to measure distance. |
+| `campaign/theater.py` | the map: airbases, targets, threat sites, who has lost, and the one correct way to measure distance. |
 | `campaign/oob.py` | order of battle. Inventory is conserved, not merely decremented. |
-| `campaign/planner.py` | the minimal ATO: select a target, build a package, schedule a TOT. |
+| `campaign/planner.py` | the minimal ATO: select a target, build a package, schedule a TOT — for whichever side asks. |
 | `campaign/bubble.py` | what DCS is allowed to know about, with hysteresis so it does not thrash. |
 | `campaign/attrition.py` | reconciliation. The load-bearing module. |
 | `campaign/resolver.py` | what happened where nobody was looking: unobserved strikes, and flights through air defences. |
@@ -246,6 +270,12 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
 
 **What works, and has been run end to end offline:**
 
+- Both sides plan. Every coalition with a squadron and an airbase frags one
+  strike package at a time against the other's highest-priority strategic
+  target, in coalition-name order, under the same inventory, attrition,
+  threat and authority rules. `player_coalition` decides only who is told
+  what; the side nobody flies is told nothing. Red's raids are resolved, on
+  paper or in DCS, exactly as blue's strikes are.
 - Target selection, a 2-ship package, airframes and munitions reserved up
   front, a TOT computed from distance.
 - Bubble instantiation and removal, hysteretic, driven only by observers.
@@ -267,9 +297,15 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   air-defence site its route passes. Paper losses go through the same tracker
   and the same conserved inventory as observed ones. A flight DCS is holding
   is never rolled.
-- One threat site, an SA-6 battery under the strike route, instantiated in the
-  bubble like anything else. `mission/validate_templates.lua` probes its
-  template.
+- One threat site a side — an SA-6 under blue's strike route, a Patriot under
+  red's — instantiated in the bubble like anything else.
+  `mission/validate_templates.lua` probes both templates, and red's Su-24M
+  and blue's storage-area statics, for the country the client spawns each for.
+- The war ends. When one side's strategic targets are all destroyed, nobody
+  plans again, packages still on the ground are stood down, and the humans
+  are told they won, lost, or that nobody did (docs/design.md, section 4).
+  The result is saved. The humans' side hears damage to its own targets and
+  sites, and its paper kills on enemy raids, but never the enemy's tasking.
 
 **What is stubbed, faked or deliberately missing:**
 
@@ -277,23 +313,33 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   per-aircraft kill probability, with no altitude bands, terrain masking or
   EW. Exposure is rolled once, at the TOT, for the whole route. Seams:
   `theater.ThreatSite`, `resolver.resolve_exposure`.
-- **One package at a time**, and the planner does not plan around threats:
-  no SEAD or DEAD, no routing around an envelope, no escort, tanker or AWACS.
-  Seams: `Campaign._plan`, `Theater.live_threats_along`, `planner`'s module
-  docstring. SEAD packages are docs/design.md section 5.
+- **One package a side at a time**, and the planner does not plan around
+  threats: no SEAD or DEAD, no routing around an envelope, no escort, tanker
+  or AWACS. Seams: `Campaign._plan_for`, `Theater.live_threats_along`,
+  `planner`'s module docstring. SEAD packages are docs/design.md section 5.
 - **Nothing on paper can hurt a threat site.** A site loses units only to
   snapshots, so only when DCS holds it and something in the sim shoots at it.
   That is DEAD, section 5.
 - **No ground war**, front line, base capture or logistics network. Seams:
   `theater.Airbase`, `theater.Theater`, `oob.SideInventory`.
-- **No red air.** Red flies nothing and plans nothing. Its only teeth are the
-  SA-6. Seam: `oob.build_slice_oob`; docs/design.md section 4.
+- **Strike only, on both sides.** Each side has one strike squadron and
+  nothing that fights in the air: no CAP, no escort, no intercept. A red raid
+  and a blue strike pass each other mid-route without noticing. Seams:
+  `oob.build_slice_oob`, `Campaign._plan_for`.
+- **The content is placeholder and symmetric by choice.** Both sides have
+  twelve airframes, forty-eight bombs, one four-unit target and one site with
+  the same flat Pk. The war is short — usually decided within two or three
+  sorties a side — and which side wins is close to a coin toss on the seed.
+  That is what uncalibrated symmetric numbers give, not a model of anything.
 - **No pilots.** A package draws anonymous airframes; ejections and deaths are
   events nobody records. Seam: `oob.Squadron`.
 - **Placeholder DCS templates.** `TEMPLATES` in `campaign_client.lua` maps
   wire template names to unit types with **empty pylons** — loadout CLSIDs are
   DCS-version specific and a wrong guess is a silently unarmed strike. Fill
-  them from mission-editor exports before flying this for real.
+  them from mission-editor exports before flying this for real. The Patriot
+  battery is a radar and four launchers only: a DCS Patriot is normally also
+  given an ECS and power, and a template carries one lead unit type, so
+  whether this one engages anything in the sim is unverified.
 - **Invented coordinates.** The Syria positions in `theater.py` are plausible,
   not surveyed. Swapping in extracted map coordinates is a content change.
 - **The Lua client has not been run against a real DCS** in producing this
@@ -302,6 +348,18 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   engine by inspection, not by execution. Everything Python has been executed.
 
 **Known rough edges:**
+
+- A package already airborne when the war ends flies out its sortie, and what
+  it achieves is recorded after the result is fixed (docs/design.md, section
+  4, says why it is not recalled). A beaten side's last raid can still damage
+  the winner.
+- Both sides draw callsigns from one list, so a red and a blue package can
+  share one. Nobody is ever told a red callsign, so only the save shows it.
+- `tools/fake_dcs.py` resolves any strike that reaches a target it holds,
+  red's included, with the same scripted outcome (`--target-pk`,
+  `--flight-losses`). After `--restart-at` its player respawns at Incirlik,
+  under red's raid, so a restarted run can see red's strike that an
+  uninterrupted one resolves on paper — a different, and correct, war.
 
 - The engine reads any `state` frame as a complete census of what is
   instantiated, which is what `docs/protocol.md` specifies. A client that

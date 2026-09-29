@@ -6,9 +6,16 @@ cover a two-ship, reserves the airframes and ordnance up front, and works out
 when the flight takes off, hits and gets home -- all from distance and a fixed
 cruise speed, so the whole schedule is a pure function of the inputs.
 
+Nothing here knows which side it is planning for, or which side the humans
+fly: a coalition's package is built from that coalition's inventory against
+the other side's targets, and the campaign asks once per coalition
+(docs/design.md, section 4). That is what keeps red subject to exactly the
+rules blue is.
+
 TODO(seam): SEAD, escort, tanker and AWACS packages are built here, off the
 same target selection, and then deconflicted against each other on time and
-route. This slice builds one strike package at a time and nothing else.
+route. This slice builds one strike package per coalition at a time and
+nothing else.
 """
 
 from __future__ import annotations
@@ -83,6 +90,9 @@ class Package:
     """
 
     id: str
+    #: The side that flies it. Decides whose inventory it draws on, whose
+    #: threat sites it faces and who is told about it -- never who plans.
+    coalition: str
     callsign: str
     squadron_id: str
     base_id: str
@@ -115,6 +125,7 @@ class Package:
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
+            "coalition": self.coalition,
             "callsign": self.callsign,
             "squadron_id": self.squadron_id,
             "base_id": self.base_id,
@@ -136,6 +147,7 @@ class Package:
     def from_dict(cls, raw: dict[str, Any]) -> Package:
         return cls(
             id=raw["id"],
+            coalition=raw["coalition"],
             callsign=raw["callsign"],
             squadron_id=raw["squadron_id"],
             base_id=raw["base_id"],
@@ -208,6 +220,7 @@ def build_package(
     t_rtb = t_tot + leg + RECOVERY_ALLOWANCE
     return Package(
         id=package_id,
+        coalition=inventory.coalition,
         callsign=rng.choice(CALLSIGNS),
         squadron_id=squadron.id,
         base_id=base.id,

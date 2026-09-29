@@ -464,6 +464,19 @@ local DEFAULT_PAYLOAD = {
     gun = 100,
 }
 
+-- DEFAULT_PAYLOAD's fuel is an F-16's internal load, which would send a
+-- Su-24M out on about a quarter of its tanks. 11700 kg is the Su-24M's full
+-- internal fuel; like everything else in this table it is unverified until
+-- mission/validate_templates.lua has run in the sim, and the pylons are just
+-- as empty.
+local SU24M_PAYLOAD = {
+    pylons = {},
+    fuel = 11700,
+    flare = 60,
+    chaff = 60,
+    gun = 100,
+}
+
 local TEMPLATES = {
     ["F-16C_strike_jdam"] = {
         unit_type = "F-16C_50",
@@ -509,6 +522,39 @@ local TEMPLATES = {
     ["SA-6_Kub_site"] = {
         lead_type = "Kub 1S91 str",
         unit_type = "Kub 2P25 ln",
+        count = 5,
+        task = "Ground Nothing",
+        skill = "High",
+    },
+    -- Red's strike squadron (campaign/oob.py), spawned for RUSSIA like
+    -- every red group. Red AI flies it; no human ever does.
+    ["Su-24M_strike_fab"] = {
+        unit_type = "Su-24M",
+        count = 2,
+        task = "Ground Attack",
+        skill = "High",
+        payload = SU24M_PAYLOAD,
+    },
+    -- The blue strategic target red strikes. Four objects for the same
+    -- reason the depot is four: the engine counts units from snapshots.
+    ["munitions_storage_medium"] = {
+        static = true,
+        unit_type = "Warehouse",
+        static_category = "Warehouses",
+        count = 4,
+        spread = 60,
+    },
+    -- A blue air-defence site, the Patriot mirror of the SA-6 above: the
+    -- AN/MPQ-53 radar first, so a battery re-issued with fewer units keeps
+    -- it. A DCS Patriot battery is usually also given its ECS and power
+    -- units; this table has room for one lead type, so whether radar and
+    -- launchers alone engage anything is exactly the kind of question the
+    -- in-sim validator can put to DCS and this file cannot answer.
+    -- TODO(seam): multi-type site templates, with the rest of unit-template
+    -- fidelity.
+    ["Patriot_site"] = {
+        lead_type = "Patriot str",
+        unit_type = "Patriot ln",
         count = 5,
         task = "Ground Nothing",
         skill = "High",

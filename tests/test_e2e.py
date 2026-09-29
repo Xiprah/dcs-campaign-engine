@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from campaign.api import PAPER_STEP
+from campaign.attrition import CAUSE_UNOBSERVED
 from campaign.audit import attributions, strip_event_derived
 from campaign.campaign import Campaign
 from campaign.planner import COMPLETE
@@ -43,7 +44,7 @@ from campaign.protocol import (
     Waypoint,
     encode,
 )
-from tools.fake_dcs import Config, FakeDCS
+from tools.fake_dcs import INCIRLIK_XZ, Config, FakeDCS
 
 #: Long enough for the slice's own strike to take off, hit and land again.
 #: Shorter than this and the loop looks closed while the flight is still out.
@@ -108,6 +109,26 @@ async def _drive(
     return sim
 
 
+def blue_packages(campaign: Campaign) -> list:
+    """Blue's packages, in planning order.
+
+    Red plans too (docs/design.md, section 4), from Bassel al-Assad against
+    Incirlik. The harness's observer chases blue's flight, so red's raid is
+    almost always resolved on paper; what these tests pin is blue's sortie.
+    """
+    return [p for p in campaign.packages.values() if p.coalition == "blue"]
+
+
+def blue_sortie_losses(campaign: Campaign) -> list:
+    """The ledger restricted to blue's first sortie: its flight and the depot."""
+    package = blue_packages(campaign)[0]
+    depot = campaign.theater.targets[DEPOT]
+    return [
+        x for x in campaign.tracker.losses
+        if x.spawn_id in (package.spawn_id, depot.spawn_id)
+    ]
+
+
 def run_loop(
     campaign: Campaign | None = None,
     idle_first: float = 0.0,
@@ -128,8 +149,8 @@ class TestTheLoopCloses(unittest.TestCase):
         cls.campaign, cls.sim = run_loop()
 
     def test_a_package_was_planned_against_the_strategic_target(self):
-        packages = list(self.campaign.packages.values())
-        self.assertEqual(len(packages), 1, "expected exactly one strike package")
+        packages = blue_packages(self.campaign)
+        self.assertEqual(len(packages), 1, "expected exactly one blue strike package")
         package = packages[0]
         self.assertEqual(package.target_id, DEPOT)
         self.assertEqual(package.flight_size, 2)
@@ -137,7 +158,7 @@ class TestTheLoopCloses(unittest.TestCase):
         self.assertLess(package.t_tot, package.t_rtb)
 
     def test_the_flight_and_the_target_were_instantiated_in_the_sim(self):
-        package = next(iter(self.campaign.packages.values()))
+        package = blue_packages(self.campaign)[0]
         self.assertTrue(self.sim.saw_spawn, "the client was never told to spawn")
         self.assertGreaterEqual(
             self.sim.received["spawn"], 2, "flight and target were not both spawned"
@@ -158,7 +179,9 @@ class TestTheLoopCloses(unittest.TestCase):
         self.assertEqual(depot.damage_fraction, 1.0)
 
     def test_every_loss_was_recorded_by_a_snapshot(self):
-        losses = self.campaign.tracker.losses
+        # Every loss of the sortie DCS watched. Red's raid is flown on paper,
+        # out of the bubble, so its losses are the resolver's and not these.
+        losses = blue_sortie_losses(self.campaign)
         self.assertTrue(losses, "the campaign recorded no losses at all")
         self.assertEqual(
             len([x for x in losses if x.entity_kind == "target"]),
@@ -170,6 +193,7 @@ class TestTheLoopCloses(unittest.TestCase):
             1,
             "the airframe the harness shot down was not written off",
         )
+        self.assertNotIn(CAUSE_UNOBSERVED, {x.cause for x in losses})
 
     def test_airframes_and_munitions_came_off_the_squadron(self):
         sqn = self.campaign.inventories["blue"].squadron(SQUADRON)
@@ -183,7 +207,7 @@ class TestTheLoopCloses(unittest.TestCase):
         sqn.check_invariant()
 
     def test_the_package_landed_and_gave_its_reservation_back(self):
-        package = next(iter(self.campaign.packages.values()))
+        package = blue_packages(self.campaign)[0]
         self.assertEqual(package.state, COMPLETE)
         sqn = self.campaign.inventories["blue"].squadron(SQUADRON)
         self.assertEqual(
@@ -220,19 +244,28 @@ class TestTheLoopCloses(unittest.TestCase):
             path = Path(self.enterContext(_tempdir())) / "campaign.json"
             self.campaign.save(path)
             raw = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(raw["save_version"], 3)
+            self.assertEqual(raw["save_version"], 4)
         reloaded = Campaign.load(path)
         self.assertEqual(reloaded.to_dict(), self.campaign.to_dict())
         # And it is an engine rather than a deserialised blob. `tick` cannot
         # show that here: the war is over, so [] is both the healthy answer and
         # the answer a stub would give. A `hello` can -- the client that
         # connects now has to be told where the campaign already is, and has to
-        # be issued nothing, the depot being rubble and the flight home.
+        # be issued nothing from the war that finished, the depot being rubble
+        # and the flight home. What it is issued is blue's own storage area and
+        # Patriot battery: the observer brought the flight home to Incirlik,
+        # so they are in the bubble, and a restarted DCS has to get them back.
         frames = reloaded.on_hello(
             Hello(seq=1, t=0.0, protocol=PROTOCOL_VERSION, theater="Syria")
         )
-        self.assertEqual([f.type for f in frames], ["sync"])
+        at_incirlik = {
+            reloaded.theater.targets["incirlik_munitions_storage"].spawn_id,
+            reloaded.theater.threats["incirlik_patriot"].spawn_id,
+        }
+        self.assertEqual(frames[0].type, "sync")
         self.assertEqual(frames[0].campaign_time, self.campaign.clock)
+        self.assertEqual([f.type for f in frames[1:]], ["spawn"] * len(at_incirlik))
+        self.assertEqual({f.spawn_id for f in frames[1:]}, at_incirlik)
 
 
 class TestEventsAreAttributionOnly(unittest.TestCase):
@@ -270,13 +303,73 @@ class TestEventsAreAttributionOnly(unittest.TestCase):
     def test_only_attribution_differs_and_it_really_does(self):
         loud = attributions(self.with_events.to_dict())
         quiet = attributions(self.without_events.to_dict())
-        self.assertEqual(quiet, ["unknown"] * len(quiet))
+        # Every observed loss is "unknown" without events. Red's raid is flown
+        # on paper and its losses say "unobserved" in both runs: not an event
+        # label, so dropping events must not touch it.
+        causes = [x.cause for x in self.without_events.tracker.losses]
+        self.assertIn(CAUSE_UNOBSERVED, causes, "no paper loss; the split is vacuous")
+        self.assertEqual(
+            quiet,
+            [
+                "unobserved" if cause == CAUSE_UNOBSERVED else "unknown"
+                for cause in causes
+            ],
+        )
         self.assertNotEqual(
             loud,
             quiet,
             "events changed nothing at all, so this test would pass even if "
             "the engine ignored them entirely",
         )
+
+
+class TestEventsAreAttributionOnlyWhenRedIsWatched(unittest.TestCase):
+    """The reconciliation rule again, with red's raid inside the bubble.
+
+    The runs above chase blue's flight, so red is only ever resolved on paper
+    and the rule is tested on blue's losses alone. Here the observer never
+    leaves Incirlik: DCS holds the storage area and the Patriot, and the red
+    raid when it arrives, and the harness bombs the target and shoots down a
+    Su-24M. Every one of those losses has to come from a snapshot, and the
+    campaign has to end identical with every event dropped.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        parked = {"chase": False, "observer_to": INCIRLIK_XZ}
+        cls.with_events, cls.loud = run_loop(**parked)
+        cls.without_events, cls.quiet = run_loop(drop_events=True, **parked)
+
+    def _red_observed(self, campaign: Campaign) -> list:
+        return [
+            x for x in campaign.tracker.losses
+            if x.cause != CAUSE_UNOBSERVED
+            and (x.coalition == "red" or x.entity_id == "incirlik_munitions_storage")
+        ]
+
+    def test_red_losses_and_red_damage_were_observed_not_rolled(self):
+        observed = self._red_observed(self.with_events)
+        kinds = {(x.coalition, x.entity_kind) for x in observed}
+        self.assertIn(("red", "flight"), kinds, "no red aircraft was lost in DCS; vacuous")
+        self.assertIn(("blue", "target"), kinds, "red damaged nothing in DCS; vacuous")
+
+    def test_the_campaign_state_is_identical(self):
+        self.assertEqual(self.quiet.sent.get("event", 0), 0)
+        self.assertTrue(
+            self._red_observed(self.without_events),
+            "red was never watched, so this is the chase run again",
+        )
+        self.assertEqual(
+            strip_event_derived(self.without_events.to_dict()),
+            strip_event_derived(self.with_events.to_dict()),
+        )
+
+    def test_only_attribution_differs_and_it_really_does(self):
+        loud = [x.attribution for x in self._red_observed(self.with_events)]
+        quiet = [x.attribution for x in self._red_observed(self.without_events)]
+        self.assertEqual(len(loud), len(quiet))
+        self.assertEqual(quiet, ["unknown"] * len(quiet))
+        self.assertNotEqual(loud, quiet, "events changed nothing; this proves nothing")
 
 
 class TestReconnect(unittest.TestCase):
@@ -296,7 +389,7 @@ class TestReconnect(unittest.TestCase):
             campaign.clock, restart_at + MISSION_SECONDS, delta=5.0
         )
 
-        package = next(iter(campaign.packages.values()))
+        package = blue_packages(campaign)[0]
         self.assertEqual(package.state, COMPLETE)
         self.assertTrue(campaign.theater.targets[DEPOT].destroyed)
 
@@ -321,9 +414,17 @@ class TestReconnect(unittest.TestCase):
 
         # And the ledger itself: a restart may neither invent a casualty nor
         # forget one, whatever the totals say.
-        ledger = [(x.cause, x.entity_kind) for x in campaign.tracker.losses]
+        #
+        # Blue's sortie's ledger, which is what the restart can be compared
+        # on. Red's raid cannot be: the restarted mission puts its player back
+        # at Incirlik, inside red's target area, so in this run DCS watches
+        # the raid arrive and in the uninterrupted one nobody does and it is
+        # rolled on paper. Two different authorities, each correct, for what
+        # is not the same observation -- not the restart costing anything.
+        ledger = [(x.cause, x.entity_kind) for x in blue_sortie_losses(campaign)]
         self.assertEqual(
-            ledger, [(x.cause, x.entity_kind) for x in uninterrupted.tracker.losses]
+            ledger,
+            [(x.cause, x.entity_kind) for x in blue_sortie_losses(uninterrupted)],
         )
         self.assertEqual(len(ledger), 5, "the reference run's ledger changed shape")
 
@@ -350,7 +451,7 @@ class TestTheHarnessDoesNotHideItsOwnFailures(unittest.TestCase):
             sim.received["spawn"] + sim.received["despawn"],
             "the client stopped acking part-way through",
         )
-        package = next(iter(campaign.packages.values()))
+        package = blue_packages(campaign)[0]
         self.assertIn(package.state, ("destroyed", "complete"))
         self.assertTrue(campaign.tracker.losses, "no losses reached the ledger")
 
@@ -582,7 +683,7 @@ class TestTheWarMovesBeforeDCSArrives(unittest.TestCase):
 
     def test_the_loop_still_closes(self):
         self.assertTrue(self.campaign.theater.targets[DEPOT].destroyed)
-        package = next(iter(self.campaign.packages.values()))
+        package = blue_packages(self.campaign)[0]
         self.assertEqual(package.state, COMPLETE)
         self.campaign.inventories["blue"].check_invariant()
 

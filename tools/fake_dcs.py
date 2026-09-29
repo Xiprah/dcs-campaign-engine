@@ -92,9 +92,17 @@ DEFAULT_AIR_UNITS = 2
 DEFAULT_GROUND_UNITS = 4
 #: Templates whose size differs from their category's default above, with
 #: the `count` the client's TEMPLATES gives them. Without this the harness
-#: would refuse the slice's SA-6 battery that the client builds, and the
-#: engine would block it for the rest of the run.
-TEMPLATE_CAPACITY: dict[str, int] = {"SA-6_Kub_site": 5}
+#: would refuse the slice's SA-6 and Patriot batteries that the client builds,
+#: and the engine would block them for the rest of the run. (The red Su-24M
+#: two-ship and the blue storage area's four objects are the defaults.)
+TEMPLATE_CAPACITY: dict[str, int] = {"SA-6_Kub_site": 5, "Patriot_site": 5}
+#: Who the harness's scripted defender is, by the coalition of the flight it
+#: shoots at. Attribution only -- the engine may never act on it -- but a red
+#: jet "killed by red_sa6_bassel" would make a misleading ledger to read.
+DEFENDERS: dict[str, tuple[tuple[str, ...], str]] = {
+    "blue": (("red_sa6_bassel", "red_sa8_bassel", "red_manpad"), "9M33"),
+    "red": (("blue_patriot_incirlik", "blue_stinger_incirlik", "blue_manpad"), "MIM-104"),
+}
 #: Inbound frames handled per sim tick, mirroring the real client's cap.
 MAX_FRAMES_PER_TICK = 32
 _AIR_CATEGORIES = frozenset({"plane", "helicopter"})
@@ -537,10 +545,13 @@ class FakeDCS:
         if losses:
             flight.units -= losses
             flight.alive = flight.units > 0
-            defender = self.rng.choice(["red_sa6_bassel", "red_sa8_bassel", "red_manpad"])
+            # One draw from a three-name list either way, so which side is
+            # being shot at does not move the harness's own dice.
+            names, weapon = DEFENDERS.get(flight.coalition, DEFENDERS["blue"])
+            defender = self.rng.choice(list(names))
             for _ in range(losses):
                 await self._emit_event(
-                    "hit", initiator=defender, target=flight.name, weapon="9M33"
+                    "hit", initiator=defender, target=flight.name, weapon=weapon
                 )
                 await self._emit_event("dead", initiator=flight.name)
                 ejected = self.rng.random() < 0.5

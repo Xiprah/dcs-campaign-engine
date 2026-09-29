@@ -22,6 +22,11 @@ which is what makes a whole war replayable and a bug reproducible.
 `tick(now)` is a bare pulse and its argument is deliberately unused -- see
 :meth:`Campaign.tick`.
 
+**Both sides fight.** Every coalition with squadrons and an airbase plans,
+under the same inventory, attrition, threat and authority rules
+(docs/design.md, section 4). `player_coalition` is only which side humans fly,
+so it decides who is *told* what (:meth:`Campaign._tell`) and nothing else.
+
 **Two clocks.** Frames carry *mission* time, which DCS resets to zero on every
 restart. The campaign runs on its own monotonic clock and rebases the mission
 clock onto it at each `hello` (:attr:`Campaign.mission_epoch`). Without that,
@@ -34,6 +39,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import random
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +59,7 @@ from campaign.planner import (
     COMPLETE,
     DESTROYED,
     ENROUTE,
+    PLANNED,
     Package,
     build_package,
     package_heading,
@@ -91,7 +98,9 @@ from campaign.theater import (
 #: :meth:`Campaign.to_dict`.
 #:
 #: 3: the theater carries threat sites, and `connected` is no longer saved.
-SAVE_VERSION = 3
+#: 4: packages carry their coalition, and `objectives_announced` is replaced
+#:    by `war_result`, because the war can now be lost as well as won.
+SAVE_VERSION = 4
 
 #: Default seed. Explicit, because an implicit one is an unseeded one.
 DEFAULT_SEED = 20240923
@@ -161,9 +170,17 @@ class Campaign:
         #: client had come and gone -- and under `--simulate`, which never has
         #: one, for good.
         self.connected: bool = False
-        self._objectives_announced: bool = False
-        #: Not persisted; see _announce_dry.
-        self._dry_announced: bool = False
+        #: Set once, when some side's strategic targets are all destroyed:
+        #: {"t": campaign time, "defeated": [coalitions, in name order]}. Nobody
+        #: plans after that. Persisted, because a war that ended must not start
+        #: again on reload.
+        self.war_result: dict[str, Any] | None = None
+        #: Coalitions already told they cannot task anything. Not persisted;
+        #: see _announce_dry.
+        self._dry_announced: set[str] = set()
+        #: Coalitions already told there is nothing to strike. Not persisted,
+        #: for the same reason.
+        self._no_targets_announced: set[str] = set()
 
         self._ensure_targets_tracked()
 
@@ -211,13 +228,25 @@ class Campaign:
         """
         return dataclasses.replace(frame, t=self.campaign_time(frame.t))
 
-    def _message(self, text: str, to: str | None = None) -> Message:
-        return Message(
-            seq=self._seq(),
-            t=self.mission_time(),
-            to=to or self.player_coalition,
-            text=text,
-        )
+    def _tell(self, audience: str | Iterable[str], text: str) -> list[Downlink]:
+        """A message for `audience`, if humans fly for any side in it.
+
+        `player_coalition` decides who hears what -- here, and in which words
+        the war's end is announced -- and nothing else. A side nobody flies has
+        no one to read a message, so it is sent none, and no seq is spent on
+        one.
+        """
+        sides = {audience} if isinstance(audience, str) else set(audience)
+        if self.player_coalition not in sides:
+            return []
+        return [
+            Message(
+                seq=self._seq(),
+                t=self.mission_time(),
+                to=self.player_coalition,
+                text=text,
+            )
+        ]
 
     # ------------------------------------------------------------------
     # CampaignEngine
@@ -283,11 +312,12 @@ class Campaign:
             if not package.is_open:
                 continue
             target = self.theater.targets.get(package.target_id)
-            frames.append(
-                self._message(
+            frames.extend(
+                self._tell(
+                    package.coalition,
                     f"{package.callsign} on task: strike on "
                     f"{target.name if target else package.target_id}, "
-                    f"TOT {self.mission_time(package.t_tot):.0f}."
+                    f"TOT {self.mission_time(package.t_tot):.0f}.",
                 )
             )
         return frames
@@ -318,9 +348,7 @@ class Campaign:
     def on_state(self, msg: StateReport) -> list[Downlink]:
         """Ground truth. The only path by which the campaign may lose anything."""
         self._advance(msg.t)
-        frames: list[Downlink] = []
-        for loss in self.tracker.ingest(self._rebase(msg)):
-            frames.extend(self._apply_loss(loss))
+        frames = self._apply_losses(self.tracker.ingest(self._rebase(msg)))
         frames.extend(self._close_out_dead_packages())
         frames.extend(self._pulse())
         return frames
@@ -405,13 +433,16 @@ class Campaign:
         return frames
 
     def _pulse(self) -> list[Downlink]:
-        """Walk packages forward, task a new one, reconcile the bubble."""
+        """Walk packages forward, task new ones, reconcile the bubble."""
         frames: list[Downlink] = []
         frames.extend(self._advance_packages())
         # A flight can now die on paper at its TOT as well as in a snapshot,
         # and it has to close out before the planner looks for an open
         # package, or its replacement waits a pulse for nothing.
         frames.extend(self._close_out_dead_packages())
+        # Before planning, so no side frags a package in the pulse its war
+        # ended in.
+        frames.extend(self._check_war_end())
         frames.extend(self._plan())
         frames.extend(self._sync_bubble())
         return frames
@@ -434,26 +465,55 @@ class Campaign:
     # planning
     # ------------------------------------------------------------------
 
+    def _planning_coalitions(self) -> list[str]:
+        """Every side that can put a package in the air, in name order.
+
+        Name order, not dict order: the sides draw callsigns, package ids and
+        spawn ids from shared sources in this order, and the order a save
+        happened to list its inventories in is not something a replay may
+        depend on. A side with no squadrons has nothing to plan with, and one
+        with no airbase has nowhere to fly from.
+        """
+        return sorted(
+            coalition
+            for coalition, inventory in self.inventories.items()
+            if inventory.squadrons and self.theater.airbases_of(coalition)
+        )
+
     def _plan(self) -> list[Downlink]:
-        """Commit at most one strike package.
+        """Let each side commit at most one strike package.
+
+        docs/design.md, section 4: every side plans, under the same rules, and
+        which side humans fly has no say in it.
 
         TODO(seam): multi-package deconfliction -- several packages in the air
         at once, sequenced on time and route -- replaces this "one at a time"
         rule. Out of scope for the slice.
         """
-        if any(pkg.is_open for pkg in self.packages.values()):
+        if self.war_result is not None:
             return []
-        enemy = enemy_of(self.player_coalition)
-        target = select_target(self.theater, enemy)
-        if target is None:
-            return self._announce_objectives_complete()
-        inventory = self.inventories.get(self.player_coalition)
-        if inventory is None:
-            return []
+        frames: list[Downlink] = []
+        for coalition in self._planning_coalitions():
+            frames.extend(self._plan_for(coalition))
+        return frames
 
-        for base in sorted(
-            self.theater.airbases_of(self.player_coalition), key=lambda b: b.id
+    def _plan_for(self, coalition: str) -> list[Downlink]:
+        """Commit one strike package for `coalition`, unless it has one open.
+
+        TODO(seam): the SEAD element of docs/design.md, section 5, attaches
+        here, once the strike is built and its route is known.
+        """
+        if any(
+            pkg.is_open and pkg.coalition == coalition
+            for pkg in self.packages.values()
         ):
+            return []
+        target = select_target(self.theater, enemy_of(coalition))
+        if target is None:
+            return self._announce_no_targets(coalition)
+        inventory = self.inventories[coalition]
+        bases = sorted(self.theater.airbases_of(coalition), key=lambda b: b.id)
+        for base in bases:
             package_id = self._next_package_id()
             spawn_id = self._next_spawn_id()
             package = build_package(
@@ -470,50 +530,106 @@ class Campaign:
                 # a gap on every tick a stalled campaign fails to plan.
                 self._package_counter -= 1
                 self._spawn_counter -= 1
-                dry = self._announce_dry(base)
-                if dry:
-                    return dry
                 continue
             self.packages[package.id] = package
-            self._dry_announced = False
+            self._dry_announced.discard(coalition)
             self.tracker.track(
                 spawn_id,
                 entity_id=package.id,
                 entity_kind=KIND_FLIGHT,
-                coalition=self.player_coalition,
+                coalition=coalition,
                 units_initial=package.flight_size,
             )
-            return [
-                self._message(
-                    f"{package.callsign} fragged: {package.flight_size}-ship strike "
-                    f"on {target.name}, TOT {self.mission_time(package.t_tot):.0f}."
-                )
-            ]
-        return []
+            return self._tell(
+                coalition,
+                f"{package.callsign} fragged: {package.flight_size}-ship strike "
+                f"on {target.name}, TOT {self.mission_time(package.t_tot):.0f}.",
+            )
+        return self._announce_dry(coalition, bases)
 
-    def _announce_dry(self, base: Any) -> list[Downlink]:
-        """Say so, once, when the campaign can no longer task anything.
+    def _announce_dry(self, coalition: str, bases: list[Any]) -> list[Downlink]:
+        """Say so, once, when a side can no longer task anything.
 
         A campaign that quietly stops planning is indistinguishable from one
         with nothing to do. This is the difference between a war that ended and
         a war that ran out of bombs, and the save file looks identical either
         way. Deliberately not persisted: repeating it once after a reload is a
         far smaller sin than a silent stall.
-        """
-        if self._dry_announced:
-            return []
-        self._dry_announced = True
-        return [
-            self._message(
-                f"Cannot task: {base.name} has no aircraft or ordnance available."
-            )
-        ]
 
-    def _announce_objectives_complete(self) -> list[Downlink]:
-        if self._objectives_announced:
+        Said only after every base has been tried. Saying it at the first dry
+        base and stopping there would make a side that is told plan
+        differently from one that is not, and who is listening may not decide
+        what gets planned.
+        """
+        if coalition in self._dry_announced:
             return []
-        self._objectives_announced = True
-        return [self._message("All assigned strategic targets destroyed.")]
+        self._dry_announced.add(coalition)
+        names = ", ".join(base.name for base in bases)
+        verb = "has" if len(bases) == 1 else "have"
+        return self._tell(
+            coalition,
+            f"Cannot task: {names} {verb} no aircraft or ordnance available.",
+        )
+
+    def _announce_no_targets(self, coalition: str) -> list[Downlink]:
+        """A side whose enemy never held a strategic target has none to strike.
+
+        Not the end of the war -- that is `_check_war_end`, for a side whose
+        targets were all *destroyed* -- only a map with nothing on it for this
+        side to do. Said once, and not persisted, like `_announce_dry`.
+        """
+        if coalition in self._no_targets_announced:
+            return []
+        self._no_targets_announced.add(coalition)
+        return self._tell(coalition, "No enemy strategic targets to task.")
+
+    def _check_war_end(self) -> list[Downlink]:
+        """End the war, once, when some side's strategic targets are all gone.
+
+        Strategic targets are what each side is fighting for, so a side left
+        with none has lost -- whichever side that is, and whichever side the
+        humans fly. Both sides can lose their last target in the same pulse;
+        that is a war without a victor, not a win for whichever sorts first.
+
+        Nobody plans after this, and a package still on the ground is stood
+        down with its reservation returned. One already airborne flies out
+        its sortie as fragged, because there is no recalling it the same way
+        in both regimes: the protocol has no re-tasking frame, so a flight DCS
+        is holding keeps its attack task whatever the engine decides, and a
+        recall that only worked on paper would make the watched and unwatched
+        wars obey different rules. What it achieves is recorded like anything
+        else, but the result is fixed here, once.
+        """
+        if self.war_result is not None:
+            return []
+        defeated = self.theater.defeated_coalitions()
+        if not defeated:
+            return []
+        self.war_result = {"t": self.clock, "defeated": defeated}
+        if self.player_coalition not in defeated:
+            text = "All assigned strategic targets destroyed."
+        elif len(defeated) == 1:
+            text = "All our strategic targets have been destroyed. The war is lost."
+        else:
+            text = (
+                "Every strategic target on both sides has been destroyed. "
+                "The war ends without a victor."
+            )
+        frames = self._tell(self.player_coalition, text)
+        for package in sorted(self.packages.values(), key=lambda p: p.id):
+            if package.state != PLANNED:
+                continue
+            package.state = ABORTED
+            frames.extend(self._retire(package.spawn_id, "stood_down"))
+            self._settle(package)
+            self.tracker.forget(package.spawn_id)
+            frames.extend(
+                self._tell(
+                    package.coalition,
+                    f"{package.callsign} stood down: the war is over.",
+                )
+            )
+        return frames
 
     def _advance_packages(self) -> list[Downlink]:
         """Walk open packages forward on their paper track."""
@@ -562,9 +678,10 @@ class Campaign:
             # flight takes, observed or not.
             return frames
         frames.extend(self._resolve_unobserved(package, survivors))
-        frames.append(
-            self._message(
-                f"{package.callsign} off target, {survivors} aircraft egressing."
+        frames.extend(
+            self._tell(
+                package.coalition,
+                f"{package.callsign} off target, {survivors} aircraft egressing.",
             )
         )
         return frames
@@ -578,6 +695,10 @@ class Campaign:
 
         The route is the paper track's single leg, base to target; egress
         retraces it, so one pass through each envelope stands for the sortie.
+
+        Nothing here asks who the humans are. The sites are the enemy of the
+        flight's own coalition, so a red raid meets blue's air defences through
+        exactly the path a blue strike meets red's.
         """
         if self.tracker.is_instantiated(package.spawn_id):
             return []  # DCS has it; the snapshot is the authority.
@@ -597,14 +718,25 @@ class Campaign:
         losses = self.tracker.record_unobserved(
             package.spawn_id, outcome.aircraft_lost, self.clock
         )
-        frames: list[Downlink] = []
-        for loss in losses:
-            frames.extend(self._apply_flight_loss(loss))
+        frames = self._apply_losses(losses)
         if losses:
-            frames.append(
-                self._message(
+            frames.extend(
+                self._tell(
+                    package.coalition,
                     f"{package.callsign} lost {len(losses)} aircraft to air "
-                    f"defences inbound."
+                    f"defences inbound.",
+                )
+            )
+            # The defending side's own batteries fired, so it knows what they
+            # claimed. Only on paper: a flight DCS shot down was shot down in
+            # front of whoever was in the bubble, and the engine has nothing
+            # but event attribution -- which must never change what is sent --
+            # to say who did it.
+            frames.extend(
+                self._tell(
+                    enemy_of(package.coalition),
+                    f"{', '.join(site.name for site in sites)} engaged: "
+                    f"{len(losses)} enemy aircraft down.",
                 )
             )
         return frames
@@ -624,14 +756,17 @@ class Campaign:
         # Through the tracker, not straight onto the ledger: a target damaged
         # here and spawned later must come into DCS with only what survived,
         # and the spawn reads its unit count from the tracker.
-        frames: list[Downlink] = []
-        for loss in self.tracker.record_unobserved(
-            target.spawn_id, outcome.units_killed, self.clock
-        ):
-            frames.extend(self._apply_target_loss(loss))
+        frames = self._apply_losses(
+            self.tracker.record_unobserved(
+                target.spawn_id, outcome.units_killed, self.clock
+            )
+        )
         if outcome.missed:
-            frames.append(
-                self._message(f"{package.callsign} reports no effect on target.")
+            frames.extend(
+                self._tell(
+                    package.coalition,
+                    f"{package.callsign} reports no effect on target.",
+                )
             )
         return frames
 
@@ -641,8 +776,11 @@ class Campaign:
         self._settle(package)
         survivors = self.tracker.units_alive(package.spawn_id)
         self.tracker.forget(package.spawn_id)
-        frames.append(
-            self._message(f"{package.callsign} recovered, {survivors} aircraft home.")
+        frames.extend(
+            self._tell(
+                package.coalition,
+                f"{package.callsign} recovered, {survivors} aircraft home.",
+            )
         )
         return frames
 
@@ -655,7 +793,7 @@ class Campaign:
             frames.extend(self._retire(package.spawn_id, "destroyed"))
             self._settle(package)
             self.tracker.forget(package.spawn_id)
-            frames.append(self._message(f"{package.callsign} is lost."))
+            frames.extend(self._tell(package.coalition, f"{package.callsign} is lost."))
         return frames
 
     def _settle(self, package: Package) -> None:
@@ -669,7 +807,8 @@ class Campaign:
             return
 
     def _squadron_for(self, package: Package) -> Squadron | None:
-        inventory = self.inventories.get(self.player_coalition)
+        """The squadron a package draws on: its own side's, whoever flies it."""
+        inventory = self.inventories.get(package.coalition)
         if inventory is None:
             return None
         return inventory.squadrons.get(package.squadron_id)
@@ -677,6 +816,57 @@ class Campaign:
     # ------------------------------------------------------------------
     # loss application
     # ------------------------------------------------------------------
+
+    def _apply_losses(self, losses: list[LossRecord]) -> list[Downlink]:
+        """Apply a batch of losses, then say what it did, once per entity.
+
+        One snapshot or one paper strike can take several units off one
+        target, and its owner is told once per strike rather than once per
+        bomb. Entities are reported in the order of their first loss, which
+        the tracker already makes deterministic.
+        """
+        frames: list[Downlink] = []
+        counts: dict[tuple[str, str], int] = {}
+        for loss in losses:
+            frames.extend(self._apply_loss(loss))
+            key = (loss.entity_kind, loss.entity_id)
+            counts[key] = counts.get(key, 0) + 1
+        for (kind, entity_id), count in counts.items():
+            frames.extend(self._report_damage(kind, entity_id, count))
+        return frames
+
+    def _report_damage(self, kind: str, entity_id: str, count: int) -> list[Downlink]:
+        """Tell whoever could plausibly know what happened to a fixed entity.
+
+        Its owner knows it was hit, whoever hit it and whether or not anyone
+        was watching, and is told how much is left. The other side learns
+        only what a strike's bomb damage assessment would give it: that the
+        thing is gone. Neither is told who did it -- that would come from
+        event attribution, and a message is a frame, so it would make the
+        frame stream depend on events.
+
+        Flights are not reported here. Their own side hears about them through
+        the package's messages, and the enemy through `_expose`.
+        """
+        entity: Target | ThreatSite | None
+        if kind == KIND_TARGET:
+            entity = self.theater.targets.get(entity_id)
+        elif kind == KIND_THREAT:
+            entity = self.theater.threats.get(entity_id)
+        else:
+            return []
+        if entity is None:
+            return []
+        if entity.destroyed:
+            return self._tell(
+                {entity.coalition, enemy_of(entity.coalition)},
+                f"{entity.name} destroyed.",
+            )
+        return self._tell(
+            entity.coalition,
+            f"{entity.name} hit: {count} unit(s) destroyed, "
+            f"{entity.units_alive} of {entity.units_initial} remaining.",
+        )
 
     def _apply_loss(self, loss: LossRecord) -> list[Downlink]:
         if loss.entity_kind == KIND_FLIGHT:
@@ -714,7 +904,6 @@ class Campaign:
             return []
         frames = self._retire(target.spawn_id, "destroyed")
         self.tracker.forget(target.spawn_id)
-        frames.append(self._message(f"{target.name} destroyed."))
         return frames
 
     def _apply_threat_loss(self, loss: LossRecord) -> list[Downlink]:
@@ -726,7 +915,6 @@ class Campaign:
             return []
         frames = self._retire(site.spawn_id, "destroyed")
         self.tracker.forget(site.spawn_id)
-        frames.append(self._message(f"{site.name} destroyed."))
         return frames
 
     # ------------------------------------------------------------------
@@ -820,9 +1008,10 @@ class Campaign:
             package.state = ABORTED
             self._settle(package)
             self.tracker.forget(spawn_id)
-            return [
-                self._message(f"{package.callsign} scrubbed: client rejected spawn.")
-            ]
+            return self._tell(
+                package.coalition,
+                f"{package.callsign} scrubbed: client rejected spawn.",
+            )
         return []
 
     # ------------------------------------------------------------------
@@ -989,7 +1178,7 @@ class Campaign:
             "live": sorted(self.live),
             "blocked": sorted(self.blocked),
             "pending": {str(k): list(v) for k, v in sorted(self.pending.items())},
-            "objectives_announced": self._objectives_announced,
+            "war_result": self.war_result,
             "theater": self.theater.to_dict(),
             "inventories": {k: v.to_dict() for k, v in self.inventories.items()},
             "packages": {k: v.to_dict() for k, v in sorted(self.packages.items())},
@@ -1029,7 +1218,12 @@ class Campaign:
         campaign.pending = {
             int(k): (v[0], v[1]) for k, v in raw["pending"].items()
         }
-        campaign._objectives_announced = bool(raw["objectives_announced"])
+        result = raw["war_result"]
+        campaign.war_result = (
+            None
+            if result is None
+            else {"t": float(result["t"]), "defeated": list(result["defeated"])}
+        )
         campaign.packages = {
             k: Package.from_dict(v) for k, v in raw["packages"].items()
         }

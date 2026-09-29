@@ -630,7 +630,13 @@ class EncodeFailureTests(TransportTestCase):
         await self.hello(client)
         self.engine.tick_frames = [None]  # type: ignore[list-item]
         with self.assertLogs("campaign.server", level="ERROR"):
-            await self.wait_for(lambda: self.engine.ticks > 2, "a tick past the bad frame")
+            # Counted from here, not from zero: at a 10 ms tick the loop can
+            # be past two ticks before the hello round trip returns, and the
+            # wait then ends before any tick has met the bad frame.
+            before = self.engine.ticks
+            await self.wait_for(
+                lambda: self.engine.ticks > before + 2, "a tick past the bad frame"
+            )
         # close() awaits the tick task; a stored exception coming back out of
         # here would propagate through __main__'s finally and skip the save.
         await self.server.close()

@@ -323,11 +323,16 @@ class SideInventory:
 
 
 def build_slice_oob() -> tuple[SideInventory, SideInventory]:
-    """Blue gets one F-16C squadron at Incirlik. Red flies nothing yet.
+    """One strike squadron a side: F-16Cs at Incirlik, Su-24Ms at Bassel al-Assad.
 
-    TODO(seam): red air goes here (docs/design.md, section 4). Red's air
-    defences already exist, as `theater.ThreatSite`s on the map rather than
-    inventory; blue planning around them is section 5.
+    The two are the same size with the same stock on purpose. Red plans under
+    exactly blue's rules (docs/design.md, section 4), and an inventory tilted
+    either way would decide the war before the rules got a say. Each side's
+    air defences are `theater.ThreatSite`s on the map rather than inventory;
+    planning around them is section 5.
+
+    TODO(seam): fighters, escorts and a second squadron per side hang off
+    this, along with the multi-package deconfliction that would task them.
     """
     blue = SideInventory(coalition="blue")
     blue.add(
@@ -345,4 +350,20 @@ def build_slice_oob() -> tuple[SideInventory, SideInventory]:
         )
     )
     red = SideInventory(coalition="red")
+    red.add(
+        Squadron(
+            # Bassel al-Assad is the airfield Russia operates as Hmeimim, and
+            # Su-24Ms flew strike from it. The unit and its stock are invented.
+            id="red_bassel_su24",
+            name="Hmeimim Su-24M detachment",
+            coalition="red",
+            airframe="Su-24M",
+            template="Su-24M_strike_fab",
+            home_base="bassel_al_assad",
+            airframes_total=12,
+            airframes_available=12,
+            munitions_total={"FAB-500": 48},
+            munitions_available={"FAB-500": 48},
+        )
+    )
     return blue, red

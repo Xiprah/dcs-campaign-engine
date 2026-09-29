@@ -268,8 +268,9 @@ These are deliberate for the first vertical slice, not oversights:
 
 - **Loadouts are empty.** `TEMPLATES` in `campaign_client.lua` carries no
   pylon CLSIDs, because they are DCS-version specific and an unknown one
-  silently yields an empty pylon rather than an error. So the strike package
-  spawns unarmed: it will fly the route and drop nothing. Copy real values from
+  silently yields an empty pylon rather than an error. So every strike
+  package, blue's F-16s and red's Su-24Ms alike, spawns unarmed: it will fly
+  the route and drop nothing. Copy real values from
   mission-editor exported group data before expecting anything to hit a target.
   Munitions accounting lives in the engine either way.
 - **Air starts in practice.** The client ramp-starts a flight whose first

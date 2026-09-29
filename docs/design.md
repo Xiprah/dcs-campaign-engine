@@ -151,13 +151,16 @@ rolls them, so whatever computes those probabilities — including the
 suppression a SEAD element buys (section 5) — changes nothing downstream.
 `Theater.live_threats_along` is the question the SEAD planner asks ("is this
 route exposed?"), and the enemy is taken from the flight's own coalition, not
-from `player_coalition`, so a red flight will face blue's sites (section 4)
+from `player_coalition`, so a red flight faces blue's sites (section 4)
 through the same code.
 
-The slice has one threat site: an SA-6 battery (one radar, four launchers),
-with invented coordinates like everything else on the map. It is placed about
-5 km off the Incirlik–Latakia leg so the slice's only strike route runs
-through its envelope.
+The slice has one threat site a side, with invented coordinates like
+everything else on the map. Red's is an SA-6 battery (one radar, four
+launchers) about 5 km off the Incirlik–Latakia leg; blue's is a Patriot
+battery (one radar, four launchers) about 5 km off the Bassel al-Assad–Incirlik
+leg. Each side's only strike route runs through the other side's only
+envelope, and both carry the same placeholder kill probability, so neither
+side's air defence is tuned against the other by numbers nobody has measured.
 
 ## 4. The enemy: both sides fight
 
@@ -165,14 +168,68 @@ through its envelope.
 what; it does not decide who plans.
 
 Every coalition that has an inventory and airbases plans, in coalition-name
-order so the sequence is deterministic. Red strikes blue's strategic targets,
-faces blue's threat sites, and takes losses through exactly the same authority
-rule. Each side may have one package open at a time until multi-package
-deconfliction exists.
+order so the sequence is deterministic. "An inventory" means at least one
+squadron: a side with none has nothing to plan with. The order matters beyond
+tidiness, because the sides draw package ids, spawn ids and callsigns from
+shared sources in it, and the order a save happens to list its inventories in
+must not decide a replay. Red strikes blue's strategic targets, faces blue's
+threat sites, and takes losses through exactly the same authority rule. Each
+side may have one package open at a time until multi-package deconfliction
+exists.
+
+A package records the side that flies it. That, never `player_coalition`,
+decides whose squadron it draws on, whose threat sites it is exposed to, and
+who hears about it. Planning tries every one of a side's bases before it says
+the side cannot task anything: stopping at the first dry base to announce it
+would make the side that is listened to plan differently from the side that
+is not.
+
+**Who is told what.** Only the side humans fly is sent messages; a side
+nobody flies has nobody to read them, and is sent none. That side hears what
+it could plausibly know, and nothing that would come from event attribution
+(a message is a frame, and frames may not depend on events):
+
+- everything about its own packages, as before: fragged, on task, off
+  target, losses to air defences, recovered, lost, scrubbed, stood down;
+- damage to its own strategic targets and threat sites, whoever caused it
+  and whether or not anyone was watching, with what is left standing — but
+  not who did it;
+- the destruction of an enemy target or site: its own strike's bomb damage
+  assessment;
+- enemy aircraft its own air defences shot down on paper. Not those DCS shot
+  down: those died in front of whoever was in the bubble, and the engine has
+  only event attribution to say who killed them;
+- never the enemy's tasking, callsigns, launches or recoveries. There is no
+  intelligence or early-warning model to learn them from (AWACS is out of
+  scope).
+
+**The end of the war.** Strategic targets are what each side fights for, so a
+side that held some and has none left has lost. The war ends the first time
+that is true of any side, and the result — the time and the defeated sides —
+is saved, so a reloaded war stays over. Both sides losing their last target
+in the same pulse is a war without a victor, not a win for whichever sorts
+first. The humans are told once: that their assigned targets are all
+destroyed, that their own are and the war is lost, or that both are.
+
+After the end nobody plans. A package still on the ground is stood down and
+its reservation returned. One already airborne flies out its sortie as
+fragged, and what it achieves is recorded, but the result is already fixed.
+It is not recalled because the two regimes could not recall it alike: the
+protocol has no re-tasking frame, so a flight DCS is holding keeps its attack
+task whatever the engine decides, and a recall that worked only on paper
+would make the watched and unwatched wars obey different rules.
+
+A side whose enemy never held a strategic target is not at war with anyone
+the map can express. It plans nothing and, if humans fly it, is told so once.
 
 Rejected: a scripted red. An enemy that follows a script is a target range
 with extra steps. The engine's red must be subject to the same inventory,
 attrition and threat as blue, or nothing blue achieves means anything.
+
+Rejected: letting the war run on once one side's targets are gone, the beaten
+side raiding until the winner's are gone as well. That ends, if it ends, with
+two victors, and turns a war the humans won into one they can lose afterwards
+to an enemy with nothing left to fight for.
 
 ## 5. Packages: a set of flights with one TOT
 

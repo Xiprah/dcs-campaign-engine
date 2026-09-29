@@ -274,6 +274,15 @@ class Theater:
     def surviving_targets_of(self, coalition: Coalition) -> list[Target]:
         return [t for t in self.targets_of(coalition) if not t.destroyed]
 
+    def defeated_coalitions(self) -> list[Coalition]:
+        """Sides that held strategic targets and have none left, in name order.
+
+        A side that never held one is not defeated by owning nothing: that is
+        a map with nothing of its to strike, not a war it lost.
+        """
+        owners = sorted({t.coalition for t in self.targets.values()})
+        return [c for c in owners if not self.surviving_targets_of(c)]
+
     def live_threats_along(
         self, coalition: Coalition, a: Vec3, b: Vec3
     ) -> list[ThreatSite]:
@@ -336,9 +345,25 @@ SA6_ENGAGEMENT_RADIUS = 20_000.0
 #: offline war to be losable. TODO(threat-model) replaces it.
 SA6_KILL_PROBABILITY = 0.15
 
+#: Placeholder envelope for a Patriot battery, as one ground radius. Well
+#: inside the system's published reach against aircraft, and trimmed the same
+#: way the SA-6's is: a flat radius stands for an envelope that really depends
+#: on altitude, aspect and terrain. See ThreatSite.
+PATRIOT_ENGAGEMENT_RADIUS = 40_000.0
+
+#: Deliberately the SA-6's number, not a judgement that the two systems are
+#: equals. Both are uncalibrated placeholders, and giving one side a better
+#: guess than the other would decide the war by content nobody has measured.
+#: TODO(threat-model) replaces both.
+PATRIOT_KILL_PROBABILITY = SA6_KILL_PROBABILITY
+
 
 def build_slice_theater() -> Theater:
-    """Two airbases, one strategic target, one threat site. Nothing else."""
+    """Two airbases, and for each side one strategic target and one threat site.
+
+    Built so that each side's only strike route runs through the other side's
+    only envelope: the war is symmetric in shape, if not in content.
+    """
     incirlik = Airbase(
         id="incirlik",
         name="Incirlik",
@@ -363,8 +388,8 @@ def build_slice_theater() -> Theater:
         units_alive=4,
     )
     # Invented, like every coordinate here, and placed on purpose: about 5 km
-    # off the Incirlik-Latakia strike leg and 25 km short of the depot, so the
-    # slice's only strike route runs through its envelope. A site covering the
+    # off the Incirlik-Latakia strike leg and 25 km short of the depot, so
+    # blue's only strike route runs through its envelope. A site covering the
     # northern approach to Latakia, not a surveyed battery.
     sa6 = ThreatSite(
         id="latakia_north_sa6",
@@ -380,9 +405,41 @@ def build_slice_theater() -> Theater:
         engagement_radius=SA6_ENGAGEMENT_RADIUS,
         kill_probability=SA6_KILL_PROBABILITY,
     )
+    # What red strikes (docs/design.md, section 4). Invented like the rest:
+    # about 6 km from the Incirlik airbase position above, standing in for the
+    # base's weapons storage area rather than surveying it.
+    storage = Target(
+        id="incirlik_munitions_storage",
+        name="Incirlik Munitions Storage",
+        coalition="blue",
+        pos=(138_000.0, 0.0, -33_000.0),
+        priority=100,
+        template="munitions_storage_medium",
+        category="structure",
+        units_initial=4,
+        units_alive=4,
+    )
+    # Placed as the SA-6 is, mirrored: about 5 km off the Bassel al-Assad to
+    # Incirlik leg and about 15 km short of the storage area, so red's only
+    # strike route runs through its envelope. A Patriot because NATO batteries
+    # have in fact been deployed around Adana; the position is not theirs.
+    patriot = ThreatSite(
+        id="incirlik_patriot",
+        name="Incirlik Patriot",
+        coalition="blue",
+        pos=(126_000.0, 0.0, -22_000.0),
+        template="Patriot_site",
+        category="ground",
+        # One AN/MPQ-53 radar and four M901 launchers: the battery the
+        # client's Patriot_site template builds.
+        units_initial=5,
+        units_alive=5,
+        engagement_radius=PATRIOT_ENGAGEMENT_RADIUS,
+        kill_probability=PATRIOT_KILL_PROBABILITY,
+    )
     return Theater(
         name="Syria",
         airbases={incirlik.id: incirlik, bassel.id: bassel},
-        targets={depot.id: depot},
-        threats={sa6.id: sa6},
+        targets={depot.id: depot, storage.id: storage},
+        threats={sa6.id: sa6, patriot.id: patriot},
     )

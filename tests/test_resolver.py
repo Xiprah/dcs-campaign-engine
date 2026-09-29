@@ -155,12 +155,23 @@ class TestNoDoubleJeopardy(unittest.TestCase):
             campaign.live,
             "the depot was never instantiated, so this proves nothing",
         )
+        # Blue's strike on the depot is what the observer is watching. Red's
+        # raid on Incirlik, 160 km away, is resolved on paper in the same war,
+        # and rightly: nothing there is instantiated.
+        watched = {campaign.theater.targets[DEPOT].spawn_id} | {
+            p.spawn_id for p in campaign.packages.values() if p.coalition == "blue"
+        }
         paper = [
             loss
             for loss in campaign.tracker.losses
-            if loss.cause == CAUSE_UNOBSERVED
+            if loss.cause == CAUSE_UNOBSERVED and loss.spawn_id in watched
         ]
         self.assertEqual(paper, [], "an observed target was resolved on paper too")
+        self.assertTrue(
+            [p for p in campaign.packages.values()
+             if p.coalition == "blue" and p.weapons_released],
+            "blue's strike never reached its TOT, so this proves nothing",
+        )
 
 
 class TestTheStallIsAnnounced(unittest.TestCase):

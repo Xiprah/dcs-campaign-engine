@@ -129,6 +129,14 @@ local DEFAULT_PAYLOAD = {
     gun = 100,
 }
 
+local SU24M_PAYLOAD = {
+    pylons = {},
+    fuel = 11700,
+    flare = 60,
+    chaff = 60,
+    gun = 100,
+}
+
 local SPEC = {
     templates = {
         ["F-16C_strike_jdam"] = {
@@ -165,11 +173,43 @@ local SPEC = {
             probe_category = "ground",
             probe_country = "RUSSIA",
         },
+        -- Red's strike aircraft, probed for RUSSIA because that is who the
+        -- client spawns red for: a type DCS refuses to a country is a
+        -- rejection no USA probe would ever see.
+        ["Su-24M_strike_fab"] = {
+            unit_type = "Su-24M",
+            count = 2,
+            task = "Ground Attack",
+            skill = "High",
+            payload = SU24M_PAYLOAD,
+            probe_category = "plane",
+            probe_country = "RUSSIA",
+        },
+        -- Blue's strategic target, a static probed for USA.
+        ["munitions_storage_medium"] = {
+            static = true,
+            unit_type = "Warehouse",
+            static_category = "Warehouses",
+            count = 4,
+            spread = 60,
+            probe_country = "USA",
+        },
+        -- A blue ground group: probed for USA, on the ground, radar first.
+        ["Patriot_site"] = {
+            lead_type = "Patriot str",
+            unit_type = "Patriot ln",
+            count = 5,
+            task = "Ground Nothing",
+            skill = "High",
+            probe_category = "ground",
+            probe_country = "USA",
+        },
     },
 
     --- Iterated in this order so a run is reproducible.
     template_order = {"F-16C_strike_jdam", "F-16C_cap", "fuel_depot_medium",
-                      "SA-6_Kub_site"},
+                      "SA-6_Kub_site", "Su-24M_strike_fab",
+                      "munitions_storage_medium", "Patriot_site"},
 
     --- campaign_client.lua: dcs_maps().country
     country = {
@@ -756,10 +796,14 @@ local function build_cases()
                             .. "' x" .. tostring(tmpl.count),
                     attempt = function(case, index)
                         local rec = new_case_record(case)
-                        local cid = country_id("RUSSIA")
+                        -- The side the target belongs to: red's depot and
+                        -- blue's storage area are both statics, spawned for
+                        -- different countries.
+                        local country = tmpl.probe_country or "RUSSIA"
+                        local cid = country_id(country)
                         if cid == nil then
                             rec.status = "SKIP"
-                            rec.error = "country.id.RUSSIA is nil"
+                            rec.error = "country.id." .. country .. " is nil"
                             return rec
                         end
                         local x, y = case_position(index)

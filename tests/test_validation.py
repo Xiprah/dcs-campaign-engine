@@ -64,6 +64,9 @@ EXPECTED_IDS = {
     "template.F-16C_cap",
     "template.fuel_depot_medium",
     "template.SA-6_Kub_site",
+    "template.Su-24M_strike_fab",
+    "template.munitions_storage_medium",
+    "template.Patriot_site",
     "country.USA",
     "country.RUSSIA",
     "country.SWITZERLAND",
@@ -313,6 +316,53 @@ class TestTheValidatorRuns(unittest.TestCase):
         self.assertEqual(
             [u["type"] for u in units], ["Kub 1S91 str"] + ["Kub 2P25 ln"] * 4
         )
+        self.assertTrue(all("payload" not in u for u in units), "a SAM carries a payload")
+        self.assertTrue(all(u["alt"] == 0 for u in units))
+        self.assertEqual(call["data"]["task"], "Ground Nothing")
+
+    def _call(self, name: str) -> dict:
+        return next(c for c in self.runner.mock.spawn_calls() if c.get("name") == name)
+
+    def test_red_strike_aircraft_are_probed_as_russian_planes(self):
+        """For the country the client spawns red for, or the probe proves nothing:
+        DCS may refuse a type to one country and not another."""
+        case = self.by_id.get("template.Su-24M_strike_fab")
+        self.assertIsNotNone(case, "the validator never probed the Su-24M")
+        self.assertEqual(case["status"], "OK")
+        self.assertEqual(case["detail"]["units"], 2)
+        call = self._call("cmpval_Su-24M_strike_fab")
+        g = self.runner.mock.lua.globals()
+        self.assertEqual(call["country"], g.country.id.RUSSIA)
+        self.assertEqual(call["category"], g.Group.Category.AIRPLANE)
+        units = call["data"]["units"]
+        self.assertEqual([u["type"] for u in units], ["Su-24M", "Su-24M"])
+        self.assertTrue(all(u["payload"]["fuel"] == 11700 for u in units))
+        self.assertEqual(call["data"]["task"], "Ground Attack")
+
+    def test_the_blue_static_target_is_probed_for_usa(self):
+        """The depot is probed for RUSSIA; blue's storage area must not be."""
+        case = self.by_id.get("template.munitions_storage_medium")
+        self.assertIsNotNone(case, "the validator never probed blue's storage area")
+        self.assertEqual(case["status"], "OK")
+        call = self._call("cmpval_munitions_storage_medium")
+        g = self.runner.mock.lua.globals()
+        self.assertEqual(call["kind"], "static")
+        self.assertEqual(call["country"], g.country.id.USA)
+        self.assertEqual((call["data"]["type"], call["data"]["category"]), ("Warehouse", "Warehouses"))
+        depot = self._call("cmpval_fuel_depot_medium")
+        self.assertEqual(depot["country"], g.country.id.RUSSIA)
+
+    def test_the_patriot_case_is_a_blue_ground_group_built_radar_first(self):
+        case = self.by_id.get("template.Patriot_site")
+        self.assertIsNotNone(case, "the validator never probed the Patriot")
+        self.assertEqual(case["status"], "OK")
+        self.assertEqual(case["detail"]["units"], 5)
+        call = self._call("cmpval_Patriot_site")
+        g = self.runner.mock.lua.globals()
+        self.assertEqual(call["country"], g.country.id.USA)
+        self.assertEqual(call["category"], g.Group.Category.GROUND)
+        units = call["data"]["units"]
+        self.assertEqual([u["type"] for u in units], ["Patriot str"] + ["Patriot ln"] * 4)
         self.assertTrue(all("payload" not in u for u in units), "a SAM carries a payload")
         self.assertTrue(all(u["alt"] == 0 for u in units))
         self.assertEqual(call["data"]["task"], "Ground Nothing")
