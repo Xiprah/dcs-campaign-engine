@@ -86,10 +86,11 @@ DOWNLINK_SAMPLES = [
         coalition="blue",
         category="plane",
         template="F-16C_strike_jdam",
+        units=2,
         position=(40000.0, 4500.0, -90000.0),
         heading=1.57,
         route=[
-            Waypoint(pos=(40000.0, 4500.0, -90000.0), alt=4500.0, speed=220.0),
+            Waypoint(pos=(40000.0, 4500.0, -90000.0), alt=4500.0, speed=220.0, airdrome_id=27),
             Waypoint(pos=(41000.0, 6000.0, -92000.0), alt=6000.0, speed=240.0, action="attack"),
         ],
         tasking={"kind": "strike", "target": "cmp_7c02", "tot": 1230.0},
@@ -102,6 +103,7 @@ DOWNLINK_SAMPLES = [
         coalition="red",
         category="ground",
         template="strategic_target",
+        units=4,
         position=(1.0, 2.0, 3.0),
     ),
     Despawn(seq=93, t=1800.0, ref=93, spawn_id="a91f", reason="left_bubble"),
@@ -211,10 +213,9 @@ class RejectionTests(unittest.TestCase):
     def test_malformed_nested_member_is_rejected(self) -> None:
         """A bad GroupSnapshot / Observer / Waypoint must never half-decode.
 
-        `_build` only wraps the outer dataclass call in its TypeError guard, so
-        today these surface as TypeError rather than ProtocolError. Both are
-        rejections, and this asserts the part that matters; tighten it to
-        ProtocolError alone once protocol.py wraps the nested construction too.
+        And it is refused as a ProtocolError, not a TypeError that only the
+        transport happens to translate: every caller of decode_uplink is owed
+        the one exception the module documents.
         """
         cases = [
             b'{"type":"state","seq":1,"t":0.0,"groups":[{"spawn_id":"a"}]}',
@@ -222,13 +223,126 @@ class RejectionTests(unittest.TestCase):
         ]
         for raw in cases:
             with self.subTest(raw=raw):
-                with self.assertRaises((ProtocolError, TypeError)):
+                with self.assertRaises(ProtocolError):
                     decode_uplink(raw)
-        with self.assertRaises((ProtocolError, TypeError)):
+        with self.assertRaises(ProtocolError):
             decode_downlink(
                 b'{"type":"despawn","seq":1,"t":0.0,"ref":1,"spawn_id":"a","reason":{"x":1},'
                 b'"bogus":2}'
             )
+        with self.assertRaises(ProtocolError):
+            decode_downlink(
+                b'{"type":"spawn","seq":1,"t":0.0,"ref":1,"spawn_id":"a","coalition":"blue",'
+                b'"category":"plane","template":"x","units":1,"position":[0,0,0],'
+                b'"route":[{"alt":1}]}'
+            )
+
+
+class Version2Tests(unittest.TestCase):
+    """What protocol 2 changed on the wire. docs/protocol.md, Changes from v1."""
+
+    def test_the_version_is_2(self) -> None:
+        self.assertEqual(PROTOCOL_VERSION, 2)
+
+    def test_a_spawn_without_a_unit_count_does_not_decode(self) -> None:
+        """`units` is required. A v1-shaped spawn is malformed, not a guess."""
+        raw = json.loads(encode(DOWNLINK_SAMPLES[2]))
+        del raw["units"]
+        with self.assertRaises(ProtocolError):
+            decode_downlink(json.dumps(raw))
+
+    def test_the_unit_count_is_a_field_and_tasking_does_not_carry_one(self) -> None:
+        decoded = decode_downlink(encode(DOWNLINK_SAMPLES[2]))
+        self.assertEqual(decoded.units, 2)
+        self.assertNotIn("units", decoded.tasking)
+
+    def test_airdrome_id_round_trips_and_is_optional(self) -> None:
+        decoded = decode_downlink(encode(DOWNLINK_SAMPLES[2]))
+        self.assertEqual(decoded.route[0].airdrome_id, 27)
+        self.assertIsNone(decoded.route[1].airdrome_id)
+
+        raw = json.loads(encode(DOWNLINK_SAMPLES[2]))
+        for waypoint in raw["route"]:
+            del waypoint["airdrome_id"]
+        absent = decode_downlink(json.dumps(raw))
+        self.assertEqual([wp.airdrome_id for wp in absent.route], [None, None])
+
+
+class EventNamesAreStringsOrNothing(unittest.TestCase):
+    """An event's name fields that are not strings are dropped, never fatal.
+
+    Events are attribution only: losing one attribution is harmless by
+    design, while a ProtocolError here would close a live connection
+    mid-sortie over a junk field.
+    """
+
+    NAMES = ("initiator", "target", "weapon", "place")
+
+    @staticmethod
+    def event(**fields: object) -> bytes:
+        frame = {"type": "event", "seq": 5, "t": 10.0, "kind": "kill"}
+        frame.update(fields)
+        return json.dumps(frame).encode("utf-8")
+
+    def test_a_numeric_initiator_is_coerced_to_none_and_the_rest_survives(self) -> None:
+        decoded = decode_uplink(
+            self.event(initiator=140521, target="cmp_a91f", weapon="GBU-38")
+        )
+        self.assertIsInstance(decoded, Event)
+        self.assertIsNone(decoded.initiator)
+        self.assertEqual(decoded.target, "cmp_a91f")
+        self.assertEqual(decoded.weapon, "GBU-38")
+        self.assertEqual(decoded.kind, "kill")
+
+    def test_every_name_field_is_coerced_whatever_the_junk(self) -> None:
+        for name in self.NAMES:
+            for junk in (7, 1.5, True, ["cmp_a91f"], {"x": 1}):
+                with self.subTest(field=name, junk=junk):
+                    decoded = decode_uplink(self.event(**{name: junk}))
+                    self.assertIsNone(getattr(decoded, name))
+
+    def test_string_and_null_names_are_left_alone(self) -> None:
+        decoded = decode_uplink(
+            self.event(initiator="sam:kub", target=None, weapon="9M38", place="Latakia")
+        )
+        self.assertEqual(
+            (decoded.initiator, decoded.target, decoded.weapon, decoded.place),
+            ("sam:kub", None, "9M38", "Latakia"),
+        )
+
+
+class StateSnapshotsAreNotLenient(unittest.TestCase):
+    """The event leniency stops at events. A bad snapshot is a ProtocolError.
+
+    A snapshot is ground truth. A group reported under a spawn_id that is not
+    a string matches nothing the engine tracks, so the group it was meant to
+    be reads as absent from the census -- and absence is a loss.
+    """
+
+    @staticmethod
+    def state(groups: object) -> bytes:
+        return json.dumps(
+            {"type": "state", "seq": 1, "t": 0.0, "groups": groups}
+        ).encode("utf-8")
+
+    def test_a_numeric_spawn_id_is_a_protocol_error(self) -> None:
+        raw = self.state(
+            [{"spawn_id": 140521, "alive": True, "units": 2, "units_initial": 2}]
+        )
+        with self.assertRaises(ProtocolError):
+            decode_uplink(raw)
+
+    def test_a_member_missing_a_field_is_a_protocol_error(self) -> None:
+        with self.assertRaises(ProtocolError):
+            decode_uplink(self.state([{"spawn_id": "a91f", "alive": True}]))
+
+    def test_a_member_that_is_not_an_object_is_a_protocol_error(self) -> None:
+        with self.assertRaises(ProtocolError):
+            decode_uplink(self.state([5]))
+
+    def test_groups_that_is_not_a_list_is_a_protocol_error(self) -> None:
+        with self.assertRaises(ProtocolError):
+            decode_uplink(self.state({}))
 
 
 class FrameBufferTests(unittest.TestCase):
@@ -293,6 +407,16 @@ class NamingTests(unittest.TestCase):
 
     def test_foreign_names_are_not_ours(self) -> None:
         for name in ["Aerial-1", "", "cm_a91f", "CMP_a91f", " cmp_a91f", "Ground Units-3"]:
+            with self.subTest(name=name):
+                self.assertIsNone(spawn_id_of(name))
+
+    def test_a_name_that_is_not_a_string_is_not_ours(self) -> None:
+        """Names come off the wire, and DCS scenery answers getName with a number.
+
+        The engine may not depend on a client filtering that out, so this is
+        a plain None -- not an AttributeError from inside the event path.
+        """
+        for name in [123, 140521, 1.5, None, True, ["cmp_a91f"], {"cmp_": 1}]:
             with self.subTest(name=name):
                 self.assertIsNone(spawn_id_of(name))
 

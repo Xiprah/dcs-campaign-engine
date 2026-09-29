@@ -13,7 +13,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 #: Hard cap on a single frame. Longer frames indicate a bug, not a big payload.
 MAX_FRAME_BYTES = 64 * 1024
@@ -36,9 +36,14 @@ def group_name(spawn_id: str) -> str:
     return f"{OWNED_PREFIX}{spawn_id}"
 
 
-def spawn_id_of(name: str) -> str | None:
-    """Inverse of :func:`group_name`; None if the name is not ours."""
-    if not name.startswith(OWNED_PREFIX):
+def spawn_id_of(name: object) -> str | None:
+    """Inverse of :func:`group_name`; None if the name is not ours.
+
+    Takes anything, because names arrive off the wire and the engine may not
+    depend on a client being well-behaved: DCS scenery answers getName with a
+    number, and a number is not one of our names.
+    """
+    if not isinstance(name, str) or not name.startswith(OWNED_PREFIX):
         return None
     return name[len(OWNED_PREFIX):]
 
@@ -136,6 +141,9 @@ class Waypoint:
     alt: float = 0.0
     speed: float = 0.0
     action: str = "turning_point"
+    #: DCS airdrome id. On the first waypoint it makes the flight a ramp start
+    #: at that airfield rather than an air start. See docs/protocol.md.
+    airdrome_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +167,10 @@ class Spawn:
     coalition: Coalition
     category: str
     template: str
+    #: Exactly how many units to build. No default, so no emitter can forget
+    #: it: the engine owns the airframe ledger, and a count left to the
+    #: client's template is how a flight that lost a wingman comes back whole.
+    units: int
     position: Vec3
     heading: float = 0.0
     route: list[Waypoint] = field(default_factory=list)
@@ -210,6 +222,9 @@ _NESTED = {
     "route": Waypoint,
 }
 
+#: Event fields that name things. See :func:`decode_uplink`.
+_EVENT_NAMES = ("initiator", "target", "weapon", "place")
+
 
 def encode(frame: Uplink | Downlink) -> bytes:
     """Serialise one frame, including its trailing newline."""
@@ -226,16 +241,23 @@ def _tuple_pos(key: str, value: Any) -> Any:
     return value
 
 
+def _build_nested(cls: type, item: Any) -> Any:
+    # A member that is not an object, or lacks a field, must fail the whole
+    # frame as a ProtocolError. Kept as a raw value it half-decodes; escaping
+    # as a TypeError it is only fatal to callers that think to translate it.
+    if not isinstance(item, dict):
+        raise ProtocolError(f"malformed {cls.__name__}: {item!r} is not an object")
+    try:
+        return cls(**{k: _tuple_pos(k, v) for k, v in item.items()})
+    except TypeError as exc:
+        raise ProtocolError(f"malformed {cls.__name__}: {exc}") from exc
+
+
 def _build(cls: type, payload: dict[str, Any]) -> Any:
     payload.pop("type", None)
     for key, nested in _NESTED.items():
         if key in payload and isinstance(payload[key], list):
-            payload[key] = [
-                nested(**{k: _tuple_pos(k, v) for k, v in item.items()})
-                if isinstance(item, dict)
-                else item
-                for item in payload[key]
-            ]
+            payload[key] = [_build_nested(nested, item) for item in payload[key]]
     payload = {k: _tuple_pos(k, v) for k, v in payload.items()}
     try:
         return cls(**payload)
@@ -243,7 +265,7 @@ def _build(cls: type, payload: dict[str, Any]) -> Any:
         raise ProtocolError(f"malformed {cls.__name__}: {exc}") from exc
 
 
-def _decode(raw: bytes | str, table: dict[str, type], direction: str) -> Any:
+def _payload(raw: bytes | str, table: dict[str, type], direction: str) -> dict[str, Any]:
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
     try:
@@ -255,17 +277,52 @@ def _decode(raw: bytes | str, table: dict[str, type], direction: str) -> Any:
     kind = payload.get("type")
     if kind not in table:
         raise ProtocolError(f"unknown {direction} frame type: {kind!r}")
-    return _build(table[kind], payload)
+    return payload
+
+
+def _check_state(report: StateReport) -> StateReport:
+    """A snapshot is ground truth, so a malformed one is refused outright.
+
+    Nothing here is lenient the way events are. A group reported under a
+    spawn_id that is not a string matches nothing the engine tracks, so the
+    group it was meant to be reads as absent from the census -- and absence is
+    a loss. Guessing would write off a flight that is still flying.
+    """
+    if not isinstance(report.groups, list):
+        raise ProtocolError(f"malformed StateReport: groups is {type(report.groups).__name__}")
+    for group in report.groups:
+        if not isinstance(group.spawn_id, str):
+            raise ProtocolError(
+                f"malformed GroupSnapshot: spawn_id {group.spawn_id!r} is not a string"
+            )
+    return report
 
 
 def decode_uplink(raw: bytes | str) -> Uplink:
-    """Decode a frame sent by the mission client."""
-    return _decode(raw, _UPLINK, "uplink")
+    """Decode a frame sent by the mission client.
+
+    An `event` whose name fields are not strings keeps the frame and loses
+    those fields. Events are attribution only, so the worst a junk name can
+    cost is one attribution; refusing the frame would make it a ProtocolError,
+    and that closes a live connection mid-sortie over something the campaign
+    is designed to do without.
+    """
+    payload = _payload(raw, _UPLINK, "uplink")
+    kind = payload["type"]
+    if kind == "event":
+        for key in _EVENT_NAMES:
+            if not isinstance(payload.get(key), (str, type(None))):
+                payload[key] = None
+    frame = _build(_UPLINK[kind], payload)
+    if kind == "state":
+        return _check_state(frame)
+    return frame
 
 
 def decode_downlink(raw: bytes | str) -> Downlink:
     """Decode a frame sent by the engine. Used by the fake-DCS harness."""
-    return _decode(raw, _DOWNLINK, "downlink")
+    payload = _payload(raw, _DOWNLINK, "downlink")
+    return _build(_DOWNLINK[payload["type"]], payload)
 
 
 class FrameBuffer:

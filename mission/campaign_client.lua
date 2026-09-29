@@ -99,7 +99,7 @@ if type(_G.CAMPAIGN_CLIENT_CONFIG) == "table" then
     for k, v in pairs(_G.CAMPAIGN_CLIENT_CONFIG) do CONFIG[k] = v end
 end
 
-local PROTOCOL_VERSION = 1
+local PROTOCOL_VERSION = 2
 local MAX_FRAME_BYTES = 64 * 1024
 local MAX_FRAMES_PER_TICK = CONFIG.max_frames_per_tick
 local OWNED_PREFIX = "cmp_"
@@ -417,15 +417,22 @@ local function dcs_maps()
 end
 
 --- Protocol waypoint action -> the (type, action) pair DCS wants.
----
---- TODO(seam): ground starts need an airdromeId on the waypoint and the
---- protocol's Waypoint has no field for one, so everything here is an air
---- start. Extending Waypoint is the seam for ramp and runway departures.
 local WAYPOINT_ACTIONS = {
     turning_point = {"Turning Point", "Turning Point"},
     fly_over_point = {"Turning Point", "Fly Over Point"},
     landing = {"Land", "Landing"},
 }
+
+--- What waypoint 1 becomes when it names an airdrome: a cold start on that
+--- airfield's ramp instead of an air start. Keyed off `airdrome_id` rather
+--- than an action because the protocol's rule is positional -- only the
+--- first waypoint is a departure -- and an `airdromeId` anywhere else is just
+--- a point on that airfield. mission/validate_templates.lua mirrors this pair.
+---
+--- TODO(seam): runway and hot starts ("TakeOff" / "From Runway",
+--- "TakeOffParkingHot") would hang off the same field once there is a reason
+--- to choose between them.
+local RAMP_START = {"TakeOffParking", "From Parking Area"}
 
 -- ------------------------------------------------------------------
 -- Templates
@@ -511,6 +518,20 @@ local function pos_xy(p)
     return p[1], p[3], p[2]
 end
 
+--- A waypoint's `airdrome_id`, or nil when it has none.
+---
+--- Absent and JSON null both mean none. Anything else that is not a whole
+--- number is a malformed payload, not an air start: guessing would put a
+--- flight the engine believes is on the ground into the sky, or the reverse.
+local function airdrome_of(wp)
+    local id = wp.airdrome_id
+    if id == nil or json.isnull(id) then return nil end
+    if type(id) ~= "number" or id ~= math.floor(id) then
+        error("malformed airdrome_id: " .. tostring(id), 0)
+    end
+    return id
+end
+
 local function build_route(spawn)
     local points = {}
     local route = spawn.route
@@ -532,7 +553,9 @@ local function build_route(spawn)
     for i = 1, #route do
         local wp = route[i]
         local x, y, alt = pos_xy(wp.pos)
+        local airdrome = airdrome_of(wp)
         local kind = WAYPOINT_ACTIONS[wp.action] or WAYPOINT_ACTIONS.turning_point
+        if i == 1 and airdrome then kind = RAMP_START end
         if wp.action == "attack" and not attack_at then attack_at = i end
         points[i] = {
             x = x,
@@ -545,6 +568,8 @@ local function build_route(spawn)
             speed_locked = true,
             ETA = 0,
             ETA_locked = false,
+            -- nil when there is none, which leaves the key out entirely.
+            airdromeId = airdrome,
             task = {id = "ComboTask", params = {tasks = {}}},
         }
     end
@@ -636,20 +661,27 @@ local function attach_tasking(route, tasking)
     end
 end
 
---- How many units this spawn actually brings.
+--- How many units this spawn brings: exactly `frame.units`, or a refusal.
 ---
---- The template decides, except that the engine may know better: a flight
---- that has already lost a wingman carries `tasking.units`, and honouring it
---- is what stops a bubble re-entry from quietly handing the campaign back an
---- aircraft it has already written off. Clamped to the template so a bad
---- number cannot conjure a twelve-ship out of a two-ship template.
-local function unit_count_for(tmpl, tasking)
-    local count = tmpl.count or 1
-    if type(tasking) == "table" and type(tasking.units) == "number" then
-        local wanted = math.floor(tasking.units)
-        if wanted >= 1 and wanted < count then return wanted end
+--- The engine owns the airframe ledger, so the count is its call and never
+--- the template's. A flight that lost a wingman is re-issued as a single-ship,
+--- and building it from the template would hand the campaign back an aircraft
+--- it has already written off. A count the template cannot hold is refused
+--- rather than clamped: a clamp builds fewer units than the engine issued,
+--- and the next census books the difference as a loss nobody caused.
+--- tools/fake_dcs.py refuses the same things with the same words.
+local function unit_count_for(tmpl, frame)
+    local units = frame.units
+    if type(units) ~= "number" or units ~= math.floor(units) or units < 1 then
+        return nil, "bad units: " .. tostring(units)
+                    .. " (want a positive integer)"
     end
-    return count
+    local capacity = tmpl.count or 1
+    if units > capacity then
+        return nil, "units " .. units .. " exceeds template "
+                    .. tostring(frame.template) .. " capacity of " .. capacity
+    end
+    return units
 end
 
 
@@ -744,9 +776,15 @@ local function handle_spawn(frame)
         return
     end
 
+    local unit_count, why = unit_count_for(tmpl, frame)
+    if not unit_count then
+        log_err("spawn " .. sid .. ": " .. why)
+        send_ack(frame.ref, false, why)
+        return
+    end
+
     local name = group_name(sid)
     local names = {name}
-    local unit_count = 1
 
     if tmpl.static then
         -- Several objects under one spawn_id: DCS has no static group, so the
@@ -759,7 +797,7 @@ local function handle_spawn(frame)
         -- and the engine would need them destroyed all over again. Do that
         -- often enough and the target can never be finished at all.
         local total = tmpl.count or 1
-        local count = unit_count_for(tmpl, frame.tasking)
+        local count = unit_count
         names = {}
         local failure = nil
         for i = 1, count do
@@ -800,13 +838,11 @@ local function handle_spawn(frame)
             send_ack(frame.ref, false, failure)
             return
         end
-        unit_count = count
     else
         if maps.category[frame.category] == nil then
             send_ack(frame.ref, false, "unknown category: " .. tostring(frame.category))
             return
         end
-        unit_count = unit_count_for(tmpl, frame.tasking)
         local built, data = pcall(build_group_data, frame, tmpl, name, unit_count)
         if not built then
             send_ack(frame.ref, false, "bad spawn payload: " .. tostring(data))

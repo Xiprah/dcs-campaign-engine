@@ -83,8 +83,9 @@ log = logging.getLogger("fake_dcs")
 INCIRLIK_XZ = (142_000.0, -38_000.0)
 TARGET_XZ = (-3_000.0, 41_000.0)
 
-#: Group sizes the protocol cannot tell us: `spawn` names a template, and in
-#: DCS the template decides how many units come with it.
+#: The most units a template can hold -- this harness's stand-in for `count` in
+#: the client's TEMPLATES table. `spawn` says how many to build; a count beyond
+#: this is refused, exactly as mission/campaign_client.lua refuses it.
 # TODO(templates): real DCS unit-template fidelity - loadouts, liveries, skill,
 # per-unit types - belongs behind this map, not in the campaign.
 DEFAULT_AIR_UNITS = 2
@@ -160,6 +161,15 @@ class SimGroup:
     @property
     def name(self) -> str:
         return group_name(self.spawn_id)
+
+
+def _whole(value: object) -> bool:
+    """A JSON number with no fractional part, as Lua's `x == math.floor(x)` sees it."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and value.is_integer()
 
 
 def _hdist(a: list[float] | tuple[float, ...], b: list[float] | tuple[float, ...]) -> float:
@@ -301,27 +311,45 @@ class FakeDCS:
             frame.bubble_radius,
         )
 
-    def _units_for(self, template: str, category: str, tasking: dict) -> int:
-        """How many units a spawn actually brings.
-
-        `spawn` has no unit-count field: in DCS the template decides. The
-        engine does put one in `tasking` when it knows better - a package that
-        already lost a jet comes back as a single-ship - and that is more
-        truthful than any template default, so it wins.
-        """
-        declared = tasking.get("units")
-        if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
-            return declared
+    def _capacity_for(self, template: str, category: str) -> int:
         if template in self.cfg.template_units:
             return self.cfg.template_units[template]
         return self.cfg.air_units if category in _AIR_CATEGORIES else self.cfg.ground_units
+
+    def _refusal(self, frame: Spawn) -> str | None:
+        """Why the Lua client would refuse this spawn, in its words; else None.
+
+        This harness may be no more forgiving than the client it stands in
+        for. A spawn accepted here and refused in DCS is a bug the whole
+        offline loop is blind to -- which is exactly how a strike flight once
+        spawned with no attack task and every test stayed green.
+        """
+        # Same order as the client: the count is judged before the route is built.
+        units = frame.units
+        if not _whole(units) or units < 1:
+            return f"bad units: {units!r} (want a positive integer)"
+        capacity = self._capacity_for(frame.template, frame.category)
+        if units > capacity:
+            return (
+                f"units {int(units)} exceeds template {frame.template} "
+                f"capacity of {capacity}"
+            )
+        for wp in frame.route:
+            if wp.airdrome_id is not None and not _whole(wp.airdrome_id):
+                return f"bad spawn payload: malformed airdrome_id: {wp.airdrome_id!r}"
+        return None
 
     async def _on_spawn(self, frame: Spawn) -> None:
         if frame.spawn_id in self.groups:
             await self._ack(frame.ref, False, f"duplicate spawn_id: {frame.spawn_id}")
             return
+        refusal = self._refusal(frame)
+        if refusal is not None:
+            log.error("spawn %s: %s", frame.spawn_id, refusal)
+            await self._ack(frame.ref, False, refusal)
+            return
         tasking = dict(frame.tasking)
-        units = self._units_for(frame.template, frame.category, tasking)
+        units = int(frame.units)
         group = SimGroup(
             spawn_id=frame.spawn_id,
             coalition=frame.coalition,
@@ -805,11 +833,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
     p.add_argument("--no-chase", dest="chase", action="store_false",
                    help="fly the scripted path instead of following the package")
     p.add_argument("--air-units", type=int, default=DEFAULT_AIR_UNITS,
-                   help="units per air group when the template is unknown")
+                   help="most units an air template holds, unless --template-units names it")
     p.add_argument("--ground-units", type=int, default=DEFAULT_GROUND_UNITS,
-                   help="units per ground group when the template is unknown")
+                   help="most units a ground template holds, unless --template-units names it")
     p.add_argument("--template-units", type=_template_units, action="append", default=[],
-                   metavar="TEMPLATE=N", help="exact unit count for one template; repeatable")
+                   metavar="TEMPLATE=N",
+                   help="most units one template holds; a spawn asking for more is "
+                        "refused, as the Lua client refuses it; repeatable")
     p.add_argument("--weapon", default="GBU-38")
     p.add_argument("--weapon-range", type=float, default=9000.0)
     p.add_argument("--target-outcome", choices=["destroyed", "damaged", "intact"],

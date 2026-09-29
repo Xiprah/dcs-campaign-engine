@@ -57,6 +57,7 @@ SPAWN_TEMPLATE = Spawn(
     coalition="blue",
     category="plane",
     template="F-16C_strike_jdam",
+    units=2,
     position=(40000.0, 4500.0, -90000.0),
     heading=1.57,
     route=[Waypoint(pos=(41000.0, 6000.0, -92000.0), alt=6000.0, speed=240.0)],

@@ -37,7 +37,9 @@ out one crash at a time, a week apart, in the middle of a sortie.
   build, and whether a group filed under it spawns;
 - whether the waypoint `type`/`action` pairs, the `alt_type` strings, the
   group-level task strings, and the `Bombing` and `AttackGroup` task tables
-  are accepted;
+  are accepted — including the ramp-start pair (`TakeOffParking` /
+  `From Parking Area` with an `airdromeId`) the client puts on waypoint 1
+  when the engine names an airdrome;
 - **whether a named weapon CLSID actually loads**, by reading `Unit.getAmmo`
   off the spawned jet rather than trusting that the spawn succeeded. An
   unknown CLSID is not an error in DCS — it yields an empty pylon, which is
@@ -123,8 +125,17 @@ CAMPAIGN_VALIDATE_CONFIG = {
     auto_start = true,
 
     clsids = { ... },     -- see below
+
+    -- The airfield the ramp-start case parks on. Airdrome ids are per map.
+    airdrome_id = nil,    -- nil: the lowest-id blue or neutral airdrome
 }
 ```
+
+The `waypoint.ramp_start` case ignores `origin`: a ramp start is only
+meaningful on a real airdrome, so it parks on `airdrome_id`, or on the
+lowest-id airdrome blue or neutral holds (the probe flies for USA, and a red
+field would read as the pair being rejected). With none available it reports
+`SKIP` and names the setting.
 
 With no `origin`, the validator picks one and says which in the `BEGIN` line:
 the first airbase it can find (offset 10 km, so nothing spawns on the ramp),
@@ -239,8 +250,9 @@ worse than no run.
   pylon entries), and any difference is a `DRIFT` failure;
 - `tests/test_validation.py` asserts the same equality offline, so drift
   turns the test suite red rather than quietly invalidating a DCS run;
-- the country map, the group task strings, the waypoint action table and the
-  `alt_type` constants are **locals** in `campaign_client.lua`. They are not
+- the country map, the group task strings, the waypoint action table, the
+  ramp-start pair and the `alt_type` constants are **locals** in
+  `campaign_client.lua`. They are not
   reachable from another file at all, so `SPEC` mirrors them, and nothing can
   currently detect drift in them.
 

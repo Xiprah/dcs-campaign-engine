@@ -65,8 +65,10 @@ from campaign.protocol import (
     Hello,
     Observer,
     ObserverReport,
+    ProtocolError,
     Spawn,
     StateReport,
+    decode_uplink,
     encode,
     group_name,
 )
@@ -159,7 +161,7 @@ class FakeDCS:
             f"engine spawned {frame.spawn_id} twice; the client would have to "
             f"reject it and the campaign would lose the entity"
         )
-        units = int(frame.tasking.get("units", 1))
+        units = frame.units
         self.groups[frame.spawn_id] = _LiveGroup(
             spawn_id=frame.spawn_id,
             category=frame.category,
@@ -1218,7 +1220,8 @@ class TestCampaignLoop(unittest.TestCase):
             for f in frames
             if isinstance(f, Spawn) and f.spawn_id == package.spawn_id
         )
-        self.assertEqual(flight.tasking["units"], 1)
+        self.assertEqual(flight.units, 1)
+        self.assertNotIn("units", flight.tasking)
 
     def _flight_in_the_bubble(self, dcs: FakeDCS | None = None):
         """A campaign whose two-ship is airborne, healthy and instantiated."""
@@ -1366,13 +1369,63 @@ class TestCampaignLoop(unittest.TestCase):
         self._assert_nothing_was_lost(reloaded, package)
 
     def test_protocol_mismatch_is_fatal(self):
-        from campaign.protocol import ProtocolError
-
         campaign = Campaign()
         with self.assertRaises(ProtocolError):
             campaign.on_hello(
                 Hello(seq=1, t=0.0, protocol=PROTOCOL_VERSION + 1, theater="Syria")
             )
+
+    def test_a_v1_client_is_refused(self):
+        """A v1 client does not know `Spawn.units`.
+
+        It would build every flight from its template, so a two-ship that lost
+        a wingman comes back whole and the campaign quietly regains an airframe
+        it wrote off. Refused, never served.
+        """
+        campaign = Campaign()
+        with self.assertRaises(ProtocolError):
+            campaign.on_hello(Hello(seq=1, t=0.0, protocol=1, theater="Syria"))
+        self.assertFalse(campaign.connected)
+
+    @staticmethod
+    def _event_off_the_wire(**fields: object):
+        frame = {"type": "event", "seq": 1, "t": 1210.0, "kind": "kill"}
+        frame.update(fields)
+        return decode_uplink(json.dumps(frame))
+
+    def test_a_numeric_event_initiator_costs_one_attribution_and_nothing_else(self):
+        """DCS scenery names itself with a number; that must not reach a loss.
+
+        A numeric initiator used to be queued as-is, and the snapshot that then
+        revealed the loss died rendering it -- the one frame allowed to record
+        a loss failing because of the one frame that is only a hint.
+        """
+        campaign, package = self._flight_in_the_bubble()
+        event = self._event_off_the_wire(
+            initiator=140521, target=group_name(package.spawn_id), weapon="9M38"
+        )
+        self.assertEqual(campaign.on_event(event), [])
+
+        census = [
+            GroupSnapshot(
+                spawn_id=sid,
+                alive=True,
+                units=1 if sid == package.spawn_id else campaign.tracker.units_alive(sid),
+                units_initial=campaign.tracker.groups[sid].units_initial,
+            )
+            for sid in sorted(campaign.live)
+        ]
+        campaign.on_state(StateReport(seq=2, t=1230.0, groups=census))
+
+        losses = campaign.tracker.losses_for(package.spawn_id)
+        self.assertEqual(len(losses), 1, "the snapshot's loss was not recorded")
+        self.assertEqual(losses[0].attribution, "kill/9M38")
+
+    def test_a_numeric_event_target_is_ignored_rather_than_raising(self):
+        campaign, package = self._flight_in_the_bubble()
+        event = self._event_off_the_wire(initiator="sam:kub", target=140521)
+        self.assertEqual(campaign.on_event(event), [])
+        self.assertEqual(campaign.tracker.hints.get(package.spawn_id, []), [])
 
     def test_the_war_ends_when_the_last_target_dies(self):
         campaign = Campaign()

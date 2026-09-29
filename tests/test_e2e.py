@@ -33,7 +33,15 @@ from campaign.audit import attributions, strip_event_derived
 from campaign.campaign import Campaign
 from campaign.planner import COMPLETE
 from campaign.server import CampaignServer
-from campaign.protocol import PROTOCOL_VERSION, Hello, Message, encode
+from campaign.protocol import (
+    PROTOCOL_VERSION,
+    Ack,
+    Hello,
+    Message,
+    Spawn,
+    Waypoint,
+    encode,
+)
 from tools.fake_dcs import Config, FakeDCS
 
 #: Long enough for the slice's own strike to take off, hit and land again.
@@ -370,6 +378,127 @@ class TestTheReaderNeverActsOnItsOwn(unittest.TestCase):
         )
         self.assertEqual(len(handled), 1)
         self.assertEqual(left, 0)
+
+
+class TestTheHarnessRefusesWhatTheClientRefuses(unittest.TestCase):
+    """tools/fake_dcs.py may be no more forgiving than the Lua client.
+
+    A spawn the harness accepts and mission/campaign_client.lua refuses is a
+    failure the whole offline loop is blind to. That gap is exactly how a
+    strike flight once spawned with no attack task while every test here
+    stayed green. The error text is the client's, word for word, so the two
+    refusals are checked against the same strings.
+    """
+
+    def _spawn(self, config: dict | None = None, **overrides: object):
+        fields: dict = dict(
+            seq=5,
+            t=0.0,
+            ref=5,
+            spawn_id="beef",
+            coalition="blue",
+            category="plane",
+            template="F-16C_strike_jdam",
+            units=2,
+            position=(1000.0, 5000.0, 2000.0),
+        )
+        fields.update(overrides)
+        frame = Spawn(**fields)
+
+        async def go():
+            sim = FakeDCS(Config(**(config or {})))
+            sent: list = []
+
+            async def record(out):
+                sent.append(out)
+
+            sim._send = record
+            await sim._on_spawn(frame)
+            acks = [f for f in sent if isinstance(f, Ack) and f.ref == frame.ref]
+            return sim, acks
+
+        # The harness logs every spawn and every refusal; assertLogs keeps it
+        # off the test output and proves it said something either way.
+        with self.assertLogs("fake_dcs", level="INFO"):
+            return asyncio.run(go())
+
+    def test_more_units_than_the_template_holds_is_refused_not_clamped(self):
+        sim, acks = self._spawn(units=3)
+        self.assertEqual(len(acks), 1)
+        self.assertFalse(acks[0].ok, "the harness built a three-ship from a two-ship")
+        self.assertIn(
+            "units 3 exceeds template F-16C_strike_jdam capacity of 2", acks[0].error
+        )
+        self.assertEqual(sim.groups, {})
+
+    def test_a_count_that_is_not_a_positive_integer_is_refused(self):
+        for units in (0, -1, 1.5, True):
+            with self.subTest(units=units):
+                sim, acks = self._spawn(units=units)
+                self.assertFalse(acks[0].ok)
+                self.assertIn("bad units", acks[0].error)
+                self.assertEqual(sim.groups, {})
+
+    def test_exactly_the_count_asked_for_is_built(self):
+        sim, acks = self._spawn(units=1)
+        self.assertTrue(acks[0].ok)
+        self.assertEqual(sim.groups["beef"].units, 1)
+        self.assertEqual(sim.groups["beef"].units_initial, 1)
+
+    def test_template_units_sets_the_capacity(self):
+        sim, acks = self._spawn(
+            config={"template_units": {"F-16C_strike_jdam": 4}}, units=4
+        )
+        self.assertTrue(acks[0].ok)
+        self.assertEqual(sim.groups["beef"].units, 4)
+
+    def test_a_malformed_airdrome_id_is_refused(self):
+        sim, acks = self._spawn(
+            route=[Waypoint(pos=(0.0, 0.0, 0.0), airdrome_id="Incirlik")]
+        )
+        self.assertFalse(acks[0].ok)
+        self.assertIn("malformed airdrome_id", acks[0].error)
+
+
+class TestAVersion1ClientIsRefused(unittest.TestCase):
+    """The real engine behind the real transport closes on a v1 hello.
+
+    Nothing may be written first: not a sync, and not a spawn the v1 client
+    would build from its template regardless of the unit count it cannot read.
+    """
+
+    def test_the_connection_closes_and_nothing_is_written(self):
+        async def go():
+            campaign = Campaign()
+            server = CampaignServer(
+                campaign, host="127.0.0.1", port=0, tick_period=TICK_PERIOD
+            )
+            await server.start()
+            try:
+                reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+                writer.write(encode(Hello(seq=1, t=0.0, protocol=1, theater="Syria")))
+                await writer.drain()
+                received, closed = b"", False
+                try:
+                    while chunk := await asyncio.wait_for(reader.read(65536), 2.0):
+                        received += chunk
+                    closed = True
+                except TimeoutError:
+                    pass
+                writer.close()
+                return campaign, received, closed
+            finally:
+                await server.close()
+
+        with self.assertLogs("campaign.server", level="ERROR") as logs:
+            campaign, received, closed = asyncio.run(go())
+            self.assertEqual(received, b"", "the engine answered a v1 client")
+            self.assertTrue(closed, "the engine left a v1 client connected")
+        self.assertFalse(campaign.connected)
+        self.assertTrue(
+            any("client protocol 1 != engine 2" in line for line in logs.output),
+            logs.output,
+        )
 
 
 class TestDeterminism(unittest.TestCase):

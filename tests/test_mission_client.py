@@ -50,6 +50,7 @@ the main suite still passes on a machine that has never heard of it.
 
 from __future__ import annotations
 
+import json
 import socket
 import sys
 import unittest
@@ -60,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from campaign.campaign import Campaign
 from campaign.planner import COMPLETE, CRUISE_ALTITUDE, DESTROYED
 from campaign.protocol import (
+    PROTOCOL_VERSION,
     Ack,
     Despawn,
     Event,
@@ -372,7 +374,7 @@ class TestFullSortie(unittest.TestCase):
     def test_the_client_connected_and_synced_once(self):
         hellos = self.mission.engine.uplink_of(Hello)
         self.assertEqual(len(hellos), 1, "the client did not say hello exactly once")
-        self.assertEqual(hellos[0].protocol, 1)
+        self.assertEqual(hellos[0].protocol, PROTOCOL_VERSION)
         self.assertEqual(hellos[0].seq, 1, "hello must be seq 1 on a connection")
         self.assertEqual(hellos[0].theater, "Syria")
         self.assertGreater(
@@ -871,6 +873,7 @@ class TestJsonEmptyTables(unittest.TestCase):
             coalition="red",
             category="structure",
             template="fuel_depot_medium",
+            units=4,
             position=(1.0, 2.0, 3.0),
             route=[],
             tasking={},
@@ -894,10 +897,11 @@ class TestJsonEmptyTables(unittest.TestCase):
             coalition="blue",
             category="plane",
             template="F-16C_strike_jdam",
+            units=2,
             position=(1.0, 2.0, 3.0),
             heading=1.25,
             route=[Waypoint(pos=(4.0, 5.0, 6.0), alt=6000.0, speed=220.0, action="attack")],
-            tasking={"kind": "strike", "target": "cmp_0001", "units": 2},
+            tasking={"kind": "strike", "target": "cmp_0001"},
         )
         self.assertEqual(decode_downlink(self.round_trip(encode(frame))), frame)
 
@@ -976,6 +980,7 @@ class TestClientRefusesBadSpawns(unittest.TestCase):
             coalition="blue",
             category="plane",
             template="F-16C_strike_jdam",
+            units=2,
             position=(1000.0, 5000.0, 2000.0),
             heading=0.0,
             route=[],
@@ -995,6 +1000,50 @@ class TestClientRefusesBadSpawns(unittest.TestCase):
         ack = self.ack_for(frame.ref)
         self.assertFalse(ack.ok)
         self.assertIn("unknown template", ack.error or "")
+        self.assertEqual(self.mission.mock.group_names(), [])
+
+    def test_more_units_than_the_template_holds_is_refused_not_clamped(self):
+        """A clamp would build two, and the census would book one as a loss.
+
+        The engine issued three; building fewer is not a smaller success but
+        a loss nobody caused. The words match tools/fake_dcs.py's refusal.
+        """
+        frame = self.spawn(units=3)
+        self.inject(frame)
+        ack = self.ack_for(frame.ref)
+        self.assertFalse(ack.ok, "the client built a three-ship from a two-ship")
+        self.assertIn(
+            "units 3 exceeds template F-16C_strike_jdam capacity of 2", ack.error or ""
+        )
+        self.assertEqual(self.mission.mock.group_names(), [])
+        self.assertEqual(self.mission.mock.status()["live_spawns"], 0)
+
+    def test_a_missing_or_bad_unit_count_is_refused(self):
+        """No count means no spawn -- never the template's count by default."""
+        for units in ("absent", 0, -1, 1.5, "2", None):
+            with self.subTest(units=units):
+                self.ref += 1
+                raw = json.loads(encode(self.spawn(spawn_id=f"u{self.ref}")))
+                if units == "absent":
+                    del raw["units"]
+                else:
+                    raw["units"] = units
+                self.mission.engine.outbox += json.dumps(raw).encode("utf-8") + b"\n"
+                self.mission.step(3)
+                ack = self.ack_for(raw["ref"])
+                self.assertFalse(ack.ok)
+                self.assertIn("bad units", ack.error or "")
+        self.assertEqual(self.mission.mock.group_names(), [])
+
+    def test_a_malformed_airdrome_id_is_refused_rather_than_ignored(self):
+        """Ignoring it would air-start a flight the engine thinks is parked."""
+        frame = self.spawn(
+            route=[Waypoint(pos=(1000.0, 5000.0, 2000.0), airdrome_id="Incirlik")]
+        )
+        self.inject(frame)
+        ack = self.ack_for(frame.ref)
+        self.assertFalse(ack.ok)
+        self.assertIn("malformed airdrome_id", ack.error or "")
         self.assertEqual(self.mission.mock.group_names(), [])
 
     def test_an_unknown_coalition_is_refused(self):
@@ -1136,6 +1185,24 @@ class TestNonBlockingDiscipline(unittest.TestCase):
             any("did not answer hello" in msg for msg in mission.mock.logs("warning")),
             mission.mock.logs(),
         )
+
+    def test_a_version_1_engine_is_refused(self):
+        """A v1 engine smuggles unit counts through tasking, which this client
+        no longer reads: serving it would rebuild every flight from its
+        template."""
+        mission = sortie_with_observer_over_the_target()
+        self.addCleanup(mission.close)
+        # Muted before hello, so the only verdict on the version is the client's.
+        mission.engine.mute = True
+        mission.run_until(lambda m: bool(m.engine.uplink_of(Hello)), limit=60.0)
+        mission.engine.send([Sync(seq=1, t=0.0, campaign_time=0.0, protocol=1)])
+        mission.step(3)
+        self.assertFalse(mission.mock.status()["synced"], "the client served a v1 engine")
+        self.assertTrue(
+            any("engine speaks protocol 1" in msg for msg in mission.mock.logs("error")),
+            mission.mock.logs(),
+        )
+        self.assertEqual(mission.engine.uplink_of(Hello)[0].protocol, PROTOCOL_VERSION)
 
     def test_a_protocol_mismatch_tears_the_connection_down(self):
         mission = sortie_with_observer_over_the_target()
@@ -1293,6 +1360,7 @@ class TestTheEventHotPathIsCheapBeforeItIsThorough(unittest.TestCase):
                     coalition="blue",
                     category="plane",
                     template="F-16C_strike_jdam",
+                    units=2,
                     position=(1000.0, 5000.0, 2000.0),
                     heading=0.0,
                     route=[],
@@ -1336,6 +1404,7 @@ class TestSceneryDoesNotPutANumberOnTheWire(unittest.TestCase):
                     coalition="blue",
                     category="plane",
                     template="F-16C_strike_jdam",
+                    units=2,
                     position=(1000.0, 5000.0, 2000.0),
                     heading=0.0,
                     route=[],
@@ -1882,6 +1951,7 @@ class TestSpawnShapes(unittest.TestCase):
             coalition="blue",
             category="plane",
             template="F-16C_cap",
+            units=2,
             position=(1000.0, 5000.0, 2000.0),
             heading=0.5,
             route=[],
@@ -1904,6 +1974,72 @@ class TestSpawnShapes(unittest.TestCase):
         self.assertEqual(data["units"][0]["alt"], 5000.0)
         self.assertEqual(points[0]["task"]["params"]["tasks"], {})
 
+    def test_a_one_unit_spawn_from_a_two_unit_template_builds_one_unit(self):
+        """The engine's count, not the template's.
+
+        This is what stops a two-ship that lost its wingman from coming back
+        whole: the engine re-issues it with `units` 1, and the template's
+        `count` of 2 is only a ceiling.
+        """
+        frame = self.spawn(units=1)
+        self.assertTrue(self.inject(frame).ok)
+        name = group_name(frame.spawn_id)
+        units = self.mission.mock.group_data(name)["units"]
+        self.assertEqual([u["name"] for u in units], [name + "_1"])
+        self.assertEqual(
+            [u for u in self.mission.mock.unit_names() if u.startswith(name)],
+            [name + "_1"],
+        )
+
+    def test_a_static_target_builds_exactly_the_objects_asked_for(self):
+        frame = self.spawn(
+            spawn_id="dep3",
+            coalition="red",
+            category="structure",
+            template="fuel_depot_medium",
+            units=2,
+        )
+        self.assertTrue(self.inject(frame).ok)
+        self.assertEqual(
+            [n for n in self.mission.mock.static_names() if n.startswith("cmp_dep3")],
+            ["cmp_dep3_1", "cmp_dep3_2"],
+        )
+
+    def test_an_airdrome_id_reaches_dcs_and_makes_waypoint_one_a_ramp_start(self):
+        frame = self.spawn(
+            route=[
+                Waypoint(pos=(142000.0, 60.0, -38000.0), alt=60.0, speed=0.0,
+                         airdrome_id=16),
+                Waypoint(pos=(100000.0, 6000.0, 0.0), alt=6000.0, speed=220.0),
+                Waypoint(pos=(142000.0, 60.0, -38000.0), alt=60.0, speed=150.0,
+                         action="landing", airdrome_id=16),
+            ]
+        )
+        self.assertTrue(self.inject(frame).ok)
+        points = self.mission.mock.group_data(group_name(frame.spawn_id))["route"]["points"]
+        self.assertEqual(len(points), 3)
+
+        self.assertEqual(points[0]["airdromeId"], 16)
+        self.assertEqual(
+            (points[0]["type"], points[0]["action"]),
+            ("TakeOffParking", "From Parking Area"),
+        )
+        # A JSON null on the wire leaves the key out, not a sentinel in it.
+        self.assertNotIn("airdromeId", points[1])
+        self.assertEqual(points[1]["type"], "Turning Point")
+        # Only waypoint 1 is a departure; elsewhere the id just names the field.
+        self.assertEqual(points[2]["airdromeId"], 16)
+        self.assertEqual((points[2]["type"], points[2]["action"]), ("Land", "Landing"))
+
+    def test_without_an_airdrome_id_the_flight_is_still_an_air_start(self):
+        frame = self.spawn(
+            route=[Waypoint(pos=(1000.0, 5000.0, 2000.0), alt=5000.0, speed=220.0)]
+        )
+        self.assertTrue(self.inject(frame).ok)
+        point = self.mission.mock.group_data(group_name(frame.spawn_id))["route"]["points"][0]
+        self.assertNotIn("airdromeId", point)
+        self.assertEqual((point["type"], point["action"]), ("Turning Point", "Turning Point"))
+
     def test_the_units_of_a_flight_are_separated_so_they_do_not_collide(self):
         frame = self.spawn()
         self.assertTrue(self.inject(frame).ok)
@@ -1925,6 +2061,7 @@ class TestSpawnShapes(unittest.TestCase):
             coalition="red",
             category="structure",
             template="fuel_depot_medium",
+            units=4,
         )
         self.assertTrue(self.inject(frame).ok)
         names = [n for n in self.mission.mock.static_names() if n.startswith("cmp_dep1")]
@@ -1944,6 +2081,7 @@ class TestSpawnShapes(unittest.TestCase):
             coalition="red",
             category="structure",
             template="fuel_depot_medium",
+            units=4,
         )
         ack = self.inject(frame)
         self.assertFalse(ack.ok, "the client acked a half-built target")

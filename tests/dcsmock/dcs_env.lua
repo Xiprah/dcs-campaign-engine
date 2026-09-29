@@ -63,6 +63,21 @@ local M = {
     --- case the client's unwind exists for.
     fail_static_named = nil,
 
+    --- What coalition.getAirbases lists. Kinds and sides are mixed and ids are
+    --- out of order on purpose: a caller after an airdrome has to filter for
+    --- one and choose deterministically, not take the first entry it sees.
+    --- category: 0 airdrome, 1 helipad, 2 ship. side: 0 neutral, 1 red, 2 blue.
+    airbases = {
+        {id = 3, name = "Incirlik FARP", side = 2, category = 1,
+         x = 141000, alt = 60, z = -37000},
+        {id = 22, name = "Adana Sakirpasa", side = 0, category = 0,
+         x = 150000, alt = 20, z = -80000},
+        {id = 16, name = "Incirlik", side = 2, category = 0,
+         x = 142000, alt = 60, z = -38000},
+        {id = 5, name = "Bassel Al-Assad", side = 1, category = 0,
+         x = -8000, alt = 30, z = 45000},
+    },
+
     mission = {
         theatre = "Syria",
         date = {Year = 2024, Month = 9, Day = 22},
@@ -176,6 +191,16 @@ local function make_static(name, data, side)
     function s:destroy() M.kill_static(self.__name) end
 
     return s
+end
+
+local function make_airbase(entry)
+    local b = {}
+    function b:getID() return entry.id end
+    function b:getName() return entry.name end
+    function b:getCoalition() return entry.side end
+    function b:getDesc() return {category = entry.category} end
+    function b:getPoint() return vec3(entry.x, entry.alt, entry.z) end
+    return b
 end
 
 -- ------------------------------------------------------------------
@@ -358,6 +383,10 @@ _G.Object = {
     Category = {UNIT = 1, WEAPON = 2, STATIC = 3, BASE = 4, SCENERY = 5},
 }
 
+_G.Airbase = {
+    Category = {AIRDROME = 0, HELIPAD = 1, SHIP = 2},
+}
+
 local COUNTRY_SIDE = {
     [0] = 1,    -- RUSSIA -> red
     [2] = 2,    -- USA    -> blue
@@ -417,6 +446,16 @@ _G.coalition = {
         local s = make_static(data.name, data, side)
         M.statics[data.name] = s
         return s
+    end,
+
+    getAirbases = function(side)
+        local out = {}
+        for i = 1, #M.airbases do
+            if M.airbases[i].side == side then
+                out[#out + 1] = make_airbase(M.airbases[i])
+            end
+        end
+        return out
     end,
 
     getPlayers = function(side)

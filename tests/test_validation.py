@@ -69,6 +69,7 @@ EXPECTED_IDS = {
     "waypoint.turning_point",
     "waypoint.fly_over_point",
     "waypoint.landing",
+    "waypoint.ramp_start",
     "alt_type.BARO",
     "grouptask.Ground_Attack",
     "grouptask.CAP",
@@ -289,6 +290,28 @@ class TestTheValidatorRuns(unittest.TestCase):
         self.assertEqual(strike["detail"]["units"], 2)
         self.assertEqual(strike["detail"]["wanted"], 2)
 
+    def test_the_ramp_start_case_parks_on_a_real_airdrome(self):
+        """The pair the client puts on waypoint 1 when it names an airdrome.
+
+        Only meaningful on an airdrome the probe's side may use, so the case
+        must pick one -- the lowest-id blue or neutral airdrome, skipping the
+        FARP and the red field the mock lists alongside it.
+        """
+        ramp = self.by_id["waypoint.ramp_start"]
+        self.assertEqual(ramp["status"], "OK")
+        self.assertTrue(ramp["required"])
+        self.assertEqual(ramp["detail"]["airdrome_id"], 16)
+        calls = [
+            c for c in self.runner.mock.spawn_calls()
+            if c["name"] == "cmpval_wp_ramp_start"
+        ]
+        self.assertEqual(len(calls), 1)
+        point = calls[0]["data"]["route"]["points"][0]
+        self.assertEqual(point["airdromeId"], 16)
+        self.assertEqual(
+            (point["type"], point["action"]), ("TakeOffParking", "From Parking Area")
+        )
+
     def test_the_static_template_reports_the_object_was_retrievable(self):
         depot = self.by_id["template.fuel_depot_medium"]
         self.assertEqual(depot["status"], "OK")
@@ -400,6 +423,34 @@ class TestAnAcceptedButUnusableTemplateIsReportedOrphan(unittest.TestCase):
         self.assertEqual(
             self.runner.leftovers(), {"groups": [], "statics": [], "units": []}
         )
+
+
+@requires_lua
+class TestTheRampStartCaseNeedsAnAirdrome(unittest.TestCase):
+    """Airdrome ids are per map; with nothing usable the case says so."""
+
+    def test_no_usable_airdrome_is_a_skip_that_names_the_fix(self):
+        run = ValidatorRun(autoload=False)
+        self.addCleanup(run.close)
+        run.mock.env.airbases = run.mock.lua.table()
+        run.load()
+        ramp = {r["id"]: r for r in run.run_now()["results"]}["waypoint.ramp_start"]
+        self.assertEqual(ramp["status"], "SKIP")
+        self.assertIn("CAMPAIGN_VALIDATE_CONFIG.airdrome_id", ramp["error"])
+
+    def test_a_configured_airdrome_id_is_the_one_used(self):
+        run = ValidatorRun(config={"airdrome_id": 22})
+        self.addCleanup(run.close)
+        ramp = {r["id"]: r for r in run.run_now()["results"]}["waypoint.ramp_start"]
+        self.assertEqual(ramp["status"], "OK")
+        self.assertEqual(ramp["detail"]["airdrome_id"], 22)
+
+    def test_a_configured_red_airdrome_is_refused_not_parked_on(self):
+        run = ValidatorRun(config={"airdrome_id": 5})
+        self.addCleanup(run.close)
+        ramp = {r["id"]: r for r in run.run_now()["results"]}["waypoint.ramp_start"]
+        self.assertEqual(ramp["status"], "SKIP")
+        self.assertIn("airdrome_id 5", ramp["error"])
 
 
 @requires_lua

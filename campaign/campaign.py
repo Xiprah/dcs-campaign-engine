@@ -737,8 +737,18 @@ class Campaign:
             coalition=squadron.coalition,
             category="plane",
             template=squadron.template,
+            # What attrition has recorded, not the package's fragged size: a
+            # flight that re-enters the bubble after losing a wingman must not
+            # come back whole.
+            units=self.tracker.units_alive(package.spawn_id),
             position=position,
             heading=heading,
+            # TODO(seam): a flight spawned before it has left the ground would
+            # carry its base's DCS airdrome id on the first waypoint, making it
+            # a ramp start (docs/protocol.md, Waypoint.airdrome_id). Not set
+            # yet: theater.Airbase has no DCS id, and real ids are map content
+            # nobody has validated -- a wrong one parks the flight at another
+            # airfield. Every flight is an air start until then.
             route=[
                 Waypoint(pos=pos, alt=alt, speed=speed, action=action)
                 for pos, alt, speed, action in package_route(
@@ -750,10 +760,6 @@ class Campaign:
                 "target": group_name(target.spawn_id) if target.spawn_id else target.id,
                 "tot": self.mission_time(package.t_tot),
                 "callsign": package.callsign,
-                # The spawn frame has no unit-count field, but a flight that
-                # re-enters the bubble after losing a wingman must not come
-                # back whole. Carried in tasking until the protocol grows one.
-                "units": self.tracker.units_alive(package.spawn_id),
             },
         )
 
@@ -768,13 +774,13 @@ class Campaign:
             coalition=target.coalition,
             category=target.category,
             template=target.template,
+            # A half-flattened target comes back half-flattened, or it would
+            # have to be destroyed twice.
+            units=self.tracker.units_alive(target.spawn_id),
             position=target.pos,
             heading=0.0,
             route=[],
-            tasking={
-                "kind": "static",
-                "units": self.tracker.units_alive(target.spawn_id),
-            },
+            tasking={"kind": "static"},
         )
 
     def _ensure_targets_tracked(self) -> None:

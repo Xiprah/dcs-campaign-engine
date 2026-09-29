@@ -102,6 +102,10 @@ local CONFIG = {
     --- mission-editor group export; the defaults are candidates, not
     --- knowledge. See mission/VALIDATION.md.
     clsids = nil,
+
+    --- DCS airdrome id the ramp-start case parks on. Leave nil to pick one --
+    --- see `pick_airdrome`. Ids are per map, so there is no safe default.
+    airdrome_id = nil,
 }
 
 if type(_G.CAMPAIGN_VALIDATE_CONFIG) == "table" then
@@ -175,6 +179,11 @@ local SPEC = {
         {wire = "fly_over_point", type = "Turning Point", action = "Fly Over Point"},
         {wire = "landing", type = "Land", action = "Landing"},
     },
+
+    --- campaign_client.lua: RAMP_START, which build_route puts on waypoint 1
+    --- when the engine sends an airdrome_id with it.
+    ramp_start = {wire = "ramp_start", type = "TakeOffParking",
+                  action = "From Parking Area"},
 
     --- campaign_client.lua: build_route / build_group_data
     alt_types = {"BARO", "RADIO"},
@@ -405,7 +414,7 @@ local function waypoint(x, y, alt, wp_type, wp_action, alt_type)
 end
 
 --- opts: name, unit_type, count, task, skill, payload, x, y, alt,
----       wp_type, wp_action, alt_type, tasks
+---       wp_type, wp_action, alt_type, tasks, airdrome_id
 local function build_group_data(opts)
     local units = {}
     for i = 1, (opts.count or 1) do
@@ -425,6 +434,7 @@ local function build_group_data(opts)
 
     local point = waypoint(opts.x, opts.y, opts.alt,
                            opts.wp_type, opts.wp_action, opts.alt_type)
+    point.airdromeId = opts.airdrome_id
     if opts.tasks then
         for i = 1, #opts.tasks do
             point.task.params.tasks[i] = opts.tasks[i]
@@ -600,6 +610,48 @@ end
 -- which is where retrievability is re-checked, ammunition is read and
 -- everything is destroyed.
 -- ------------------------------------------------------------------
+
+--- The airdrome the ramp-start case parks on, as {id, name, x, y, alt}, or
+--- nil and the reason there is none.
+---
+--- Blue or neutral only, because the probe flies for USA and DCS will not
+--- park a flight on an enemy field -- a red one would read as the ramp-start
+--- pair being rejected. Lowest id rather than first listed, so the choice
+--- does not hang on the order DCS happens to enumerate bases in.
+local function pick_airdrome()
+    if not (coalition and coalition.getAirbases and coalition.side) then
+        return nil, "coalition.getAirbases is unavailable"
+    end
+    local kind = Airbase and Airbase.Category and Airbase.Category.AIRDROME
+    if kind == nil then
+        return nil, "Airbase.Category.AIRDROME is unavailable"
+    end
+    local wanted = tonumber(CONFIG.airdrome_id)
+    local best = nil
+    local sides = {coalition.side.BLUE, coalition.side.NEUTRAL}
+    for s = 1, #sides do
+        local bases = try(coalition.getAirbases, sides[s]) or {}
+        for i = 1, #bases do
+            local base = bases[i]
+            local desc = try(base.getDesc, base)
+            local id = try(base.getID, base)
+            local point = try(base.getPoint, base)
+            if desc and desc.category == kind and type(id) == "number" and point
+               and (wanted == nil or id == wanted)
+               and (best == nil or id < best.id) then
+                best = {id = id, name = tostring(try(base.getName, base) or "?"),
+                        x = point.x, y = point.z, alt = point.y}
+            end
+        end
+    end
+    if best then return best end
+    if wanted then
+        return nil, "CAMPAIGN_VALIDATE_CONFIG.airdrome_id " .. tostring(wanted)
+                    .. " is not a blue or neutral airdrome in this mission"
+    end
+    return nil, "no blue or neutral airdrome in this mission; set "
+                .. "CAMPAIGN_VALIDATE_CONFIG.airdrome_id"
+end
 
 local function case_position(index)
     return RUN.origin.x + (index - 1) * CONFIG.spacing, RUN.origin.y
@@ -805,6 +857,45 @@ local function build_cases()
             end,
         })
     end
+
+    -- The ramp start the client builds when waypoint 1 names an airdrome.
+    -- Placed on the airfield rather than at the case origin: the pair only
+    -- means anything with a real airdromeId, and those are per map.
+    local ramp = SPEC.ramp_start
+    add({
+        id = "waypoint." .. ramp.wire,
+        kind = "group",
+        required = true,
+        label = "first route point type '" .. ramp.type .. "' action '"
+                .. ramp.action .. "' with an airdromeId",
+        attempt = function(case, index)
+            local rec = new_case_record(case)
+            local cid, cat = country_id("USA"), group_category("AIRPLANE")
+            if cid == nil or cat == nil then
+                rec.status = "SKIP"
+                rec.error = "country or Group.Category unavailable"
+                return rec
+            end
+            local base, why = pick_airdrome()
+            if not base then
+                rec.status = "SKIP"
+                rec.error = why
+                return rec
+            end
+            rec.detail.airdrome_id = base.id
+            rec.detail.airdrome = base.name
+            return try_group(rec, {data = build_group_data({
+                name = NAME_PREFIX .. "wp_" .. ramp.wire,
+                unit_type = SPEC.templates["F-16C_cap"].unit_type,
+                count = 1,
+                task = "Nothing",
+                wp_type = ramp.type,
+                wp_action = ramp.action,
+                airdrome_id = base.id,
+                x = base.x, y = base.y, alt = base.alt,
+            })}, cid, cat)
+        end,
+    })
 
     for i = 1, #SPEC.alt_types do
         local alt_type = SPEC.alt_types[i]

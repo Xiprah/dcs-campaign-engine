@@ -271,9 +271,9 @@ class CampaignServer:
                 except ProtocolError:
                     raise
                 except Exception as exc:
-                    # protocol.py only converts a TypeError from the *outer*
-                    # dataclass into a ProtocolError; a malformed nested member
-                    # still escapes raw. Undecodable is undecodable.
+                    # protocol.py means to raise nothing but ProtocolError, but
+                    # it is not the place a decoder bug should cost the engine
+                    # its connection handling. Undecodable is undecodable.
                     raise ProtocolError(f"undecodable frame: {exc!r}") from exc
                 await self._dispatch(conn, frame)
                 if not conn.alive:

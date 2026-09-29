@@ -221,6 +221,14 @@ the sandbox is gone for everything, and it stays gone.
 - **Maps** `spawn_id` to the DCS group name `cmp_<spawn_id>`. A duplicate
   `spawn_id` is rejected with a failed `ack`; a `despawn` for an unknown one is
   a successful no-op.
+- **Builds exactly `units` units** — the engine's count, never the
+  template's. The template's `count` is a ceiling: a spawn asking for more is
+  refused with a failed `ack`, not clamped, because a clamp builds fewer units
+  than the engine issued and the next census books the difference as a loss.
+  `tools/fake_dcs.py` refuses the same spawns with the same words.
+- **Ramp-starts** a flight whose first waypoint carries an `airdrome_id`
+  (`TakeOffParking` / `From Parking Area` at that airfield); every other
+  flight is an air start.
 - **Reports state** on the engine's `state_period` for every spawn it is
   tracking, including ones whose DCS group has vanished — those report
   `alive=false`. This is the only thing that records a loss, so nothing is ever
@@ -264,8 +272,11 @@ These are deliberate for the first vertical slice, not oversights:
   spawns unarmed: it will fly the route and drop nothing. Copy real values from
   mission-editor exported group data before expecting anything to hit a target.
   Munitions accounting lives in the engine either way.
-- **Air starts only.** A ground start needs an `airdromeId` on the waypoint and
-  the protocol's waypoint has no field for one.
+- **Air starts in practice.** The client ramp-starts a flight whose first
+  waypoint carries an `airdrome_id`, but the engine never sends one: airdrome
+  ids are per-map content nobody has validated yet. The `waypoint.ramp_start`
+  case in `validate_templates.lua` is how to settle whether DCS accepts the
+  pair before the engine starts using it.
 - **Templates are literals.** Real fidelity means deep-copying a
   late-activation group out of `env.mission`. The seam is marked in the file.
 - **One `state` frame.** Hundreds of live entities would exceed the protocol's
@@ -284,6 +295,8 @@ These are deliberate for the first vertical slice, not oversights:
 | `engine not reachable ... retrying` | the engine is not listening on 7777; the client keeps retrying, the mission is unaffected |
 | `load mission/json.lua before this file` | trigger actions are in the wrong order |
 | `unknown template: X` in an `ack` | the engine asked for a template that is not in `TEMPLATES` |
+| `units N exceeds template X capacity of C` in an `ack` | the engine issued a bigger group than `TEMPLATES[X].count` holds; raise `count` or fix the engine's flight size — the client will not clamp |
+| `bad units: ...` in an `ack` | the spawn carried no unit count, or not a positive integer; protocol 2 requires one, so this is an engine bug |
 | `engine speaks protocol N` | version mismatch; the engine closes the connection and the client backs off to `reconnect_max` |
 | `CONFIG.host must be an IPv4 address` | `host` was overridden with a name; resolving one would block the sim thread, so the client refuses to dial it — use the address |
 | nothing at all in `dcs.log` | the trigger never fired — a `MISSION START` rule must carry **no condition**; `TIME MORE (1)` is false at mission start and the rule is never evaluated again |
