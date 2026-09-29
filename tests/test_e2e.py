@@ -125,7 +125,7 @@ def blue_sortie_losses(campaign: Campaign) -> list:
     depot = campaign.theater.targets[DEPOT]
     return [
         x for x in campaign.tracker.losses
-        if x.spawn_id in (package.spawn_id, depot.spawn_id)
+        if x.spawn_id in (package.strike.spawn_id, depot.spawn_id)
     ]
 
 
@@ -153,7 +153,7 @@ class TestTheLoopCloses(unittest.TestCase):
         self.assertEqual(len(packages), 1, "expected exactly one blue strike package")
         package = packages[0]
         self.assertEqual(package.target_id, DEPOT)
-        self.assertEqual(package.flight_size, 2)
+        self.assertEqual(package.strike.flight_size, 2)
         self.assertLess(package.t_takeoff, package.t_tot)
         self.assertLess(package.t_tot, package.t_rtb)
 
@@ -164,7 +164,7 @@ class TestTheLoopCloses(unittest.TestCase):
             self.sim.received["spawn"], 2, "flight and target were not both spawned"
         )
         self.assertIn(
-            package.spawn_id,
+            package.strike.spawn_id,
             self.sim.struck,
             "the flight never reached its target inside the bubble",
         )
@@ -244,7 +244,7 @@ class TestTheLoopCloses(unittest.TestCase):
             path = Path(self.enterContext(_tempdir())) / "campaign.json"
             self.campaign.save(path)
             raw = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(raw["save_version"], 4)
+            self.assertEqual(raw["save_version"], 5)
         reloaded = Campaign.load(path)
         self.assertEqual(reloaded.to_dict(), self.campaign.to_dict())
         # And it is an engine rather than a deserialised blob. `tick` cannot
@@ -370,6 +370,56 @@ class TestEventsAreAttributionOnlyWhenRedIsWatched(unittest.TestCase):
         self.assertEqual(len(loud), len(quiet))
         self.assertEqual(quiet, ["unknown"] * len(quiet))
         self.assertNotEqual(loud, quiet, "events changed nothing; this proves nothing")
+
+
+class TestAWatchedSeadElementIsTheSimsToResolve(unittest.TestCase):
+    """docs/design.md, section 5: an element DCS holds is the sim's.
+
+    Blue's SEAD element flies two minutes ahead of the strike the observer
+    chases, inside the bubble, past the SA-6 the bubble also holds; the
+    harness has it destroy one unit of the battery (`--sead-kills 1`). That
+    loss may arrive only by snapshot, the paper may not fire the same
+    missiles again at the TOT, and the whole war must come out the same with
+    every event dropped.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.with_events, cls.loud = run_loop(sead_kills=1)
+        cls.without_events, cls.quiet = run_loop(sead_kills=1, drop_events=True)
+
+    def _site_losses(self, campaign: Campaign) -> list:
+        return [x for x in campaign.tracker.losses if x.entity_id == SA6]
+
+    def test_the_harness_resolved_the_sead_element_against_the_sa6(self):
+        package = blue_packages(self.with_events)[0]
+        engaged = [o for o in self.loud.sead_outcomes
+                   if o["flight"] == f"cmp_{package.sead.spawn_id}"]
+        self.assertEqual(len(engaged), 1, self.loud.sead_outcomes)
+        self.assertEqual(engaged[0]["site_units_killed"], 1)
+
+    def test_the_site_unit_came_back_by_snapshot_and_only_once(self):
+        losses = self._site_losses(self.with_events)
+        self.assertEqual(len(losses), 1)
+        self.assertNotEqual(losses[0].cause, CAUSE_UNOBSERVED)
+        self.assertEqual(losses[0].attribution.split("/")[-1], "AGM-88C")
+        site = self.with_events.theater.threats[SA6]
+        self.assertEqual(site.units_alive, site.units_initial - 1)
+        package = blue_packages(self.with_events)[0]
+        # The two shared the sim, so the paper left the battery alone at the
+        # TOT whoever held what by then.
+        self.assertEqual(package.sead.sim_contact, [SA6])
+        self.assertTrue(package.weapons_released)
+
+    def test_the_campaign_state_is_identical_without_events(self):
+        self.assertEqual(self.quiet.sent.get("event", 0), 0)
+        self.assertEqual(
+            strip_event_derived(self.without_events.to_dict()),
+            strip_event_derived(self.with_events.to_dict()),
+        )
+        self.assertEqual(
+            [x.attribution for x in self._site_losses(self.without_events)], ["unknown"]
+        )
 
 
 class TestReconnect(unittest.TestCase):
@@ -609,6 +659,22 @@ class TestTheHarnessRefusesWhatTheClientRefuses(unittest.TestCase):
         )
         self.assertFalse(acks[0].ok)
         self.assertIn("malformed airdrome_id", acks[0].error)
+
+    def test_a_sead_element_is_accepted_as_the_client_accepts_it(self):
+        """Both sides' SEAD templates, at the client's capacity and no more."""
+        for coalition, template in (("blue", "F-16C_sead_harm"), ("red", "Su-24M_sead_kh58")):
+            with self.subTest(template=template):
+                tasking = {"kind": "sead", "targets": ["cmp_0004"], "tot": 900.0,
+                           "callsign": "VIPER SEAD"}
+                sim, acks = self._spawn(coalition=coalition, template=template,
+                                        tasking=tasking)
+                self.assertTrue(acks[0].ok, acks[0].error)
+                self.assertEqual(sim.groups["beef"].tasking, tasking)
+                sim, acks = self._spawn(coalition=coalition, template=template,
+                                        tasking=tasking, units=3)
+                self.assertFalse(acks[0].ok)
+                self.assertIn(f"units 3 exceeds template {template} capacity of 2",
+                              acks[0].error)
 
 
 class TestAVersion1ClientIsRefused(unittest.TestCase):

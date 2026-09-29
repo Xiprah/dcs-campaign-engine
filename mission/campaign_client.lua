@@ -535,6 +535,27 @@ local TEMPLATES = {
         skill = "High",
         payload = SU24M_PAYLOAD,
     },
+    -- SEAD elements (docs/design.md, section 5): each side's anti-radiation
+    -- squadron in campaign/oob.py. Group task "SEAD" is what lets DCS give
+    -- the flight its EngageTargets task against air defences; see
+    -- attach_sead. The pylons are as empty as everyone else's, so until a
+    -- mission-editor export fills them these jets carry no AGM-88C or
+    -- Kh-58U and suppress nothing in the sim. mission/VALIDATION.md, section
+    -- 4, is how to find CLSIDs that load.
+    ["F-16C_sead_harm"] = {
+        unit_type = "F-16C_50",
+        count = 2,
+        task = "SEAD",
+        skill = "High",
+        payload = DEFAULT_PAYLOAD,
+    },
+    ["Su-24M_sead_kh58"] = {
+        unit_type = "Su-24M",
+        count = 2,
+        task = "SEAD",
+        skill = "High",
+        payload = SU24M_PAYLOAD,
+    },
     -- The blue strategic target red strikes. Four objects for the same
     -- reason the depot is four: the engine counts units from snapshots.
     ["munitions_storage_medium"] = {
@@ -658,6 +679,71 @@ local function bombing_task(number, x, y)
     }
 end
 
+--- An AttackGroup task against one live group, by its DCS group id.
+local function attack_group_task(number, group_id)
+    return {
+        number = number,
+        auto = false,
+        id = "AttackGroup",
+        enabled = true,
+        params = {groupId = group_id, expend = "All", groupAttack = true},
+    }
+end
+
+--- What a SEAD element searches for, and engages, along its whole route:
+--- DCS's target attribute for SAM radars and launchers alike. Exported as
+--- CampaignClient.SEAD_TARGET_TYPES so mission/validate_templates.lua can
+--- cross-check its own copy against this one.
+local SEAD_TARGET_TYPES = {"Air Defence"}
+
+--- The en-route task a mission-editor SEAD flight is given on its first
+--- waypoint: search, and engage whatever air defence it finds.
+local function engage_sead_task(number)
+    local types = {}
+    for i = 1, #SEAD_TARGET_TYPES do types[i] = SEAD_TARGET_TYPES[i] end
+    return {
+        number = number,
+        auto = false,
+        id = "EngageTargets",
+        enabled = true,
+        params = {targetTypes = types, priority = 0},
+    }
+end
+
+--- Task a SEAD element: `tasking.targets` names the enemy sites its route
+--- enters, by DCS group name.
+---
+--- Two tasks, because the two cases need different ones. The sites the
+--- engine names are usually not instantiated when the flight is -- the
+--- bubble holds what is near the players -- so the standing task is an
+--- EngageTargets on waypoint 1, active for the whole route, that finds and
+--- engages any air defence the flight meets. A named site that does exist
+--- also gets an AttackGroup on the attack waypoint, so the flight goes after
+--- the site it was fragged against rather than whatever it happens to see.
+---
+--- What the flight achieves is the sim's to decide and a snapshot's to
+--- report (docs/design.md, section 5): the engine never reads anything back
+--- from this task, only site units that stop existing.
+local function attach_sead(route, tasking)
+    if #route.points == 0 then return end
+    local first = route.points[1].task.params.tasks
+    first[#first + 1] = engage_sead_task(#first + 1)
+
+    local targets = tasking.targets
+    if type(targets) ~= "table" then return end
+    local waypoint = route.points[route.attack_at or #route.points]
+    local tasks = waypoint.task.params.tasks
+    for i = 1, #targets do
+        local name = targets[i]
+        if type(name) == "string" then
+            local grp = try(Group.getByName, name)
+            if grp and try(grp.isExist, grp) then
+                tasks[#tasks + 1] = attack_group_task(#tasks + 1, grp:getID())
+            end
+        end
+    end
+end
+
 --- Attach a best-effort attack task to the waypoint the engine marked
 --- `attack`, falling back to the last one.
 ---
@@ -677,12 +763,19 @@ end
 --- would mean two clocks disagreeing about the same flight. If a waypoint
 --- ETA is ever wanted, it is derived from tot, not substituted for it.
 ---
---- TODO(seam): SEAD, escort, tanker and AWACS packages, and any richer
---- task composition, belong here. Multi-package deconfliction is the
---- engine's problem, not this function's: spawn frames arrive
---- independently and the client never reasons about two packages at once.
+--- A SEAD element (`tasking.kind == "sead"`) is tasked by attach_sead
+--- instead. Its strike element arrives in a spawn frame of its own: the
+--- client never reasons about two elements, or two packages, at once.
+---
+--- TODO(seam): escort, tanker and AWACS elements, and any richer task
+--- composition, belong here. Deconflicting them is the engine's problem,
+--- not this function's.
 local function attach_tasking(route, tasking)
     if type(tasking) ~= "table" then return end
+    if tasking.kind == "sead" then
+        attach_sead(route, tasking)
+        return
+    end
     local target = tasking.target
     if type(target) ~= "string" or #route.points == 0 then return end
 
@@ -691,13 +784,7 @@ local function attach_tasking(route, tasking)
 
     local grp = try(Group.getByName, target)
     if grp and try(grp.isExist, grp) then
-        tasks[#tasks + 1] = {
-            number = #tasks + 1,
-            auto = false,
-            id = "AttackGroup",
-            enabled = true,
-            params = {groupId = grp:getID(), expend = "All", groupAttack = true},
-        }
+        tasks[#tasks + 1] = attack_group_task(#tasks + 1, grp:getID())
         return
     end
 
@@ -1820,6 +1907,7 @@ end
 
 M.CONFIG = CONFIG
 M.TEMPLATES = TEMPLATES
+M.SEAD_TARGET_TYPES = SEAD_TARGET_TYPES
 
 -- Reloading this file (a second DO SCRIPT FILE, or a mission restart
 -- inside one DCS session) must not leave two clients fighting over one

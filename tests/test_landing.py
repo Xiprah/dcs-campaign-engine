@@ -36,7 +36,7 @@ def _flight_in_the_air(test: unittest.TestCase):
     mission.run_until(
         lambda m: bool(
             first_blue_package(m.campaign)
-            and m.mock.group(group_name(m.package.spawn_id)) is not None
+            and m.mock.group(group_name(m.package.strike.spawn_id)) is not None
         ),
         limit=1400.0,
     )
@@ -72,7 +72,7 @@ class TestALandedFlightIsNotALostFlight(unittest.TestCase):
             "a flight that landed was booked as a combat loss",
         )
         self.assertEqual(
-            mission.campaign.tracker.units_alive(mission.package.spawn_id),
+            mission.campaign.tracker.units_alive(mission.package.strike.spawn_id),
             2,
             "the campaign lost aircraft that were parked on the ramp",
         )
@@ -100,7 +100,7 @@ class TestALandedFlightIsNotALostFlight(unittest.TestCase):
             squadron.airframes_lost, 2, "a flight shot down cost the squadron nothing"
         )
         self.assertEqual(
-            mission.campaign.tracker.units_alive(mission.package.spawn_id), 0
+            mission.campaign.tracker.units_alive(mission.package.strike.spawn_id), 0
         )
         mission.assert_lua_was_clean(self)
 
@@ -115,7 +115,7 @@ class TestALandedFlightIsNotALostFlight(unittest.TestCase):
         squadron = mission.campaign.inventories["blue"].squadron(SQUADRON)
         self.assertEqual(squadron.airframes_lost, 1)
         self.assertEqual(
-            mission.campaign.tracker.units_alive(mission.package.spawn_id), 1
+            mission.campaign.tracker.units_alive(mission.package.strike.spawn_id), 1
         )
         mission.assert_lua_was_clean(self)
 

@@ -32,6 +32,7 @@ import unittest
 from campaign.api import PAPER_STEP
 from campaign.attrition import CAUSE_UNOBSERVED, KIND_FLIGHT, KIND_TARGET
 from campaign.campaign import Campaign
+from campaign.oob import ANTI_RADIATION_MUNITIONS
 from campaign.planner import ABORTED, DESTROYED, OPEN_STATES, PLANNED
 from campaign.protocol import Message
 from campaign.theater import Theater, build_slice_theater
@@ -50,15 +51,18 @@ DRAWN = (
     "The war ends without a victor."
 )
 
-#: Seeds pinned by flying the slice as shipped, offline, to its end: at the
-#: default seed blue wins at 4000 s, at seed 1 red wins at 3945 s.
-SEED_BLUE_WINS = Campaign().seed
+#: Seeds pinned by flying the slice as shipped, offline, to its end: at seed
+#: 3 blue wins at 4000 s, at seed 1 red wins at 6435 s. Re-pinned when SEAD
+#: elements arrived: they draw dice at every escorted TOT, so every seed's
+#: war fell differently, and the default seed became a red win (3945 s).
+SEED_BLUE_WINS = 3
 SEED_RED_WINS = 1
-#: A day of war on the slice as shipped in which each side loses aircraft to
-#: the other's air defences and each side's bombs destroy part of the other's
-#: target. Found by flying seeds in order; the default seed is not one (blue
-#: wins in two sorties the SA-6 never touches), which is why it is pinned.
-SEED_BOTH_BLEED = 9
+#: A day of war on the slice as shipped in which each side's strike element
+#: loses aircraft to the other's air defences and each side's bombs destroy
+#: part of the other's target. Found by flying seeds in order: at seed 2 blue
+#: wins at 9050 s after both sides have bled. Re-pinned from 9 with SEAD, for
+#: the reason above.
+SEED_BOTH_BLEED = 2
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +72,7 @@ SEED_BOTH_BLEED = 9
 
 def side_of(campaign: Campaign, package) -> str | None:
     for coalition in sorted(campaign.inventories):
-        if package.squadron_id in campaign.inventories[coalition].squadrons:
+        if package.strike.squadron_id in campaign.inventories[coalition].squadrons:
             return coalition
     return None
 
@@ -96,6 +100,40 @@ def flight_losses(campaign: Campaign, coalition: str) -> list:
         x for x in campaign.tracker.losses
         if x.entity_kind == KIND_FLIGHT and x.coalition == coalition
     ]
+
+
+def element_losses(campaign: Campaign, coalition: str, role: str) -> list:
+    """One side's aircraft losses from elements of one role.
+
+    A package is its elements now (docs/design.md, section 5), and a side's
+    SEAD element loses aircraft to the same sites its strike does. What these
+    tests pinned about "the raid" is the strike element, and they still pin
+    exactly that.
+    """
+    spawn_ids = {
+        element.spawn_id
+        for package in packages_of(campaign, coalition)
+        for element in package.elements
+        if element.role == role
+    }
+    return [x for x in flight_losses(campaign, coalition) if x.spawn_id in spawn_ids]
+
+
+def strike_squadron(campaign: Campaign, coalition: str):
+    """The side's strike squadron: the one that is not loaded with ARMs."""
+    (squadron,) = [
+        s for s in squadrons_of(campaign, coalition)
+        if not set(s.munitions_total) <= ANTI_RADIATION_MUNITIONS
+    ]
+    return squadron
+
+
+def sead_squadron(campaign: Campaign, coalition: str):
+    (squadron,) = [
+        s for s in squadrons_of(campaign, coalition)
+        if set(s.munitions_total) <= ANTI_RADIATION_MUNITIONS
+    ]
+    return squadron
 
 
 def texts(frames: list) -> list[str]:
@@ -136,16 +174,26 @@ def slice_with(**changes) -> Theater:
 
 
 def conserved(test: unittest.TestCase, campaign: Campaign) -> None:
-    """Every squadron's books, and every package's reservation, on both sides."""
+    """Every squadron's books, and every element's reservation, on both sides.
+
+    Each element holds its own reservation for exactly as long as it is
+    open, and a package is open exactly while one of its elements is.
+    """
     for coalition in sorted(campaign.inventories):
         for squadron in squadrons_of(campaign, coalition):
             squadron.check_invariant()
     for package in campaign.packages.values():
         side = side_of(campaign, package)
         test.assertIsNotNone(side, package.id)
-        squadron = campaign.inventories[side].squadrons[package.squadron_id]
-        held = package.reservation_id in squadron.open_reservations
-        test.assertEqual(held, package.state in OPEN_STATES, package.id)
+        for element in package.elements:
+            squadron = campaign.inventories[side].squadrons[element.squadron_id]
+            held = element.reservation_id in squadron.open_reservations
+            test.assertEqual(held, element.is_open, element.reservation_id)
+        test.assertEqual(
+            package.state in OPEN_STATES,
+            any(e.is_open for e in package.elements),
+            package.id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +215,9 @@ class TestRedPlansAndFlies(unittest.TestCase):
 
         fly_until(campaign, first_red_raid_released, limit=5_000.0, frames=frames)
         self.assertIn(package.state, OPEN_STATES | {DESTROYED})
-        (squadron,) = squadrons_of(campaign, "red")
+        squadron = campaign.inventories["red"].squadron(package.strike.squadron_id)
         spent = sum(squadron.munitions_expended.values()) + sum(squadron.munitions_lost.values())
-        self.assertEqual(spent, package.rounds, "the raid's bombs are not accounted for")
+        self.assertEqual(spent, package.strike.rounds, "the raid's bombs are not accounted for")
         squadron.check_invariant()
         # Nobody flies red, so red was told nothing -- not its fragging, not
         # its egress -- and nothing went to anyone but the humans' side.
@@ -272,11 +320,14 @@ class TestRedFacesBlueAirDefences(unittest.TestCase):
         frames = fly_until(campaign, first_red_raid_released, limit=5_000.0)
         package = packages_of(campaign, "red")[0]
 
-        lost = flight_losses(campaign, "red")
+        lost = element_losses(campaign, "red", "strike")
         self.assertEqual(len(lost), 2, "the Patriot shot nothing down")
         self.assertTrue(all(x.cause == CAUSE_UNOBSERVED and x.entity_id == package.id for x in lost))
+        # A Pk of one leaves nothing of the SEAD element in front of it
+        # either, and then there is nobody left to suppress anything.
+        self.assertEqual(len(element_losses(campaign, "red", "sead")), 2)
         self.assertEqual(package.state, DESTROYED)
-        (squadron,) = squadrons_of(campaign, "red")
+        squadron = strike_squadron(campaign, "red")
         self.assertEqual(squadron.airframes_lost, 2)
         # Shot down inbound, so the bombs went into the ground, not onto Incirlik.
         self.assertEqual(sum(squadron.munitions_lost.values()), 4)
@@ -319,7 +370,7 @@ class TestRedFacesBlueAirDefences(unittest.TestCase):
             package = red[0]
             if not package.weapons_released:
                 seen["before"] = c.rng.getstate()
-                seen["held_at_tot"] = c.tracker.is_instantiated(package.spawn_id)
+                seen["held_at_tot"] = c.tracker.is_instantiated(package.strike.spawn_id)
             elif "after" not in seen:
                 seen["after"] = c.rng.getstate()
 
@@ -349,18 +400,21 @@ class TestRedFacesBlueAirDefences(unittest.TestCase):
 
 class TestConservationOnBothSides(unittest.TestCase):
     def test_both_sides_books_balance_through_a_long_war(self):
-        """Sturdier targets and deadlier sites, so the war lasts and bleeds.
+        """Sturdier targets and sites, deadlier sites, so the war lasts and bleeds.
 
         Forty units a target keeps either side from winning in a few sorties;
-        a Pk of 0.3 at both sites makes losses common on both sides. Every
-        squadron and every reservation is checked after every paper step.
+        a Pk of 0.3 at both sites makes losses common on both sides. Forty
+        units a site too, now that SEAD missiles can destroy one: a five-unit
+        battery is gone within a few escorted sorties, and after that nobody
+        loses anything and the books balance trivially. Every squadron and
+        every reservation is checked after every paper step.
         """
         theater = slice_with(
             **{
                 DEPOT: {"units_initial": 40, "units_alive": 40},
                 STORAGE: {"units_initial": 40, "units_alive": 40},
-                SA6: {"kill_probability": 0.3},
-                PATRIOT: {"kill_probability": 0.3},
+                SA6: {"kill_probability": 0.3, "units_initial": 40, "units_alive": 40},
+                PATRIOT: {"kill_probability": 0.3, "units_initial": 40, "units_alive": 40},
             }
         )
         campaign = Campaign(theater=theater)
@@ -370,17 +424,27 @@ class TestConservationOnBothSides(unittest.TestCase):
 
         for coalition in ("blue", "red"):
             with self.subTest(coalition=coalition):
-                lost = flight_losses(campaign, coalition)
-                self.assertGreaterEqual(len(lost), 4, "too few losses to prove anything")
-                (squadron,) = squadrons_of(campaign, coalition)
-                self.assertEqual(squadron.airframes_lost, len(lost))
-                # Every loss is on paper, at the TOT, before release: each
-                # took its two bombs down with it.
-                self.assertEqual(sum(squadron.munitions_lost.values()), 2 * len(lost))
+                # The strike squadron and the SEAD squadron each answer for
+                # their own elements' losses, and nothing else.
+                for role, squadron in (
+                    ("strike", strike_squadron(campaign, coalition)),
+                    ("sead", sead_squadron(campaign, coalition)),
+                ):
+                    lost = element_losses(campaign, coalition, role)
+                    self.assertGreaterEqual(len(lost), 4, "too few losses to prove anything")
+                    self.assertEqual(squadron.airframes_lost, len(lost), role)
+                    # Every loss is on paper, at the TOT, before release: each
+                    # took its two bombs, or two missiles, down with it.
+                    self.assertEqual(sum(squadron.munitions_lost.values()), 2 * len(lost))
+                    self.assertEqual(
+                        squadron.airframes_available + squadron.airframes_reserved
+                        + squadron.airframes_lost,
+                        squadron.airframes_total,
+                    )
                 self.assertEqual(
-                    squadron.airframes_available + squadron.airframes_reserved
-                    + squadron.airframes_lost,
-                    squadron.airframes_total,
+                    len(flight_losses(campaign, coalition)),
+                    len(element_losses(campaign, coalition, "strike"))
+                    + len(element_losses(campaign, coalition, "sead")),
                 )
 
 
@@ -405,8 +469,12 @@ class TestTheWarEnds(unittest.TestCase):
             for squadron in squadrons_of(campaign, coalition):
                 self.assertEqual(squadron.open_reservations, {}, squadron.id)
                 squadron.check_invariant()
-        # Anything still on the ground when it ended was stood down, not flown.
+        # Anything still on the ground when it ended was stood down, not
+        # flown -- element by element, since a SEAD element leaves first.
         for package in campaign.packages.values():
+            for element in package.elements:
+                if element.t_takeoff > result["t"]:
+                    self.assertEqual(element.state, ABORTED, element.reservation_id)
             if package.t_takeoff > result["t"]:
                 self.assertEqual(package.state, ABORTED, package.id)
         # An ended war stays ended through a save.
@@ -475,15 +543,26 @@ class TestTheWarEnds(unittest.TestCase):
         self.assertEqual(result["defeated"], ["red"])
         for package in waiting:
             self.assertEqual(package.state, ABORTED, package.id)
-            squadron = campaign.inventories[side_of(campaign, package)].squadrons[package.squadron_id]
-            self.assertEqual(squadron.open_reservations, {})
-            self.assertEqual(squadron.airframes_available, squadron.airframes_total)
+            # Every element was on the ground, so every element stood down.
+            self.assertEqual(
+                [e.state for e in package.elements], [ABORTED] * len(package.elements)
+            )
+            for element in package.elements:
+                squadron = campaign.inventories[side_of(campaign, package)].squadrons[
+                    element.squadron_id
+                ]
+                self.assertEqual(squadron.open_reservations, {})
+                self.assertEqual(squadron.airframes_available, squadron.airframes_total)
         said = texts(frames)
         self.assertIn(WON, said)
         blue = packages_of(campaign, "blue")[0]
         self.assertIn(f"{blue.callsign} stood down: the war is over.", said)
-        # Red's was stood down too, and nobody told the humans red's callsign.
-        self.assertEqual(len([t for t in said if "stood down" in t]), 1)
+        # Red's was stood down too, and nobody told the humans red's callsign:
+        # the humans heard of blue's elements standing down and nothing else.
+        self.assertEqual(
+            [t for t in said if "stood down" in t],
+            [f"{blue.name_of(e)} stood down: the war is over." for e in blue.elements],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -503,11 +582,16 @@ class TestBothSidesFight(unittest.TestCase):
 
         for coalition, enemy_target in (("blue", DEPOT), ("red", STORAGE)):
             with self.subTest(side=coalition):
-                lost = flight_losses(campaign, coalition)
+                lost = element_losses(campaign, coalition, "strike")
                 self.assertGreaterEqual(len(lost), 1, f"{coalition} lost no aircraft")
-                (squadron,) = squadrons_of(campaign, coalition)
+                squadron = strike_squadron(campaign, coalition)
                 self.assertEqual(squadron.airframes_lost, len(lost))
                 squadron.check_invariant()
+                sead = sead_squadron(campaign, coalition)
+                self.assertEqual(
+                    sead.airframes_lost, len(element_losses(campaign, coalition, "sead"))
+                )
+                sead.check_invariant()
                 hits = [
                     x for x in campaign.tracker.losses
                     if x.entity_kind == KIND_TARGET and x.entity_id == enemy_target

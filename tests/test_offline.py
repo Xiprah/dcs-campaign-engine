@@ -419,8 +419,14 @@ class TestObserversDoNotOutliveTheWarMovingOn(unittest.TestCase):
 
 
 def _mid_sortie_save(path: Path, *, disconnect: bool) -> Campaign:
-    """A real save, written with the flight and the depot instantiated."""
-    campaign = Campaign()
+    """A real save, written with the flight and the depot instantiated.
+
+    Seed 3, a war blue wins at 4000 s, because what the tests below read off
+    the result is the depot destroyed: proof that paper strikes reached it.
+    The default seed was such a war until SEAD elements changed every seed's
+    dice; at it, red now wins first.
+    """
+    campaign = Campaign(seed=3)
     drive(
         campaign,
         observer_positions=OBSERVER_AT_TARGET,

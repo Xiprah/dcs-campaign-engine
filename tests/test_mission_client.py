@@ -59,7 +59,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from campaign.campaign import Campaign
-from campaign.planner import COMPLETE, CRUISE_ALTITUDE, DESTROYED
+from campaign.planner import COMPLETE, CRUISE_ALTITUDE, DESTROYED, element_position
 from campaign.protocol import (
     PROTOCOL_VERSION,
     Ack,
@@ -311,7 +311,7 @@ class Mission:
         return self.campaign.theater.targets[DEPOT]
 
     def flight_group(self) -> str:
-        return group_name(self.package.spawn_id)
+        return group_name(self.package.strike.spawn_id)
 
     def assert_lua_was_clean(self, test: unittest.TestCase) -> None:
         test.assertEqual(
@@ -360,7 +360,7 @@ class TestFullSortie(unittest.TestCase):
             package = first_blue_package(m.campaign)
             if package is None:
                 return
-            flight = group_name(package.spawn_id)
+            flight = group_name(package.strike.spawn_id)
             if m.mock.group(flight) is not None and not cls.saw_flight_group:
                 cls.saw_flight_group = True
                 data = m.mock.group_data(flight)
@@ -425,7 +425,7 @@ class TestFullSortie(unittest.TestCase):
         states = self.mission.engine.uplink_of(StateReport)
         self.assertGreater(len(states), 5, "hardly any snapshots were sent")
         seen = {g.spawn_id for s in states for g in s.groups}
-        self.assertIn(self.mission.package.spawn_id, seen)
+        self.assertIn(self.mission.package.strike.spawn_id, seen)
         self.assertIn(self.mission.depot.spawn_id, seen)
         # The depot's four objects were counted as four, not as one.
         depot_counts = {
@@ -441,9 +441,23 @@ class TestFullSortie(unittest.TestCase):
         self.assertTrue(self.mission.depot.destroyed)
         self.assertEqual(self.mission.depot.units_alive, 0)
         target_losses = [
-            x for x in self.mission.campaign.tracker.losses if x.entity_kind == "target"
+            x for x in self.mission.campaign.tracker.losses
+            if x.entity_kind == "target" and x.entity_id == self.mission.depot.id
         ]
         self.assertEqual(len(target_losses), 4)
+        # The depot's four were the only target losses anyone observed. Red's
+        # raid on Incirlik, 150 km from this observer, is flown on paper, and
+        # at this seed it gets through now that its SEAD element draws the
+        # Patriot's fire -- so the storage area's losses are the resolver's.
+        self.assertEqual(
+            [
+                x for x in self.mission.campaign.tracker.losses
+                if x.entity_kind == "target"
+                and x.entity_id != self.mission.depot.id
+                and x.cause != "unobserved"
+            ],
+            [],
+        )
 
     def test_the_lost_airframe_came_off_the_squadron(self):
         self.assertTrue(self.killed_wingman, "no aircraft was ever shot down")
@@ -474,14 +488,14 @@ class TestFullSortie(unittest.TestCase):
         self.assertTrue(self.mission.campaign.tracker.groups[site.spawn_id].ever_seen)
 
         # Aircraft still carry theirs; the ground rule must not strip them.
-        flight = calls[group_name(self.mission.package.spawn_id)]
+        flight = calls[group_name(self.mission.package.strike.spawn_id)]
         self.assertTrue(all("payload" in u for u in flight["data"]["units"]))
 
     def test_everything_the_engine_owned_was_despawned_from_dcs(self):
         despawned = {f.spawn_id for f in self.mission.engine.downlink_of(Despawn)}
         package = self.mission.package
         depot = self.mission.campaign.theater.targets[DEPOT]
-        self.assertIn(package.spawn_id, despawned)
+        self.assertIn(package.strike.spawn_id, despawned)
         self.assertIn(depot.spawn_id, despawned)
         leftovers = sorted(
             n
@@ -492,7 +506,7 @@ class TestFullSortie(unittest.TestCase):
         # still over it, so it is rightly still in DCS. Nothing else may be.
         still_live = sorted(group_name(s) for s in self.mission.campaign.live)
         self.assertEqual(leftovers, still_live, "engine-owned objects outlived their despawn")
-        self.assertNotIn(group_name(package.spawn_id), leftovers)
+        self.assertNotIn(group_name(package.strike.spawn_id), leftovers)
         self.assertEqual(self.mission.mock.status()["live_spawns"], len(still_live))
 
     def test_a_despawn_reports_ground_truth_before_it_destroys_anything(self):
@@ -581,7 +595,7 @@ class TestStrikeIsActuallyTasked(unittest.TestCase):
         found = mission.run_until(
             lambda m: bool(
                 first_blue_package(m.campaign)
-                and m.mock.group(group_name(m.package.spawn_id)) is not None
+                and m.mock.group(group_name(m.package.strike.spawn_id)) is not None
             ),
             limit=1200.0,
         )
@@ -646,7 +660,7 @@ class TestStrikeIsActuallyTasked(unittest.TestCase):
         found = mission.run_until(
             lambda m: bool(
                 first_blue_package(m.campaign)
-                and m.mock.group(group_name(m.package.spawn_id)) is not None
+                and m.mock.group(group_name(m.package.strike.spawn_id)) is not None
             ),
             limit=1400.0,
         )
@@ -668,6 +682,98 @@ class TestStrikeIsActuallyTasked(unittest.TestCase):
             200.0,
             "the aim point is not on the depot",
         )
+
+
+@requires_lua
+class TestSeadIsActuallyTasked(unittest.TestCase):
+    """A SEAD element must carry tasks that make DCS go after air defences.
+
+    docs/design.md, section 5: observed, the SEAD element is tasked in DCS
+    and the sim decides. A SEAD element with an empty task list, or with the
+    strike's bombing task, would fly past the SA-6 doing nothing, and every
+    test that only counts spawns would stay green.
+    """
+
+    def _sead_group(self, mission: Mission) -> str:
+        found = mission.run_until(
+            lambda m: bool(
+                first_blue_package(m.campaign)
+                and m.package.sead is not None
+                and m.mock.group(group_name(m.package.sead.spawn_id)) is not None
+            ),
+            limit=1400.0,
+        )
+        self.assertTrue(found, "the SEAD element never entered the bubble")
+        return group_name(mission.package.sead.spawn_id)
+
+    def _engage(self, tasks: list[dict]) -> list[dict]:
+        return [t for t in tasks if t["id"] == "EngageTargets"]
+
+    def test_with_its_site_up_it_searches_and_attacks_that_site(self):
+        mission = sortie_with_observer_over_the_target()
+        self.addCleanup(mission.close)
+        name = self._sead_group(mission)
+        site = group_name(mission.campaign.theater.threats["latakia_north_sa6"].spawn_id)
+        self.assertIsNotNone(mission.mock.group(site), "the SA-6 was not up first")
+
+        data = mission.mock.group_data(name)
+        self.assertEqual(data["task"], "SEAD")
+        self.assertEqual([u["type"] for u in data["units"]], ["F-16C_50", "F-16C_50"])
+        per_waypoint = mission.mock.waypoint_tasks(name)
+        engage = self._engage(per_waypoint[0])
+        self.assertEqual(len(engage), 1, per_waypoint[0])
+        self.assertTrue(engage[0]["enabled"])
+        self.assertEqual(engage[0]["params"]["priority"], 0)
+        self.assertEqual(list(engage[0]["params"]["targetTypes"]), ["Air Defence"])
+        attacks = [t for t in per_waypoint[1] if t["id"] == "AttackGroup"]
+        self.assertEqual(len(attacks), 1, per_waypoint)
+        self.assertEqual(attacks[0]["params"]["groupId"], mission.mock.group_id(site))
+        everything = mission.mock.attack_tasks(name)
+        self.assertEqual(
+            sorted(t["id"] for t in everything), ["AttackGroup", "EngageTargets"],
+            "a SEAD element was given the strike's bombs to drop",
+        )
+        mission.assert_lua_was_clean(self)
+
+    def test_with_no_site_up_it_still_searches_and_engages(self):
+        """Spawned at its own base, 140 km from the SA-6: the ordinary case."""
+        incirlik = (142_000.0, CRUISE_ALTITUDE, -38_000.0)
+        mission = Mission(observer_pos=incirlik)
+        self.addCleanup(mission.close)
+        name = self._sead_group(mission)
+        site = group_name(mission.campaign.theater.threats["latakia_north_sa6"].spawn_id)
+        self.assertIsNone(mission.mock.group(site), "the SA-6 was up; this proves nothing")
+        tasks = mission.mock.attack_tasks(name)
+        self.assertEqual([t["id"] for t in tasks], ["EngageTargets"], tasks)
+        mission.assert_lua_was_clean(self)
+
+    def test_a_flight_spawned_after_its_tot_is_given_no_task_at_all(self):
+        """The Lua half of the egress fix: nothing to attack on the way home."""
+        campaign = Campaign()
+        while not (first_blue_package(campaign) and first_blue_package(campaign).weapons_released):
+            campaign.advance(5.0)
+        package = first_blue_package(campaign)
+        base = campaign.theater.airbases[package.base_id]
+        target = campaign.theater.targets[package.target_id]
+        where = element_position(package.strike, base, target, campaign.clock)
+        mission = Mission(observer_pos=(where[0], CRUISE_ALTITUDE, where[2]), campaign=campaign)
+        self.addCleanup(mission.close)
+        found = mission.run_until(
+            lambda m: all(
+                m.mock.group(group_name(e.spawn_id)) is not None for e in package.elements
+            ),
+            limit=60.0,
+        )
+        self.assertTrue(found, "the package was not re-instantiated on its way home")
+        for element in package.elements:
+            spawn = next(
+                f for f in mission.engine.downlink_of(Spawn) if f.spawn_id == element.spawn_id
+            )
+            self.assertEqual(spawn.tasking["kind"], "egress")
+            self.assertEqual(
+                mission.mock.attack_tasks(group_name(element.spawn_id)), [], element.role
+            )
+        mission.assert_lua_was_clean(self)
 
 
 @requires_lua
@@ -693,12 +799,14 @@ class TestRedRaidsThroughTheRealClient(unittest.TestCase):
             # plans fails the assertions below rather than this lookup.
             red = campaign.inventories["red"].squadrons
             return next(
-                (p for p in campaign.packages.values() if p.squadron_id in red), None
+                (p for p in campaign.packages.values() if p.strike.squadron_id in red),
+                None,
             )
 
         cls.arrived = mission.run_until(
             lambda m: red_flight(m.campaign) is not None
-            and m.mock.group(group_name(red_flight(m.campaign).spawn_id)) is not None,
+            and m.mock.group(group_name(red_flight(m.campaign).strike.spawn_id))
+            is not None,
             limit=1500.0,
         )
         cls.raid = red_flight(mission.campaign)
@@ -717,7 +825,7 @@ class TestRedRaidsThroughTheRealClient(unittest.TestCase):
         self.mission.assert_lua_was_clean(self)
 
     def test_the_raid_is_two_su24ms_for_russia_tasked_at_the_storage_area(self):
-        call = self.calls.get(group_name(self.raid.spawn_id))
+        call = self.calls.get(group_name(self.raid.strike.spawn_id))
         self.assertIsNotNone(call, "the red flight was never built")
         self.assertEqual(call["country"], self.g.country.id.RUSSIA)
         self.assertEqual(call["category"], self.g.Group.Category.AIRPLANE)
@@ -725,7 +833,7 @@ class TestRedRaidsThroughTheRealClient(unittest.TestCase):
         self.assertEqual([u["type"] for u in units], ["Su-24M", "Su-24M"])
         self.assertTrue(all(u["payload"]["fuel"] == 11700 for u in units))
         attacks = [
-            t for t in self.mission.mock.attack_tasks(group_name(self.raid.spawn_id))
+            t for t in self.mission.mock.attack_tasks(group_name(self.raid.strike.spawn_id))
             if t["id"] in ("Bombing", "AttackGroup")
         ]
         self.assertEqual(len(attacks), 1, attacks)
@@ -783,7 +891,7 @@ class TestReconnect(unittest.TestCase):
         mission.run_until(
             lambda m: bool(
                 first_blue_package(m.campaign)
-                and m.mock.group(group_name(m.package.spawn_id)) is not None
+                and m.mock.group(group_name(m.package.strike.spawn_id)) is not None
             ),
             limit=1400.0,
         )
@@ -867,7 +975,7 @@ class TestReconnect(unittest.TestCase):
             package = first_blue_package(m.campaign)
             if package is None:
                 return
-            flight = group_name(package.spawn_id)
+            flight = group_name(package.strike.spawn_id)
             if not state["dropped"] and m.mock.group(flight) is not None:
                 state["dropped"] = True
                 m.engine.drop()
@@ -914,7 +1022,7 @@ class TestFramesCarryMissionTimeNotCampaignTime(unittest.TestCase):
         first.run_until(
             lambda m: bool(
                 first_blue_package(m.campaign)
-                and m.mock.group(group_name(m.package.spawn_id)) is not None
+                and m.mock.group(group_name(m.package.strike.spawn_id)) is not None
             ),
             limit=1400.0,
         )
@@ -937,7 +1045,7 @@ class TestFramesCarryMissionTimeNotCampaignTime(unittest.TestCase):
                 and [
                     s
                     for s in m.engine.downlink_of(Spawn)
-                    if s.spawn_id == package.spawn_id
+                    if s.spawn_id == package.strike.spawn_id
                 ]
             ),
             limit=120.0,
@@ -958,7 +1066,7 @@ class TestFramesCarryMissionTimeNotCampaignTime(unittest.TestCase):
         )
 
         spawn = [
-            s for s in second.engine.downlink_of(Spawn) if s.spawn_id == package.spawn_id
+            s for s in second.engine.downlink_of(Spawn) if s.spawn_id == package.strike.spawn_id
         ][-1]
         self.assertLessEqual(
             abs(spawn.t - second.mock.time),
@@ -1651,7 +1759,7 @@ class TestAnAttritedEntityComesBackAttrited(unittest.TestCase):
         mission.run_until(
             lambda m: bool(
                 first_blue_package(m.campaign)
-                and m.mock.group(group_name(m.package.spawn_id)) is not None
+                and m.mock.group(group_name(m.package.strike.spawn_id)) is not None
             ),
             limit=1400.0,
         )
@@ -1667,7 +1775,7 @@ class TestAnAttritedEntityComesBackAttrited(unittest.TestCase):
             mission.mock.kill_static(name)
 
         settled = mission.run_until(
-            lambda m: m.campaign.tracker.units_alive(m.package.spawn_id) == 1
+            lambda m: m.campaign.tracker.units_alive(m.package.strike.spawn_id) == 1
             and m.campaign.tracker.units_alive(m.depot.spawn_id) == 2,
             limit=mission.mock.time + 180.0,
         )
@@ -1764,19 +1872,32 @@ class TestAFlightLostEarlyIsClosedOutAtOnce(unittest.TestCase):
     """
 
     def test_the_package_closes_settles_and_is_replaced_before_its_rtb(self):
+        """Every element of it: a package is open while any element is.
+
+        Blue's package is a strike and its SEAD element, and a strike lost
+        with its escort still flying leaves the package open until the escort
+        is home -- that is the SEAD element failing independently, pinned in
+        tests/test_sead.py. Here the whole package dies, as the one flight of
+        the one-flight package used to.
+        """
         mission = sortie_with_observer_over_the_target()
         self.addCleanup(mission.close)
         mission.run_until(
             lambda m: bool(
                 first_blue_package(m.campaign)
-                and m.mock.group(group_name(m.package.spawn_id)) is not None
+                and all(
+                    m.mock.group(group_name(e.spawn_id)) is not None
+                    for e in m.package.elements
+                )
             ),
             limit=1400.0,
         )
         package = mission.package
         self.assertTrue(package.is_open, "the flight was never airborne")
+        self.assertEqual(len(package.elements), 2, "no SEAD element to lose")
 
-        mission.mock.kill_group(group_name(package.spawn_id))
+        for element in package.elements:
+            mission.mock.kill_group(group_name(element.spawn_id))
         # Long enough for one census, which is the only thing that may record
         # the loss, and the pulse that follows it.
         mission.step(40)
@@ -1789,9 +1910,15 @@ class TestAFlightLostEarlyIsClosedOutAtOnce(unittest.TestCase):
         )
         self.assertEqual(package.state, DESTROYED)
         self.assertNotIn(
-            package.reservation_id,
+            package.strike.reservation_id,
             squadron.open_reservations,
             "a flight that is gone still holds its airframes and bombs",
+        )
+        sead = mission.campaign.inventories["blue"].squadron(package.sead.squadron_id)
+        self.assertNotIn(
+            package.sead.reservation_id,
+            sead.open_reservations,
+            "a SEAD element that is gone still holds its airframes and missiles",
         )
         self.assertTrue(
             any("is lost" in text for text in mission.engine.messages()),

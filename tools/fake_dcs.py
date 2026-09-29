@@ -103,6 +103,9 @@ DEFENDERS: dict[str, tuple[tuple[str, ...], str]] = {
     "blue": (("red_sa6_bassel", "red_sa8_bassel", "red_manpad"), "9M33"),
     "red": (("blue_patriot_incirlik", "blue_stinger_incirlik", "blue_manpad"), "MIM-104"),
 }
+#: What a SEAD element fires, by its coalition. Attribution only, like
+#: DEFENDERS: the engine never learns a thing from it.
+ANTI_RADIATION: dict[str, str] = {"blue": "AGM-88C", "red": "Kh-58U"}
 #: Inbound frames handled per sim tick, mirroring the real client's cap.
 MAX_FRAMES_PER_TICK = 32
 _AIR_CATEGORIES = frozenset({"plane", "helicopter"})
@@ -139,6 +142,8 @@ class Config:
     target_outcome: str = "destroyed"
     target_pk: float = 1.0
     flight_losses: int = 1
+    sead_kills: int = 0
+    sead_range: float = 25_000.0
     dead_linger: int = 1
     takeoff_delay: float = 5.0
     spawn_timeout: float = 900.0
@@ -202,6 +207,9 @@ class FakeDCS:
         self.sent: Counter[str] = Counter()
         self.received: Counter[str] = Counter()
         self.outcomes: list[dict] = []
+        #: Kept apart from `outcomes`, which is strikes: a SEAD element's shot
+        #: is not a strike, and the two answer different questions.
+        self.sead_outcomes: list[dict] = []
         self.messages: list[str] = []
         self.struck: set[str] = set()
         self.restarted = False
@@ -480,9 +488,12 @@ class FakeDCS:
             if group.resolved or not group.alive:
                 continue
             tasking = group.tasking
+            if tasking.get("kind") == "sead":
+                await self._resolve_sead(group)
+                continue
             if tasking.get("kind") != "strike":
-                # TODO(packages): SEAD, escort, tanker and AWACS taskings land
-                # here as new `kind`s, each with its own resolution. Package
+                # TODO(packages): escort, tanker and AWACS taskings land here
+                # as new `kind`s, each with its own resolution. Package
                 # deconfliction (who shoots first when two arrive together) is
                 # the engine's problem, not this loop's.
                 continue
@@ -511,6 +522,82 @@ class FakeDCS:
             if not in_range and not overdue:
                 continue
             await self._strike(group, target)
+
+    async def _resolve_sead(self, flight: SimGroup) -> None:
+        """A SEAD element engages the named sites it has in range, once.
+
+        Scripted like the strike: `--sead-kills` units come off every named
+        site that is instantiated and within `--sead-range` when the flight
+        first has one there. Zero by default, so the harness's standard runs
+        are the ones they were before SEAD existed; the engine may only learn
+        what happened from the next census either way. A site the engine has
+        not instantiated cannot be engaged, exactly as in DCS.
+        """
+        tasking = flight.tasking
+        names = tasking.get("targets")
+        if not isinstance(names, list):
+            names = []
+        sites = [
+            site
+            for site in (
+                self.groups.get(spawn_id_of(name))
+                for name in names
+                if isinstance(name, str)
+            )
+            if site is not None and site.alive
+        ]
+        in_range = [
+            site for site in sites
+            if _hdist(flight.pos, site.pos) <= self.cfg.sead_range
+        ]
+        tot = tasking.get("tot")
+        overdue = isinstance(tot, (int, float)) and self.t >= float(tot) + 120.0
+        if not in_range:
+            if overdue and not flight.warned_no_target:
+                flight.warned_no_target = True
+                log.warning(
+                    "%s is past its TOT with none of %r instantiated in range; "
+                    "nothing is suppressed, exactly as in DCS",
+                    flight.name,
+                    names,
+                )
+            return
+        flight.resolved = True
+        self.struck.add(flight.spawn_id)
+        weapon = ANTI_RADIATION.get(flight.coalition, "AGM-88C")
+        for site in in_range:
+            await self._emit_event(
+                "shot", initiator=flight.name, target=site.name, weapon=weapon
+            )
+            before = site.units
+            site.units = max(0, site.units - max(0, self.cfg.sead_kills))
+            site.alive = site.units > 0
+            for _ in range(before - site.units):
+                await self._emit_event(
+                    "hit", initiator=flight.name, target=site.name, weapon=weapon
+                )
+                await self._emit_event(
+                    "kill", initiator=flight.name, target=site.name, weapon=weapon
+                )
+            if not site.alive:
+                await self._emit_event("dead", initiator=site.name)
+            self.sead_outcomes.append(
+                {
+                    "t": self.t,
+                    "flight": flight.name,
+                    "site": site.name,
+                    "site_units_killed": before - site.units,
+                    "site_alive": site.alive,
+                }
+            )
+            log.info(
+                "SEAD at t=%.0f: %s -> %s, %d unit(s) destroyed, %d left",
+                self.t,
+                flight.name,
+                site.name,
+                before - site.units,
+                site.units,
+            )
 
     async def _strike(self, flight: SimGroup, target: SimGroup) -> None:
         flight.resolved = True
@@ -584,9 +671,15 @@ class FakeDCS:
         if self.t < self.cfg.observer_hold:
             return self.cfg.observer_from
         if self.cfg.chase:
-            for group in self.groups.values():
-                if group.alive and group.category in _AIR_CATEGORIES and group.coalition == "blue":
-                    return (group.pos[0], group.pos[2])
+            # Blue's strike flight if there is one, since that is what the
+            # scripted outcome resolves; its SEAD element flies the same
+            # track two minutes ahead and is chased only when it is alone.
+            blue = [
+                group for group in self.groups.values()
+                if group.alive and group.category in _AIR_CATEGORIES and group.coalition == "blue"
+            ]
+            for group in sorted(blue, key=lambda g: g.tasking.get("kind") != "strike"):
+                return (group.pos[0], group.pos[2])
         return self.cfg.observer_to
 
     def _move_observer(self, dt: float) -> None:
@@ -794,6 +887,7 @@ class FakeDCS:
             "sent": dict(sorted(self.sent.items())),
             "received": dict(sorted(self.received.items())),
             "outcomes": self.outcomes,
+            "sead_outcomes": self.sead_outcomes,
             "messages": self.messages,
             "restarted": self.restarted,
             "live_groups": {
@@ -865,6 +959,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
     p.add_argument("--target-pk", type=float, default=1.0)
     p.add_argument("--flight-losses", type=int, default=1,
                    help="airframes the package loses over the target")
+    p.add_argument("--sead-kills", type=int, default=0,
+                   help="units a SEAD element destroys on each named site it reaches")
+    p.add_argument("--sead-range", type=float, default=25_000.0,
+                   help="ground range at which a SEAD element engages a named site")
     p.add_argument("--dead-linger", type=int, default=1,
                    help="snapshots a destroyed group still appears in before DCS forgets it")
     p.add_argument("--spawn-timeout", type=float, default=900.0)
@@ -904,6 +1002,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         target_outcome=args.target_outcome,
         target_pk=args.target_pk,
         flight_losses=args.flight_losses,
+        sead_kills=args.sead_kills,
+        sead_range=args.sead_range,
         dead_linger=args.dead_linger,
         spawn_timeout=args.spawn_timeout,
         summary=args.summary,

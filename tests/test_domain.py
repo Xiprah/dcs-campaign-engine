@@ -54,7 +54,7 @@ from campaign.planner import (
     ENROUTE,
     OPEN_STATES,
     build_package,
-    package_position,
+    element_position,
     select_target,
 )
 from campaign.protocol import (
@@ -107,6 +107,12 @@ class Damage:
     event: str | None = None
     initiator: str | None = None
     weapon: str | None = None
+    #: The spawn's `tasking.kind` and coalition, when the category alone
+    #: does not say which group is meant. A package is several flights now
+    #: (docs/design.md, section 5), and blue's SEAD element is in the bubble
+    #: before its strike: "the first plane" is no longer the strike flight.
+    kind: str | None = None
+    coalition: str | None = None
 
 
 @dataclass
@@ -116,6 +122,8 @@ class _LiveGroup:
     units: int
     units_initial: int
     alive: bool = True
+    kind: str | None = None
+    coalition: str | None = None
 
 
 @dataclass
@@ -168,6 +176,8 @@ class FakeDCS:
             category=frame.category,
             units=units,
             units_initial=units,
+            kind=frame.tasking.get("kind"),
+            coalition=frame.coalition,
         )
         self.pump(
             self.campaign.on_ack(
@@ -234,10 +244,15 @@ class FakeDCS:
             )
         )
 
-    def _group_of(self, category: str) -> _LiveGroup | None:
+    def _group_of(self, damage: Damage) -> _LiveGroup | None:
         for group in self.groups.values():
-            if group.category == category:
-                return group
+            if group.category != damage.category:
+                continue
+            if damage.kind is not None and group.kind != damage.kind:
+                continue
+            if damage.coalition is not None and group.coalition != damage.coalition:
+                continue
+            return group
         return None
 
     def _apply_damage(self, t: int) -> None:
@@ -245,7 +260,7 @@ class FakeDCS:
             if damage.t != t:
                 continue
             self.applied.add(id(damage))
-            group = self._group_of(damage.category)
+            group = self._group_of(damage)
             assert group is not None, (
                 f"scripted damage at t={t} has no {damage.category} instantiated; "
                 f"the scenario drifted and the test would be measuring nothing"
@@ -364,12 +379,12 @@ SCENARIO: list[Damage] = [
            initiator="cmp_0002", weapon="GBU-38"),
     # More damage, and DCS reports nothing at all about it.
     Damage(t=1560, category="structure", remove=1),
-    # A jet shot down, explained.
+    # A jet of blue's strike flight shot down, explained.
     Damage(t=1800, category="plane", remove=1, event="kill",
-           initiator="sam:kub_01", weapon="9M38"),
+           initiator="sam:kub_01", weapon="9M38", kind="strike", coalition="blue"),
     # The rest of the flight simply stops being reported. No event, no dead
     # snapshot, nothing. The engine must still write the loss down.
-    Damage(t=1920, category="plane", vanish=True),
+    Damage(t=1920, category="plane", vanish=True, kind="strike", coalition="blue"),
 ]
 
 SCENARIO_DURATION = 2700
@@ -597,7 +612,7 @@ class TestInventoryConservation(unittest.TestCase):
                 (
                     f
                     for f in frames
-                    if isinstance(f, Spawn) and f.spawn_id == package.spawn_id
+                    if isinstance(f, Spawn) and f.spawn_id == package.strike.spawn_id
                 ),
                 None,
             )
@@ -615,7 +630,13 @@ class TestInventoryConservation(unittest.TestCase):
             )
         )
 
-        self.assertEqual(package.state, "aborted")
+        # The rejected flight is the strike element, and it is the one
+        # scrubbed. Its SEAD element was not refused and flies on, so the
+        # package is still open for as long as that element is -- and for
+        # no other reason.
+        self.assertEqual(package.strike.state, "aborted")
+        self.assertIsNotNone(package.sead, "no SEAD element; the split is untested")
+        self.assertEqual(package.state in OPEN_STATES, package.sead.is_open)
         self.assertEqual(sqn.airframes_available, 12)
         self.assertEqual(sqn.munitions_available["GBU-38"], 48)
         self.assert_conserved(sqn)
@@ -1041,7 +1062,7 @@ class TestReconciliation(unittest.TestCase):
                 t=99_999.0,
                 kind="kill",
                 initiator="sam:kub",
-                target=group_name(package.spawn_id),
+                target=group_name(package.strike.spawn_id),
                 weapon="9M38",
             )
         )
@@ -1091,7 +1112,7 @@ class TestSaveLoad(unittest.TestCase):
         airborne = [
             p
             for p in blue_packages(original)
-            if p.state in OPEN_STATES and p.spawn_id in original.live
+            if p.state in OPEN_STATES and p.strike.spawn_id in original.live
         ]
         self.assertEqual(
             len(airborne),
@@ -1184,7 +1205,9 @@ class TestSaveLoad(unittest.TestCase):
         campaign = Campaign()
         campaign.tick(0.0)
         issued = {t.spawn_id for t in campaign.theater.targets.values()}
-        issued |= {p.spawn_id for p in campaign.packages.values()}
+        issued |= {
+            e.spawn_id for p in campaign.packages.values() for e in p.elements
+        }
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
@@ -1236,14 +1259,15 @@ class TestCampaignLoop(unittest.TestCase):
             observer_positions=OBSERVER_AT_TARGET,
             damages=[
                 Damage(t=1500, category="plane", remove=1, event="kill",
-                       initiator="sam:kub", weapon="9M38")
+                       initiator="sam:kub", weapon="9M38", kind="strike",
+                       coalition="blue")
             ],
             deliver_events=True,
             start=0,
             duration=1560,
         )
         package = next(p for p in blue_packages(campaign) if p.state in OPEN_STATES)
-        self.assertEqual(campaign.tracker.units_alive(package.spawn_id), 1)
+        self.assertEqual(campaign.tracker.units_alive(package.strike.spawn_id), 1)
 
         campaign.on_disconnect()
         frames = campaign.on_hello(
@@ -1252,14 +1276,14 @@ class TestCampaignLoop(unittest.TestCase):
         flight = next(
             f
             for f in frames
-            if isinstance(f, Spawn) and f.spawn_id == package.spawn_id
+            if isinstance(f, Spawn) and f.spawn_id == package.strike.spawn_id
         )
         self.assertEqual(flight.units, 1)
         self.assertNotIn("units", flight.tasking)
 
-    def _flight_in_the_bubble(self, dcs: FakeDCS | None = None):
+    def _flight_in_the_bubble(self, dcs: FakeDCS | None = None, seed: int | None = None):
         """A campaign whose two-ship is airborne, healthy and instantiated."""
-        campaign = Campaign()
+        campaign = Campaign() if seed is None else Campaign(seed=seed)
         if dcs is not None:
             dcs.campaign = campaign
             dcs.connect(0.0)
@@ -1274,9 +1298,9 @@ class TestCampaignLoop(unittest.TestCase):
         )
         package = next(p for p in blue_packages(campaign) if p.state in OPEN_STATES)
         self.assertIn(
-            package.spawn_id, campaign.live, "the flight never entered the bubble"
+            package.strike.spawn_id, campaign.live, "the flight never entered the bubble"
         )
-        self.assertEqual(campaign.tracker.units_alive(package.spawn_id), 2)
+        self.assertEqual(campaign.tracker.units_alive(package.strike.spawn_id), 2)
         return campaign, package
 
     def _assert_nothing_was_lost(self, campaign: Campaign, package) -> None:
@@ -1308,7 +1332,7 @@ class TestCampaignLoop(unittest.TestCase):
             ],
             "the flight was written off despite never being observed to die",
         )
-        self.assertEqual(campaign.tracker.units_alive(package.spawn_id), 2)
+        self.assertEqual(campaign.tracker.units_alive(package.strike.spawn_id), 2)
         self.assertEqual(package.state, ENROUTE)
         squadron = campaign.inventories["blue"].squadron("vfa_incirlik_f16")
         self.assertEqual(squadron.airframes_lost, 0)
@@ -1322,7 +1346,11 @@ class TestCampaignLoop(unittest.TestCase):
         `vanished` airframes and a destroyed package.
         """
         dcs = SilentDespawnDCS(campaign=Campaign(), deliver_events=False)
-        campaign, package = self._flight_in_the_bubble(dcs)
+        # The flight leaves the bubble before its TOT, so it meets the SA-6
+        # on paper there, and the last check below is that it lost nothing
+        # at all. Seed 3 is a TOT the dice spare; the default seed was one
+        # until SEAD elements changed every seed's dice.
+        campaign, package = self._flight_in_the_bubble(dcs, seed=3)
 
         drive(
             campaign,
@@ -1334,7 +1362,7 @@ class TestCampaignLoop(unittest.TestCase):
             dcs=dcs,
         )
 
-        self.assertNotIn(package.spawn_id, campaign.live)
+        self.assertNotIn(package.strike.spawn_id, campaign.live)
         self.assertTrue(
             any(
                 isinstance(f, Despawn) and f.reason == "left_bubble"
@@ -1371,7 +1399,7 @@ class TestCampaignLoop(unittest.TestCase):
             Hello(seq=1, t=0.0, protocol=PROTOCOL_VERSION, theater="Syria")
         )
         self.assertIn(
-            package.spawn_id,
+            package.strike.spawn_id,
             {f.spawn_id for f in frames if isinstance(f, Spawn)},
             "the flight was not re-issued, so this proves nothing",
         )
@@ -1442,7 +1470,7 @@ class TestCampaignLoop(unittest.TestCase):
         """
         campaign, package = self._flight_in_the_bubble()
         event = self._event_off_the_wire(
-            initiator=140521, target=group_name(package.spawn_id), weapon="9M38"
+            initiator=140521, target=group_name(package.strike.spawn_id), weapon="9M38"
         )
         self.assertEqual(campaign.on_event(event), [])
 
@@ -1450,14 +1478,14 @@ class TestCampaignLoop(unittest.TestCase):
             GroupSnapshot(
                 spawn_id=sid,
                 alive=True,
-                units=1 if sid == package.spawn_id else campaign.tracker.units_alive(sid),
+                units=1 if sid == package.strike.spawn_id else campaign.tracker.units_alive(sid),
                 units_initial=campaign.tracker.groups[sid].units_initial,
             )
             for sid in sorted(campaign.live)
         ]
         campaign.on_state(StateReport(seq=2, t=1230.0, groups=census))
 
-        losses = campaign.tracker.losses_for(package.spawn_id)
+        losses = campaign.tracker.losses_for(package.strike.spawn_id)
         self.assertEqual(len(losses), 1, "the snapshot's loss was not recorded")
         self.assertEqual(losses[0].attribution, "kill/9M38")
 
@@ -1465,7 +1493,7 @@ class TestCampaignLoop(unittest.TestCase):
         campaign, package = self._flight_in_the_bubble()
         event = self._event_off_the_wire(initiator="sam:kub", target=140521)
         self.assertEqual(campaign.on_event(event), [])
-        self.assertEqual(campaign.tracker.hints.get(package.spawn_id, []), [])
+        self.assertEqual(campaign.tracker.hints.get(package.strike.spawn_id, []), [])
 
     def test_the_war_ends_when_the_last_target_dies(self):
         campaign = Campaign()
@@ -1508,7 +1536,7 @@ class TestCampaignLoop(unittest.TestCase):
         pkg_a = blue_packages(a)[0]
         pkg_b = blue_packages(b)[0]
         self.assertEqual(pkg_a.t_tot, pkg_b.t_tot)
-        self.assertEqual(pkg_a.spawn_id, pkg_b.spawn_id)
+        self.assertEqual(pkg_a.strike.spawn_id, pkg_b.strike.spawn_id)
         # The other half of the name. Without this the test says only that the
         # seed changes nothing, which a campaign that never consulted its RNG
         # would satisfy perfectly.
@@ -1601,10 +1629,10 @@ class TestPlanner(unittest.TestCase):
             rng=random.Random(1),
         )
         assert package is not None
-        self.assertIn(package.reservation_id, sqn.open_reservations)
+        self.assertIn(package.strike.reservation_id, sqn.open_reservations)
         self.assertEqual(sqn.airframes_available, 10)
-        self.assertLess(package.t_takeoff, package.t_tot)
-        self.assertLess(package.t_tot, package.t_rtb)
+        self.assertLess(package.strike.t_takeoff, package.strike.t_tot)
+        self.assertLess(package.strike.t_tot, package.strike.t_rtb)
 
     def test_the_paper_track_is_a_pure_function_of_time(self):
         theater = build_slice_theater()
@@ -1621,12 +1649,13 @@ class TestPlanner(unittest.TestCase):
             rng=random.Random(1),
         )
         assert package is not None
+        strike = package.strike
 
-        self.assertEqual(package_position(package, base, target, 0.0), base.pos)
-        at_tot = package_position(package, base, target, package.t_tot)
+        self.assertEqual(element_position(strike, base, target, 0.0), base.pos)
+        at_tot = element_position(strike, base, target, strike.t_tot)
         self.assertLess(ground_distance(at_tot, target.pos), 1.0)
         self.assertEqual(
-            package_position(package, base, target, package.t_rtb + 1.0), base.pos
+            element_position(strike, base, target, strike.t_rtb + 1.0), base.pos
         )
 
         # The interior of the track, not just its endpoints. Without this the
@@ -1634,18 +1663,18 @@ class TestPlanner(unittest.TestCase):
         # nothing notices -- and the bubble would then instantiate a two-ship
         # over its target twenty minutes before its TOT.
         leg = ground_distance(base.pos, target.pos)
-        midpoint = (package.t_takeoff + package.t_tot) / 2.0
-        at_mid = package_position(package, base, target, midpoint)
+        midpoint = (strike.t_takeoff + strike.t_tot) / 2.0
+        at_mid = element_position(strike, base, target, midpoint)
         self.assertAlmostEqual(ground_distance(base.pos, at_mid) / leg, 0.5, places=2)
         self.assertAlmostEqual(ground_distance(at_mid, target.pos) / leg, 0.5, places=2)
 
         # And it closes on the target monotonically, rather than merely passing
         # through the halfway point on its way somewhere else.
-        span = package.t_tot - package.t_takeoff
+        span = strike.t_tot - strike.t_takeoff
         ranges = [
             ground_distance(
-                package_position(
-                    package, base, target, package.t_takeoff + span * n / 10.0
+                element_position(
+                    strike, base, target, strike.t_takeoff + span * n / 10.0
                 ),
                 target.pos,
             )
@@ -1655,15 +1684,15 @@ class TestPlanner(unittest.TestCase):
         self.assertAlmostEqual(ranges[0] / leg, 1.0, places=2)
 
         # The egress leg is the same story in reverse.
-        egress = (package.t_tot + package.t_rtb) / 2.0
-        at_egress = package_position(package, base, target, egress)
+        egress = (strike.t_tot + strike.t_rtb) / 2.0
+        at_egress = element_position(strike, base, target, egress)
         self.assertAlmostEqual(
             ground_distance(target.pos, at_egress) / leg, 0.5, places=2
         )
         self.assertGreater(
             ground_distance(at_egress, target.pos),
             ground_distance(
-                package_position(package, base, target, package.t_tot + 1.0), target.pos
+                element_position(strike, base, target, strike.t_tot + 1.0), target.pos
             ),
         )
 

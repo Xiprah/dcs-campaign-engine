@@ -180,13 +180,14 @@ class ThreatSite:
     """An air-defence site: something that shoots at aircraft flying past it.
 
     Deliberately not a :class:`Target`. A strategic target is what a strike is
-    *for*; a threat site is what a strike has to *survive*, and killing one is
-    DEAD work planned for its own sake (docs/design.md, section 5). Kept in a
-    separate collection so `planner.select_target` cannot pick one by accident.
+    *for*; a threat site is what a strike has to *survive*, and killing one for
+    its own sake is DEAD work, not built. Kept in a separate collection so
+    `planner.select_target` cannot pick one by accident.
 
     Strikable and instantiable exactly like a target: it has a tracked unit
-    count, reduced by snapshots when DCS holds it, and a destroyed site stops
-    shooting. Nothing reduces it on paper yet; that is DEAD, section 5.
+    count, reduced by snapshots when DCS holds it and on paper by a SEAD
+    element's missiles when it does not (docs/design.md, section 5), and a
+    destroyed site stops shooting.
 
     TODO(threat-model): `engagement_radius` and `kill_probability` are flat
     placeholders -- one ground radius and one per-aircraft Pk for the whole

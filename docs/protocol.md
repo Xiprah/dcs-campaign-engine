@@ -202,6 +202,28 @@ is `{"kind":"air_defence"}`: it has no route and no target, and the sim's own
 AI decides what it shoots at. A `kind` the client does not recognise carries
 no task, so adding one is not a protocol change.
 
+A package's elements (docs/design.md, section 5) arrive as separate spawns,
+each with its own `spawn_id`, and the client never reasons about two at
+once. A SEAD element's tasking is
+
+```json
+{"kind":"sead","targets":["cmp_0004"],"tot":1351.0,"callsign":"VIPER SEAD"}
+```
+
+`targets` names, by DCS group name, the enemy air-defence sites the
+package's route enters, as they stand when the element is spawned; any of
+them may not be instantiated. `tot` is the element's own time over the
+target, ahead of the strike's. The client gives the group an
+`EngageTargets` task against air defences on its first waypoint and, for
+each named site that exists, an `AttackGroup` on the attack waypoint.
+
+A flight whose part in its package's time on target has already been
+resolved — one re-entering the bubble on its way home — is sent
+`{"kind":"egress","callsign":"VIPER"}`. The client does not recognise the
+kind and attaches no task: the flight flies its route home. A strike
+tasking there would have the client hang the attack on the landing waypoint
+and strike the target a second time.
+
 ### `despawn`
 Remove an entity. The engine is responsible for deciding this; the client just
 obeys. A `despawn` for an unknown `spawn_id` is a successful no-op.

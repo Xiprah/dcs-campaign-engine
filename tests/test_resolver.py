@@ -159,7 +159,10 @@ class TestNoDoubleJeopardy(unittest.TestCase):
         # raid on Incirlik, 160 km away, is resolved on paper in the same war,
         # and rightly: nothing there is instantiated.
         watched = {campaign.theater.targets[DEPOT].spawn_id} | {
-            p.spawn_id for p in campaign.packages.values() if p.coalition == "blue"
+            e.spawn_id
+            for p in campaign.packages.values()
+            if p.coalition == "blue"
+            for e in p.elements
         }
         paper = [
             loss

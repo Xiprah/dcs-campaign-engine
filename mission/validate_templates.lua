@@ -204,12 +204,33 @@ local SPEC = {
             probe_category = "ground",
             probe_country = "USA",
         },
+        -- Blue's SEAD element: the F-16 under the group task "SEAD", which
+        -- the strike template's "Ground Attack" is not.
+        ["F-16C_sead_harm"] = {
+            unit_type = "F-16C_50",
+            count = 2,
+            task = "SEAD",
+            skill = "High",
+            payload = DEFAULT_PAYLOAD,
+            probe_category = "plane",
+        },
+        -- Red's SEAD element, probed for RUSSIA like red's strike.
+        ["Su-24M_sead_kh58"] = {
+            unit_type = "Su-24M",
+            count = 2,
+            task = "SEAD",
+            skill = "High",
+            payload = SU24M_PAYLOAD,
+            probe_category = "plane",
+            probe_country = "RUSSIA",
+        },
     },
 
     --- Iterated in this order so a run is reproducible.
     template_order = {"F-16C_strike_jdam", "F-16C_cap", "fuel_depot_medium",
                       "SA-6_Kub_site", "Su-24M_strike_fab",
-                      "munitions_storage_medium", "Patriot_site"},
+                      "munitions_storage_medium", "Patriot_site",
+                      "F-16C_sead_harm", "Su-24M_sead_kh58"},
 
     --- campaign_client.lua: dcs_maps().country
     country = {
@@ -242,7 +263,12 @@ local SPEC = {
     alt_types = {"BARO", "RADIO"},
 
     --- Group-level task strings the client can put on a group table.
-    group_tasks = {"Ground Attack", "CAP", "Nothing"},
+    group_tasks = {"Ground Attack", "CAP", "SEAD", "Nothing"},
+
+    --- campaign_client.lua: SEAD_TARGET_TYPES, the attribute names in the
+    --- EngageTargets task a SEAD element gets on its first waypoint.
+    --- Exported by the client, so `cross_check` compares the two.
+    sead_target_types = {"Air Defence"},
 
     --- Static type/category pairs. The first is the client's; the rest are
     --- alternatives to fall back to when it turns out to be rejected.
@@ -265,6 +291,10 @@ local DEFAULT_CLSIDS = {
     {clsid = "{GBU-31}", pylon = 3, label = "GBU-31 JDAM (candidate)"},
     {clsid = "{GBU-12}", pylon = 3, label = "GBU-12 (candidate)"},
     {clsid = "{Mk-82}", pylon = 3, label = "Mk-82 (candidate)"},
+    -- What the SEAD element should carry. A guess like the rest: copy the
+    -- real one out of a mission-editor export before trusting a miss.
+    {clsid = "{B06DD79A-F21E-4EB9-BD9D-AB3844618C93}", pylon = 3,
+     label = "AGM-88C HARM (candidate)"},
 }
 
 -- ------------------------------------------------------------------
@@ -540,7 +570,21 @@ local function bombing_task(x, y)
     }
 end
 
---- campaign_client.lua: attach_tasking, the AttackGroup branch
+--- campaign_client.lua: engage_sead_task, on a SEAD element's first waypoint
+local function engage_sead_task()
+    local types = {}
+    for i = 1, #SPEC.sead_target_types do types[i] = SPEC.sead_target_types[i] end
+    return {
+        number = 1,
+        auto = false,
+        id = "EngageTargets",
+        enabled = true,
+        params = {targetTypes = types, priority = 0},
+    }
+end
+
+--- campaign_client.lua: attack_group_task, which attach_tasking gives a
+--- strike and attach_sead a SEAD element
 local function attack_group_task(group_id)
     return {
         number = 1,
@@ -1104,6 +1148,100 @@ local function build_cases()
         end,
     })
 
+    -- The two tasks the client gives a SEAD element, under the group task
+    -- the SEAD template carries. DCS can take a task table and still refuse
+    -- it for a group whose main task does not allow it, so the group task
+    -- here is the template's, not "Nothing".
+    local sead = SPEC.templates["F-16C_sead_harm"]
+    add({
+        id = "task.EngageTargets_SEAD",
+        kind = "group",
+        required = true,
+        label = "ComboTask carrying an EngageTargets task against '"
+                .. table.concat(SPEC.sead_target_types, "', '")
+                .. "' under group task '" .. tostring(sead.task) .. "'",
+        attempt = function(case, index)
+            local rec = new_case_record(case)
+            local cid, cat = country_id("USA"), group_category("AIRPLANE")
+            if cid == nil or cat == nil then
+                rec.status = "SKIP"
+                rec.error = "country or Group.Category unavailable"
+                return rec
+            end
+            local x, y = case_position(index)
+            return try_group(rec, {data = build_group_data({
+                name = NAME_PREFIX .. "task_engage_sead",
+                unit_type = sead.unit_type,
+                count = 1,
+                task = sead.task,
+                tasks = {engage_sead_task()},
+                x = x, y = y, alt = CONFIG.altitude,
+            })}, cid, cat)
+        end,
+    })
+
+    add({
+        id = "task.AttackGroup_SEAD",
+        kind = "group",
+        required = true,
+        label = "ComboTask carrying an AttackGroup task against a live SA-6 "
+                .. "site under group task '" .. tostring(sead.task) .. "'",
+        attempt = function(case, index)
+            local rec = new_case_record(case)
+            local cid = country_id("USA")
+            local red = country_id("RUSSIA")
+            local plane = group_category("AIRPLANE")
+            local ground = group_category("GROUND")
+            if cid == nil or red == nil or plane == nil or ground == nil then
+                rec.status = "SKIP"
+                rec.error = "country or Group.Category unavailable"
+                return rec
+            end
+
+            local x, y = case_position(index)
+            -- What a SEAD element is sent after: an air-defence ground
+            -- group, built as the SA-6 template is. It needs land, as every
+            -- ground case does.
+            local site = SPEC.templates["SA-6_Kub_site"]
+            local victim_name = NAME_PREFIX .. "sead_victim"
+            local made = add_group(red, ground, build_group_data({
+                name = victim_name,
+                unit_type = site.unit_type,
+                lead_type = site.lead_type,
+                count = 2,
+                task = site.task,
+                skill = site.skill,
+                ground = true,
+                x = x + 8000, y = y, alt = 0,
+            }))
+            if made then
+                rec.created[#rec.created + 1] = {kind = "group", name = victim_name}
+            end
+            local victim = live_group(victim_name)
+            if not victim then
+                rec.status = "SKIP"
+                rec.error = "could not create an air-defence group to attack"
+                return rec
+            end
+            local gid = try(victim.getID, victim)
+            rec.detail.target_group_id = gid
+            if gid == nil then
+                rec.status = "SKIP"
+                rec.error = "Group.getID returned nothing"
+                return rec
+            end
+
+            return try_group(rec, {data = build_group_data({
+                name = NAME_PREFIX .. "task_attackgroup_sead",
+                unit_type = sead.unit_type,
+                count = 1,
+                task = sead.task,
+                tasks = {attack_group_task(gid)},
+                x = x, y = y, alt = CONFIG.altitude,
+            })}, cid, plane)
+        end,
+    })
+
     -- 6. Static type/category pairs beyond the client's own.
     for i = 1, #SPEC.static_pairs do
         local pair = SPEC.static_pairs[i]
@@ -1248,6 +1386,16 @@ local function cross_check()
                     .. "mirrored template values could not be verified",
             detail = {},
         })
+        record({
+            id = "drift.sead_target_types",
+            kind = "meta",
+            required = false,
+            status = "SKIP",
+            label = "cross-check SPEC.sead_target_types against "
+                    .. "CampaignClient.SEAD_TARGET_TYPES",
+            error = "campaign_client.lua is not loaded in this mission",
+            detail = {},
+        })
         return
     end
 
@@ -1290,6 +1438,36 @@ local function cross_check()
         label = "cross-check SPEC.templates against CampaignClient.TEMPLATES",
         error = (#problems > 0) and table.concat(problems, "; ") or nil,
         detail = {mismatches = #problems},
+    })
+
+    -- The SEAD task's target attribute names: content DCS either knows or
+    -- quietly matches nothing with, so a copy that drifted would validate a
+    -- task the client no longer sends.
+    local label = "cross-check SPEC.sead_target_types against "
+                  .. "CampaignClient.SEAD_TARGET_TYPES"
+    local theirs = client.SEAD_TARGET_TYPES
+    local mine = SPEC.sead_target_types
+    local why = nil
+    if type(theirs) ~= "table" then
+        why = "the client does not export SEAD_TARGET_TYPES"
+    else
+        local same = #mine == #theirs
+        for i = 1, math.max(#mine, #theirs) do
+            if mine[i] ~= theirs[i] then same = false end
+        end
+        if not same then
+            why = "validator {" .. table.concat(mine, ", ") .. "} vs client {"
+                  .. table.concat(theirs, ", ") .. "}"
+        end
+    end
+    record({
+        id = "drift.sead_target_types",
+        kind = "meta",
+        required = true,
+        status = why and "DRIFT" or "OK",
+        label = label,
+        error = why,
+        detail = {},
     })
 end
 

@@ -111,7 +111,9 @@ offline, blue cannot lose a war it is not watching.
 A **threat site** is an air-defence entity: strikable, instantiable in the
 bubble like any other entity, with an engagement radius and a per-aircraft
 kill probability. Threat sites are kept apart from strategic targets, so the
-strike planner does not pick them; destroying them is DEAD work (section 5).
+strike planner does not pick them. Destroying them for their own sake is DEAD
+work, not built; a SEAD element's missiles can take units off one on the way
+(section 5).
 
 **Paper exposure.** At a package's TOT, for each flight *not* instantiated,
 every live enemy threat site whose engagement radius the route enters rolls
@@ -217,7 +219,10 @@ fragged, and what it achieves is recorded, but the result is already fixed.
 It is not recalled because the two regimes could not recall it alike: the
 protocol has no re-tasking frame, so a flight DCS is holding keeps its attack
 task whatever the engine decides, and a recall that worked only on paper
-would make the watched and unwatched wars obey different rules.
+would make the watched and unwatched wars obey different rules. Since
+packages became sets of elements (section 5) this is decided element by
+element, for the same reason: a SEAD element already in the air flies out
+its sortie while the strike still on the ramp behind it is stood down.
 
 A side whose enemy never held a strategic target is not at war with anyone
 the map can express. It plans nothing and, if humans fly it, is told so once.
@@ -243,9 +248,183 @@ ahead of the strikers. On paper, it rolls first: suppression cuts the site's
 kill probability for the strike element, and its missiles may destroy site
 units outright. Observed, it is tasked in DCS and the sim decides.
 
+**Elements.** Each element has its own spawn id, its own reservation
+(`<package>-<role>`), its own schedule and its own state, and is tracked on
+its own under its package's id: the ledger names the package, the spawn id
+names the element. The strike element's spawn id is issued first and a
+supporting element's only if one is attached, so a package without one draws
+exactly the ids, and the dice, the one-flight package did; a test holds
+eleven recorded pre-SEAD wars to that, frame for frame. A package is open
+while any element is. When none is, it is complete if any element came home,
+destroyed if none did and one was lost, and aborted if every one was scrubbed
+or stood down. Each side still holds one open package at a time, so a
+package whose strike element is lost stays open until its SEAD element is
+home.
+
+**When one is attached.** At planning the planner is shown the enemy sites
+whose envelopes the base-to-target leg enters (`Theater.live_threats_along`,
+the enemy being the planning side's, never `player_coalition`'s). It attaches
+a SEAD two-ship, two missiles an aircraft, when there are any and a squadron
+at the same base holds that many anti-radiation munitions
+(`oob.ANTI_RADIATION_MUNITIONS`). The same base, because the two elements
+share one paper track. A squadron that carries only anti-radiation missiles
+never flies a strike, and a side whose SEAD squadron has run dry sends its
+strikes alone. Attaching throws no dice.
+
+**Content: red gets anti-radiation missiles.** Each side has a SEAD squadron
+at its one base: F-16Cs with AGM-88C at Incirlik, Su-24Ms with Kh-58U at
+Bassel al-Assad, eight airframes and twenty-four missiles each. The Su-24M
+really does carry the Kh-58U, and giving blue SEAD and red none would tilt
+the war by content nobody has measured, which section 4 already refused to do
+with the strike squadrons.
+
+**The lead is 120 seconds** (`planner.SEAD_LEAD`), on the same track: the SEAD
+element's takeoff, time over the target and recovery are the strike's less
+120 s. At the paper track's ground speed of about 140 m/s that is 17 km.
+Blue's strikers cross into the SA-6's 20 km envelope 310 s before their TOT,
+when the SEAD element ahead of them is abeam the battery, 293 s out, as close
+as it gets and with the shortest shot it has. Red's route runs 394 s inside
+the Patriot's larger envelope, and the same lead puts its SEAD element 17 km
+into it before the strikers. Much more and the SEAD element is off the target
+and turning for home while the strikers are still inbound; much less and the
+two are one formation that each envelope meets at once. It is a constant,
+not derived from each route's geometry, because on paper exposure is one
+event at the TOT (section 3) and the lead does not enter that arithmetic: it
+decides where the SEAD element is on its paper track, which is when the
+bubble holds it and where DCS flies it.
+
+**The paper order.** Everything is resolved once, at the package's TOT, in
+this order:
+
+1. the SEAD element flies its exposure, at the sites' full kill probability,
+   because it goes in first;
+2. its survivors' missiles are rolled against the sites, shared round-robin
+   in site-id order, each removing a unit at `resolver.ARM_PK` (0.25),
+   through the tracker like any paper loss;
+3. every surviving SEAD aircraft halves the kill probability of each site it
+   engaged, compounding (`resolver.SEAD_SUPPRESSION_PER_AIRCRAFT`), so a SEAD
+   element that lost a jet only half does its job;
+4. the strike element flies its exposure against the sites still standing,
+   at those probabilities: a site the missiles destroyed does not fire;
+5. the strike element's survivors release.
+
+Each element's survivors expend what they carried, there, whoever held what:
+expenditure is the engine's own fact. `resolve_exposure` rolls the
+probabilities it is given, so suppression changes its inputs and nothing
+downstream.
+
+**Dice.** Each step draws a number of dice fixed by the state it starts from,
+and the dice thrown within a step never change how many it throws: every
+missile is rolled though the first one destroyed the site, every aircraft is
+rolled against every site though it is already dead. What an earlier step did
+is part of the state a later one starts from: an aircraft shot down fires
+nothing, and a site destroyed throws nothing at the strikers. That is how the
+one-flight package already rolled its bombs (survivors times two), and it is
+kept. The stronger form, a TOT whose total draws ignore what happened within
+it, would change the one-flight package's dice.
+
+**Mixed authority.** Section 1 holds per entity, at the TOT: an element DCS
+is holding is never flown through the sites on paper, and a site DCS is
+holding loses units only to snapshots. What SEAD does on paper is therefore
+bounded by the rule this section adds:
+
+> A SEAD element has a paper effect on a site — missiles rolled at it, and
+> suppression of it for the strike element — only when the SEAD element and
+> the site are both outside DCS at the TOT, **and** DCS never held the two at
+> the same time before it.
+
+| at the TOT | SEAD exposure | missiles at the site | strike's kill probability |
+|---|---|---|---|
+| SEAD paper, site paper, never shared the sim | rolled | rolled | suppressed |
+| SEAD paper, site paper, shared the sim earlier | rolled | none | full |
+| SEAD paper, site held | rolled | none | full |
+| SEAD held, site either | not rolled | none | full |
+
+and independently of the table the strike element is rolled only if DCS is
+not holding it. The cases the rule settles:
+
+* *SEAD observed, strike not.* The sim decides what the SEAD element did,
+  and a snapshot can carry only site units destroyed, never suppression. So
+  no suppression is inferred: the unwatched strikers meet the site at its
+  full kill probability, less whatever the snapshots destroyed (a site
+  destroyed outright fires at nobody). Crediting suppression as well would
+  count one sortie's effect twice, or credit an effect no authority
+  observed. It errs against the players on the rare edge of the bubble
+  where the two elements, 17 km apart, are held differently.
+* *Strike observed, SEAD not.* The SEAD element flies its exposure on paper
+  and its missiles are rolled at any site DCS is not holding; the strike's
+  exposure is the sim's, so suppression has nothing to act on.
+* *A site DCS holds* loses units only to snapshots: paper missiles cannot
+  take one (the tracker refuses), and a paper SEAD element cannot have shut
+  down a radar that is being simulated.
+* *Shared sim time.* The client tasks a SEAD element to engage any air
+  defence it meets along its route, not at a waypoint, so a SEAD element DCS
+  held at the same time as a site had its chance to fire at it, and what it
+  did came back by snapshot. If both then leave the bubble before the TOT,
+  firing the same missiles on paper would resolve them twice. The engine
+  records the contact (`Element.sim_contact`) whenever the client
+  acknowledges a spawn, which is the only moment two entities can begin to
+  be held together, so no stretch of shared time is missed and a replay
+  records the same contact. A strike element has no such rule: its attack
+  hangs on the waypoint it reaches at its TOT, so the sim resolves its bombs
+  only if it holds the strike then.
+* *After the TOT.* An element whose part in the TOT is resolved is spawned
+  with the tasking `{"kind": "egress"}`, which carries no task. Without it a
+  flight that re-entered the bubble on the way home was tasked to attack
+  again — the client hangs the attack on the last waypoint when there is no
+  attack waypoint left — and a strike resolved on paper bombed the same
+  target a second time in DCS. That was true of the one-flight package too,
+  and is the one change made to it on purpose: its frames now differ from
+  the recorded ones in those spawns' tasking and nowhere else.
+
+Section 3's caveat carries over per element: one held for part of its route
+but not at the TOT is rolled for the whole route. It cannot lose an aircraft
+twice, because the roll is of the aircraft still alive.
+
+**Failing independently.** A SEAD element shot down, on paper or by
+snapshot, suppresses nothing and the strike flies on at the full kill
+probability. A spawn the client refuses scrubs that element only. At the end
+of the war each element still on the ramp is stood down, and each in the air
+flies out (section 4).
+
+**Observed.** The SEAD templates fly under DCS's group task `SEAD`. The
+client puts an `EngageTargets` task for `"Air Defence"` on the first
+waypoint, active for the whole route, and an `AttackGroup` on the attack
+waypoint against each fragged site that exists in the sim when the element
+spawns. What it achieves the engine learns only from snapshots. The pylons
+are as empty as the strike's (README), so until a mission-editor export
+fills them these jets carry no missiles in DCS and suppress nothing there.
+
+**What it buys, at the placeholder numbers.** Over each side's first sortie
+on seeds 0 to 399, the only situation both configurations fly identically,
+blue's strike elements lost 37 aircraft escorted and 106 alone, red's 41 and
+111: about 0.10 a sortie against 0.27. The SEAD elements themselves lost 130
+and 111, flying into the same sites at full kill probability first, so a
+package loses more aircraft in total escorted than not. Over whole wars
+(seeds 0 to 99, a day each) strike losses per sortie fall from 0.30 to 0.09
+for blue and from 0.33 to 0.13 for red, and the wars are shorter. Red wins
+67 of them against 56 without SEAD. Part of that is a race the symmetric
+content does not remove: escorted strikes finish a target on the second
+sortie more often, for both sides, and red's second TOT falls 52 s before
+blue's. In 14 of red's 39 wins at that moment blue's strike, already
+airborne, flattened the depot 52 s later (9 of 28 without SEAD). None of
+those numbers was tuned: the missile and suppression values were set before
+any war was flown and are as uncalibrated as the kill probabilities they
+cut.
+`tests/test_sead.py` holds only the claim that escorted strikers lose fewer.
+
 Rejected: modelling SEAD as a bonus on the strike flight. The point of a
 package is that its parts can fail independently — the SEAD element can be
 shot down, arrive late, or run dry — and a bonus cannot.
+
+Rejected: inferring suppression from a watched SEAD element's survivors. The
+snapshot says it is alive, not that it fired or where; and a site it could
+not reach in the sim was never suppressed by anybody.
+
+Rejected: resolving the SEAD element at its own arrival, 120 s before the
+package's TOT. The suppression it buys must be settled by the strike's
+exposure; resolving the two at different instants would let each be judged
+by a different picture of who held what, and carry state between them.
 
 ## Out of scope, deliberately
 

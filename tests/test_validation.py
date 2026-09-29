@@ -81,6 +81,15 @@ EXPECTED_IDS = {
     "task.Bombing",
     "task.AttackGroup",
     "pylon.baseline_empty",
+    # SEAD elements (docs/design.md, section 5): both sides' templates, the
+    # group task they fly under, the two tasks the client gives them, and
+    # the cross-check on the attribute names their search task names.
+    "template.F-16C_sead_harm",
+    "template.Su-24M_sead_kh58",
+    "grouptask.SEAD",
+    "task.EngageTargets_SEAD",
+    "task.AttackGroup_SEAD",
+    "drift.sead_target_types",
 }
 
 
@@ -338,6 +347,57 @@ class TestTheValidatorRuns(unittest.TestCase):
         self.assertEqual([u["type"] for u in units], ["Su-24M", "Su-24M"])
         self.assertTrue(all(u["payload"]["fuel"] == 11700 for u in units))
         self.assertEqual(call["data"]["task"], "Ground Attack")
+
+    def test_the_sead_templates_are_probed_as_the_client_builds_them(self):
+        """Each side's, for its own country, under the group task "SEAD"."""
+        g = self.runner.mock.lua.globals()
+        for key, country, unit_type, fuel in (
+            ("F-16C_sead_harm", g.country.id.USA, "F-16C_50", 3249),
+            ("Su-24M_sead_kh58", g.country.id.RUSSIA, "Su-24M", 11700),
+        ):
+            with self.subTest(template=key):
+                case = self.by_id[f"template.{key}"]
+                self.assertEqual(case["status"], "OK")
+                self.assertEqual(case["detail"]["units"], 2)
+                call = self._call(f"cmpval_{key}")
+                self.assertEqual(call["country"], country)
+                self.assertEqual(call["category"], g.Group.Category.AIRPLANE)
+                self.assertEqual(call["data"]["task"], "SEAD")
+                units = call["data"]["units"]
+                self.assertEqual([u["type"] for u in units], [unit_type, unit_type])
+                self.assertTrue(all(u["payload"]["fuel"] == fuel for u in units))
+
+    @staticmethod
+    def _first_task(call: dict) -> dict:
+        """The one task on waypoint 1 of a spawn call, as the probe built it."""
+        (point,) = call["data"]["route"]["points"]
+        (task,) = point["task"]["params"]["tasks"]
+        return task
+
+    def test_the_sead_tasks_are_probed_as_the_client_composes_them(self):
+        g = self.runner.mock.lua.globals()
+        engage = self._call("cmpval_task_engage_sead")
+        self.assertEqual(engage["data"]["task"], "SEAD")
+        task = self._first_task(engage)
+        self.assertEqual(task["id"], "EngageTargets")
+        self.assertEqual(list(task["params"]["targetTypes"]), ["Air Defence"])
+        self.assertEqual(task["params"]["priority"], 0)
+
+        victim = self._call("cmpval_sead_victim")
+        self.assertEqual(victim["country"], g.country.id.RUSSIA)
+        self.assertEqual(victim["category"], g.Group.Category.GROUND)
+        self.assertEqual(
+            [u["type"] for u in victim["data"]["units"]], ["Kub 1S91 str", "Kub 2P25 ln"]
+        )
+        attacker = self._call("cmpval_task_attackgroup_sead")
+        self.assertEqual(attacker["data"]["task"], "SEAD")
+        task = self._first_task(attacker)
+        self.assertEqual(task["id"], "AttackGroup")
+        self.assertEqual(
+            task["params"]["groupId"], self.by_id["task.AttackGroup_SEAD"]["detail"]["target_group_id"]
+        )
+        for case in ("task.EngageTargets_SEAD", "task.AttackGroup_SEAD", "grouptask.SEAD"):
+            self.assertEqual(self.by_id[case]["status"], "OK", case)
 
     def test_the_blue_static_target_is_probed_for_usa(self):
         """The depot is probed for RUSSIA; blue's storage area must not be."""
@@ -663,9 +723,27 @@ class TestItValidatesWhatTheClientActuallyUses(unittest.TestCase):
         run = ValidatorRun()
         self.addCleanup(run.close)
         by_id = {r["id"]: r for r in run.run_now()["results"]}
-        drift = by_id["drift.templates"]
-        self.assertEqual(drift["status"], "SKIP")
-        self.assertFalse(drift["required"])
+        for case in ("drift.templates", "drift.sead_target_types"):
+            drift = by_id[case]
+            self.assertEqual(drift["status"], "SKIP", case)
+            self.assertFalse(drift["required"], case)
+
+    def test_the_sead_target_types_match_the_clients_own(self):
+        run = ValidatorRun(with_client=True)
+        self.addCleanup(run.close)
+        drift = {r["id"]: r for r in run.run_now()["results"]}["drift.sead_target_types"]
+        self.assertEqual(drift["status"], "OK", drift["error"])
+        self.assertTrue(drift["required"])
+
+    def test_sead_target_types_changed_in_the_client_are_reported_as_drift(self):
+        run = ValidatorRun(with_client=True, autoload=False)
+        self.addCleanup(run.close)
+        run.mock.lua.globals().CampaignClient.SEAD_TARGET_TYPES[1] = "SAM SR"
+        run.load()
+        drift = {r["id"]: r for r in run.run_now()["results"]}["drift.sead_target_types"]
+        self.assertEqual(drift["status"], "DRIFT")
+        self.assertTrue(drift["required"])
+        self.assertIn("SAM SR", drift["error"])
 
     def test_the_validator_needs_no_client_and_no_engine(self):
         # It loaded and ran in every test above with no campaign_client.lua

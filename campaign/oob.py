@@ -20,6 +20,13 @@ from typing import Any
 
 from campaign.protocol import Coalition
 
+#: Munitions that home on an emitting radar. What the planner looks for when
+#: it wants a SEAD element (docs/design.md, section 5), and what it will not
+#: hang on a strike: an anti-radiation missile has nothing to guide on at a
+#: fuel depot. Content, like the stock itself: a side whose squadrons carry
+#: none of these simply never flies SEAD.
+ANTI_RADIATION_MUNITIONS = frozenset({"AGM-88C", "Kh-58U"})
+
 
 class InsufficientInventory(Exception):
     """A reservation was asked for that the squadron cannot cover."""
@@ -323,16 +330,26 @@ class SideInventory:
 
 
 def build_slice_oob() -> tuple[SideInventory, SideInventory]:
-    """One strike squadron a side: F-16Cs at Incirlik, Su-24Ms at Bassel al-Assad.
+    """A strike squadron and a SEAD squadron a side, at each side's one base.
 
-    The two are the same size with the same stock on purpose. Red plans under
-    exactly blue's rules (docs/design.md, section 4), and an inventory tilted
-    either way would decide the war before the rules got a say. Each side's
-    air defences are `theater.ThreatSite`s on the map rather than inventory;
-    planning around them is section 5.
+    F-16Cs at Incirlik and Su-24Ms at Bassel al-Assad, the same size with the
+    same stock on purpose. Red plans under exactly blue's rules
+    (docs/design.md, section 4), and an inventory tilted either way would
+    decide the war before the rules got a say. Each side's air defences are
+    `theater.ThreatSite`s on the map rather than inventory.
 
-    TODO(seam): fighters, escorts and a second squadron per side hang off
-    this, along with the multi-package deconfliction that would task them.
+    Red gets anti-radiation missiles as blue does, for the same reason. The
+    Su-24M really does carry the Kh-58U, and giving blue SEAD and red none
+    would tilt the war by content nobody has measured. Each SEAD squadron is
+    its own unit with its own template, because a SEAD element is its own
+    flight (section 5): the strike squadron's jets are loaded for bombs.
+
+    The strike squadron is declared first at each base, and must stay so:
+    the planner takes the first squadron that can cover a strike, and a
+    squadron carrying only anti-radiation missiles never can.
+
+    TODO(seam): fighters, escorts and further squadrons hang off this, along
+    with the multi-package deconfliction that would task them.
     """
     blue = SideInventory(coalition="blue")
     blue.add(
@@ -364,6 +381,39 @@ def build_slice_oob() -> tuple[SideInventory, SideInventory]:
             airframes_available=12,
             munitions_total={"FAB-500": 48},
             munitions_available={"FAB-500": 48},
+        )
+    )
+    # Smaller than the strike squadrons: eight airframes and twenty-four
+    # missiles, six two-ship sorties at two missiles an aircraft. Enough to
+    # escort a war the slice usually decides in two or three sorties a side,
+    # few enough that a long one runs dry and its later strikes go in alone.
+    # Invented, like the rest.
+    blue.add(
+        Squadron(
+            id="vfa_incirlik_f16_sead",
+            name="Incirlik SEAD detachment",
+            coalition="blue",
+            airframe="F-16C_50",
+            template="F-16C_sead_harm",
+            home_base="incirlik",
+            airframes_total=8,
+            airframes_available=8,
+            munitions_total={"AGM-88C": 24},
+            munitions_available={"AGM-88C": 24},
+        )
+    )
+    red.add(
+        Squadron(
+            id="red_bassel_su24_sead",
+            name="Hmeimim Su-24M SEAD detachment",
+            coalition="red",
+            airframe="Su-24M",
+            template="Su-24M_sead_kh58",
+            home_base="bassel_al_assad",
+            airframes_total=8,
+            airframes_available=8,
+            munitions_total={"Kh-58U": 24},
+            munitions_available={"Kh-58U": 24},
         )
     )
     return blue, red

@@ -7,8 +7,9 @@ battery's `Patriot str` radar and `Patriot ln` launchers under a
 `Ground Nothing` group task, the static type/category pairs `Tank` /
 `Fortifications` and `Warehouse` / `Warehouses`, three
 `country.id` values, the `Bombing` and
-`AttackGroup` task schemas, the waypoint `type`/`action`/`alt_type` strings,
-and a payload whose `pylons` table is empty. The offline suite is green
+`AttackGroup` task schemas, the `SEAD` group task and the `EngageTargets`
+task a SEAD element searches with, the waypoint `type`/`action`/`alt_type`
+strings, and a payload whose `pylons` table is empty. The offline suite is green
 whether or not DCS would accept any of them, because the mock in
 `tests/dcsmock/` accepts any well-formed table.
 
@@ -44,9 +45,16 @@ out one crash at a time, a week apart, in the middle of a sortie.
   and the same of the Patriot site, as a blue (`USA`) one;
 - whether each of the other templates spawns for the country the client
   spawns it for: red's Su-24M strike two-ship for `RUSSIA`, red's fuel depot
-  for `RUSSIA`, blue's munitions-storage statics for `USA`. DCS can refuse a
-  type to one country and accept it for another, so a probe filed under the
-  wrong side proves nothing;
+  for `RUSSIA`, blue's munitions-storage statics for `USA`, and each side's
+  SEAD two-ship (`F-16C_sead_harm` for `USA`, `Su-24M_sead_kh58` for
+  `RUSSIA`) under the group task `SEAD`. DCS can refuse a type to one country
+  and accept it for another, so a probe filed under the wrong side proves
+  nothing;
+- whether the two tasks the client gives a SEAD element are accepted under
+  that group task: `EngageTargets` against `"Air Defence"`
+  (`task.EngageTargets_SEAD`), and `AttackGroup` against a live SA-6-built
+  ground group (`task.AttackGroup_SEAD`). Accepted is not the same as
+  engaging, as below;
 - whether the waypoint `type`/`action` pairs, the `alt_type` strings, the
   group-level task strings, and the `Bombing` and `AttackGroup` task tables
   are accepted — including the ramp-start pair (`TakeOffParking` /
@@ -264,6 +272,9 @@ worse than no run.
   table whenever the client is loaded, field by field (`unit_type`, `count`,
   `task`, `skill`, `static`, `static_category`, `spread`, and the number of
   pylon entries), and any difference is a `DRIFT` failure;
+- the client also exports `CampaignClient.SEAD_TARGET_TYPES`, the attribute
+  names in a SEAD element's `EngageTargets` task, and `SPEC.sead_target_types`
+  is cross-checked against it the same way (`drift.sead_target_types`);
 - `tests/test_validation.py` asserts the same equality offline, so drift
   turns the test suite red rather than quietly invalidating a DCS run;
 - the country map, the group task strings, the waypoint action table, the

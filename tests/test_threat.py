@@ -42,15 +42,18 @@ from tests.test_offline import observe, run_steps, say_hello
 DEPOT = "latakia_fuel_depot"
 SA6 = "latakia_north_sa6"
 SQUADRON = "vfa_incirlik_f16"
+SEAD_SQUADRON = "vfa_incirlik_f16_sead"
 
 #: Seeds pinned against the slice's placeholder Pk, found by flying blue's
-#: first offline sortie: seed 2 gets through untouched, seed 1 loses one
-#: aircraft on the way in, seed 30 loses both. Re-pinned when red started
-#: planning: red's callsign draw and its raid's rolls now share the stream,
-#: so every seed's dice fall differently for blue than they used to.
-SEED_UNTOUCHED = 2
-SEED_ONE_LOST = 1
-SEED_BOTH_LOST = 30
+#: first offline sortie: seed 3 gets through untouched, seed 2 loses one
+#: strike aircraft on the way in and nothing else, seed 480 loses the whole
+#: package -- both SEAD jets, and then both strikers behind them. Re-pinned
+#: when red started planning, and again when SEAD elements arrived: an
+#: escorted TOT draws the SEAD element's dice before the strike's, so every
+#: seed's dice fall differently for blue than they used to.
+SEED_UNTOUCHED = 3
+SEED_ONE_LOST = 2
+SEED_BOTH_LOST = 480
 
 
 def theater_with(**site_changes: object) -> Theater:
@@ -101,6 +104,18 @@ def flight_losses(campaign: Campaign, coalition: str = "blue") -> list:
 
 def squadron(campaign: Campaign):
     return campaign.inventories["blue"].squadron(SQUADRON)
+
+
+def sead_squadron(campaign: Campaign):
+    return campaign.inventories["blue"].squadron(SEAD_SQUADRON)
+
+
+def element_losses(campaign: Campaign, role: str) -> list:
+    """Blue's aircraft losses from elements of one role (docs/design.md, 5)."""
+    spawn_ids = {
+        e.spawn_id for p in blue_packages(campaign) for e in p.elements if e.role == role
+    }
+    return [x for x in flight_losses(campaign) if x.spawn_id in spawn_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +246,7 @@ class TestPaperExposure(unittest.TestCase):
         self.assertEqual(losses[0].cause, CAUSE_UNOBSERVED)
         self.assertEqual(losses[0].attribution, ATTRIBUTION_UNOBSERVED)
         self.assertEqual(losses[0].entity_id, package.id)
-        self.assertEqual(campaign.tracker.units_alive(package.spawn_id), 1)
+        self.assertEqual(campaign.tracker.units_alive(package.strike.spawn_id), 1)
         self.assertEqual(squadron(campaign).airframes_lost, 1)
 
     def test_a_route_that_misses_every_envelope_takes_none(self):
@@ -273,7 +288,7 @@ class TestPaperExposure(unittest.TestCase):
                 return
             if not package.weapons_released:
                 seen["before"] = c.rng.getstate()
-                seen["held_at_tot"] = c.tracker.is_instantiated(package.spawn_id)
+                seen["held_at_tot"] = c.tracker.is_instantiated(package.strike.spawn_id)
             elif "after" not in seen:
                 seen["after"] = c.rng.getstate()
 
@@ -298,7 +313,13 @@ class TestPaperExposure(unittest.TestCase):
         self.assertEqual(sqn.munitions_expended.get("GBU-38", 0), 2, "the dead jet bombed")
         self.assertEqual(sqn.munitions_lost.get("GBU-38", 0), 2)
 
-        wholly = Campaign(theater=theater_with(kill_probability=1.0))
+        # Seed 3: red's first raid, which reaches Incirlik twenty seconds
+        # before blue reaches the depot, misses. The last line below asserts
+        # that no target anywhere took a loss, and it can only mean what it
+        # says -- that blue's dead jets bombed nothing -- in a war where red
+        # has not hit anything yet either. The default seed was one until
+        # SEAD elements changed red's dice.
+        wholly = Campaign(theater=theater_with(kill_probability=1.0), seed=3)
         fly_first_sortie(wholly)
         sqn = squadron(wholly)
         self.assertEqual(sqn.munitions_expended.get("GBU-38", 0), 0)
@@ -316,33 +337,53 @@ class TestPaperExposure(unittest.TestCase):
         self.assertEqual(package.coalition, "blue")
 
         self.assertEqual(package.state, DESTROYED)
-        self.assertNotIn(package.spawn_id, campaign.tracker.groups)
+        self.assertEqual(package.strike.state, DESTROYED)
+        self.assertNotIn(package.strike.spawn_id, campaign.tracker.groups)
         sqn = squadron(campaign)
-        self.assertNotIn(package.reservation_id, sqn.open_reservations)
+        self.assertNotIn(package.strike.reservation_id, sqn.open_reservations)
         self.assertEqual(sqn.airframes_lost, 2)
         sqn.check_invariant()
         self.assertIn(f"{package.callsign} is lost.", [getattr(f, "text", "") for f in frames])
+        # Its SEAD element went the same way, and closed out the same way.
+        self.assertEqual(package.sead.state, DESTROYED)
+        self.assertNotIn(package.sead.spawn_id, campaign.tracker.groups)
+        self.assertNotIn(package.sead.reservation_id, sead_squadron(campaign).open_reservations)
+        self.assertEqual(sead_squadron(campaign).airframes_lost, 2)
+        self.assertIn(
+            f"{package.name_of(package.sead)} is lost.", [getattr(f, "text", "") for f in frames]
+        )
         # And the war goes on: blue's next package is tasked in the same pulse.
         self.assertTrue([p for p in blue_packages(campaign) if p.state in OPEN_STATES])
 
     def test_conservation_holds_through_paper_flight_losses(self):
         """A deadlier site, a long war, the books checked at every step.
 
-        Seed 14, not the 5 this used to fly: red's raids now end most wars
-        within two or three blue sorties, and at seed 5 blue loses only two
-        aircraft before its war is decided -- too few to prove anything. At
-        14 the war runs to 8925 s and blue loses seven.
+        Seed 4, not the 14 this flew before SEAD, nor the 5 before red
+        planned: red's raids end most wars within two or three blue sorties,
+        and a suppressed SA-6 kills fewer strikers, so at 14 blue's strike
+        element now loses three aircraft before its war is decided -- too few
+        to prove anything. At 4 the war runs to 8925 s and it loses seven.
         """
-        campaign = Campaign(theater=theater_with(kill_probability=0.5), seed=14)
+        campaign = Campaign(theater=theater_with(kill_probability=0.5), seed=4)
         sqn = squadron(campaign)
+        sead = sead_squadron(campaign)
         for _ in range(12_000):
             campaign.advance(PAPER_STEP)
             sqn.check_invariant()
+            sead.check_invariant()
             for package in blue_packages(campaign):
-                held = package.reservation_id in sqn.open_reservations
-                self.assertEqual(held, package.state in OPEN_STATES, package.id)
+                held = package.strike.reservation_id in sqn.open_reservations
+                self.assertEqual(held, package.strike.is_open, package.id)
+                if package.sead is not None:
+                    held = package.sead.reservation_id in sead.open_reservations
+                    self.assertEqual(held, package.sead.is_open, package.id)
+                self.assertEqual(
+                    package.state in OPEN_STATES,
+                    any(e.is_open for e in package.elements),
+                    package.id,
+                )
 
-        lost = flight_losses(campaign)
+        lost = element_losses(campaign, "strike")
         self.assertGreaterEqual(len(lost), 4, "too few losses to prove anything")
         self.assertEqual(sqn.airframes_lost, len(lost))
         # Every one of them died inbound, carrying its bombs.
@@ -350,6 +391,14 @@ class TestPaperExposure(unittest.TestCase):
         self.assertEqual(
             sqn.airframes_available + sqn.airframes_lost, sqn.airframes_total,
             "an airframe is still reserved by a finished war",
+        )
+        # And the SEAD squadron answers for its own, missiles included.
+        sead_lost = element_losses(campaign, "sead")
+        self.assertEqual(sead.airframes_lost, len(sead_lost))
+        self.assertEqual(sead.munitions_lost.get("AGM-88C", 0), 2 * len(sead_lost))
+        self.assertEqual(
+            sead.airframes_available + sead.airframes_lost, sead.airframes_total,
+            "a SEAD airframe is still reserved by a finished war",
         )
 
     def test_the_audits_headline_reversed_blue_loses_aircraft_offline(self):
@@ -360,14 +409,17 @@ class TestPaperExposure(unittest.TestCase):
         until red started planning. Since then the default seed's war is won
         in two blue sorties that both slip past the SA-6 -- about an even
         chance at the placeholder Pk -- so it no longer shows the one thing
-        this test is for. Seed 9 is a war blue wins *and* pays for. Whether
-        both sides pay is TestBothSidesFight's business.
+        this test is for. Seed 9 was a war blue won *and* paid for, until
+        SEAD elements changed every seed's dice; seed 2 is one now, and its
+        strike element pays. Whether both sides pay is TestBothSidesFight's
+        business.
         """
-        campaign = Campaign(seed=9)
+        campaign = Campaign(seed=2)
         run_steps(campaign, int(40_000 / PAPER_STEP))
         sqn = squadron(campaign)
         self.assertGreaterEqual(sqn.airframes_lost, 1, "blue cannot lose a war it does not watch")
-        self.assertEqual(sqn.airframes_lost, len(flight_losses(campaign)))
+        self.assertEqual(sqn.airframes_lost, len(element_losses(campaign, "strike")))
+        self.assertEqual(sead_squadron(campaign).airframes_lost, len(element_losses(campaign, "sead")))
         self.assertTrue(all(x.cause == CAUSE_UNOBSERVED for x in flight_losses(campaign)))
         self.assertTrue(campaign.theater.targets[DEPOT].destroyed, "and the war is still winnable")
         sqn.check_invariant()

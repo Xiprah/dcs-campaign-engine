@@ -25,7 +25,11 @@ sends the target's current `units_alive`.
 The same rule runs the other way at the same instant. A strike flight DCS is
 not holding at its TOT is flown through the enemy's air defences on paper
 (:func:`resolve_exposure`) before it releases anything, so an unwatched sortie
-can be lost as well as won.
+can be lost as well as won. A SEAD element flies first, and its missiles are
+rolled here too (:func:`resolve_strike` at :data:`ARM_PK`); what it buys the
+strikers is a lower kill probability (:func:`suppressed_kill_probability`),
+never a different roll. When SEAD may act on paper at all is
+docs/design.md, section 5.
 
 This is also the one place the campaign's seeded RNG earns its keep. Every roll
 here comes off `Campaign.rng`, whose state round-trips through the save, so an
@@ -108,9 +112,10 @@ def resolve_exposure(
     reason: an early kill must not shift every later roll in the campaign.
 
     TODO(threat-model): the probabilities are flat per-site placeholders. A
-    real model -- altitude bands, terrain masking, EW, per-type envelopes, and
-    the suppression a SEAD element buys (docs/design.md, section 5) -- decides
-    the numbers passed in here; this function only has to roll them.
+    real model -- altitude bands, terrain masking, EW, per-type envelopes --
+    decides the numbers passed in here; this function only has to roll them.
+    The suppression a SEAD element buys (docs/design.md, section 5) already
+    arrives that way, through :func:`suppressed_kill_probability`.
     """
     if aircraft <= 0:
         return ExposureOutcome(aircraft_lost=0, rolls=0)
@@ -122,3 +127,33 @@ def resolve_exposure(
     return ExposureOutcome(
         aircraft_lost=sum(lost), rolls=aircraft * len(kill_probabilities)
     )
+
+
+#: Probability that one anti-radiation missile removes one unit of the site it
+#: is fired at. Lower than a bomb's: an ARM guides on an emitter rather than an
+#: aimpoint, and a radar that shuts down in time is not where it homes.
+# TODO(threat-model): a real model kills the radar in particular, and a site
+# without one stops shooting. Units here are counted, not typed, so an ARM
+# kill costs the site whichever unit a respawn would drop -- a launcher.
+ARM_PK = 0.25
+
+#: Fraction of a site's kill probability each surviving SEAD aircraft takes
+#: away from the strike element behind it. Suppression compounds per
+#: aircraft, so a two-ship that got through leaves a quarter of the site's Pk
+#: and a SEAD element that lost a jet leaves half: the parts of a package fail
+#: independently (docs/design.md, section 5), and a SEAD element that is only
+#: half there only half does its job. A flat placeholder like the Pk it cuts.
+SEAD_SUPPRESSION_PER_AIRCRAFT = 0.5
+
+
+def suppressed_kill_probability(kill_probability: float, suppressors: int) -> float:
+    """A site's kill probability with `suppressors` SEAD aircraft on it.
+
+    With none, the site's own number comes back untouched -- not multiplied by
+    one -- so a package without a SEAD element rolls exactly the probability
+    it always did. Draws nothing: suppression changes what the dice are rolled
+    against, never how many are rolled.
+    """
+    if suppressors <= 0:
+        return kill_probability
+    return kill_probability * (1.0 - SEAD_SUPPRESSION_PER_AIRCRAFT) ** suppressors
