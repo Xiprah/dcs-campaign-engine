@@ -182,9 +182,9 @@ squadron: a side with none has nothing to plan with. The order matters beyond
 tidiness, because the sides draw package ids, spawn ids and callsigns from
 shared sources in it, and the order a save happens to list its inventories in
 must not decide a replay. Red strikes blue's strategic targets, faces blue's
-threat sites, and takes losses through exactly the same authority rule. Each
-side may have one package open at a time until multi-package deconfliction
-exists.
+threat sites, and takes losses through exactly the same authority rule. How
+many packages a side has open at once is decided by its squadrons' readiness
+(section 6).
 
 A package records the side that flies it. That, never `player_coalition`,
 decides whose squadron it draws on, whose threat sites it is exposed to, and
@@ -266,9 +266,10 @@ exactly the ids, and the dice, the one-flight package did; a test holds
 eleven recorded pre-SEAD wars to that, frame for frame. A package is open
 while any element is. When none is, it is complete if any element came home,
 destroyed if none did and one was lost, and aborted if every one was scrubbed
-or stood down. Each side still holds one open package at a time, so a
-package whose strike element is lost stays open until its SEAD element is
-home.
+or stood down. A package whose strike element is lost stays open until its
+SEAD element is home, so no second package goes against its target before
+then (section 6); its strike squadron, with nothing open, is free for
+another.
 
 **When one is attached.** At planning the planner is shown the enemy sites
 whose envelopes the base-to-target leg enters (`Theater.live_threats_along`,
@@ -489,6 +490,194 @@ package's TOT. The suppression it buys must be settled by the strike's
 exposure; resolving the two at different instants would let each be judged
 by a different picture of who held what, and carry state between them.
 
+## 6. Sortie rate: readiness, not a count
+
+Until this, each side flew exactly one package at a time, around the clock,
+and never waited for anything: about 35 packages a side a day, and a Syria
+war over in a median 41 hours. That was structure, not content: the "one at
+a time" rule stood in for deconfliction, and nothing else limited tempo.
+
+**Readiness bounds the planner.** A side frags a package whenever a squadron
+is ready to fly it. Each pulse it goes down its targets in priority order,
+skips any target it already has an open package against, and tries each
+from its nearest base first, falling back to the next nearest exactly as it
+does for a dry one (theater section). So a side has as many packages open as
+it has ready squadrons for. Two rules stand in for the deconfliction that is
+not built:
+
+- **never two open packages against one target**, and
+- **a squadron contributes to at most one open package**: a squadron with an
+  open element (an open reservation) is not ready. One whose element has
+  closed is free, even while the rest of its package flies on.
+
+Left undone, as `TODO(seam)` in `Campaign._plan` and the planner's
+docstring: packages are not sequenced against each other on time or route;
+two packages through one envelope are each suppressed only by their own SEAD
+element and each rolled against the site on its own; one package's SEAD
+never covers another's strike; and a strike whose base's SEAD squadron is
+busy or spent for the day goes in alone, as it always did when the SEAD
+squadron was dry, where a planner would hold it.
+
+**Turnaround.** Airframes that come home are not ready again until their
+squadron's turnaround has passed. They sit in a fourth bucket, so
+conservation is now `available + reserved + turning + lost == total`,
+checked by `Squadron.check_invariant` on every move. The record is per
+landing (`oob.Turnaround`: airframes, ready time), not per airframe:
+airframes are anonymous, and every airframe of one element lands at the same
+instant, so per-airframe timestamps would carry nothing more. An element that
+took off -- home on schedule, shot down to the last jet, or scrubbed in the
+air by a refused spawn -- returns its survivors through turnaround from the
+moment it closes; one stood down on the ramp never flew and is ready at
+once. Unspent ordnance goes straight back to stock: turning a jet round is
+what the turnaround time is for.
+
+**Daily limit.** A squadron flies at most `floor(rate x airframes on
+strength)` aircraft sorties a local calendar day, on strength being total
+less lost. A sortie is charged when its element is fragged, to the day it
+takes off on, so the next package planned in the same pulse already sees it;
+one stood down at the end of the war keeps its charge, since nobody plans
+after that. Calendar days, not a rolling 24 hours, because under the
+daylight rule midnight never falls inside a flying day, so the two windows
+agree, and the calendar needs no history beyond one count per day
+(`Squadron.sorties_by_day`).
+
+**Daylight.** A day-only squadron is fragged only when the package's TOT is
+between sunrise and sunset. The TOT, not each element's own time over the
+target, because the TOT is the one instant the whole package is resolved at
+(section 5); the SEAD element's 120 s lead does not leave it out of the
+first strike of the day. "Daylight" is the sun's centre above -0.833 deg,
+the definition almanacs publish sunrise and sunset by, computed in
+`campaign.sun` with NOAA's Solar Calculator algorithm (Meeus' low-precision
+solar coordinates) from the campaign's local date and time and the
+theater's latitude, longitude and UTC offset. Standard library, no time zone
+database, no clock read. It reproduces the published 2025 sunrise and
+sunset table for Aleppo to within two minutes across June, September and
+December (`tests/test_sortie_rate.py`). The theater is reckoned from one
+point, Aleppo (36 deg 12' N, 37 deg 12' E), the middle of the fighting:
+across the map sunrise moves by about a quarter of an hour. Its clock is
+UTC+3, the DCS Syria map's (pydcs, `dcs/terrain/syria/syria.py`).
+
+Darkness is waited out, not routed around. If a target's nearest base has a
+squadron free to go but its TOT would fall in the dark, the target waits for
+the sun there, and that squadron is held for it for the rest of the pulse.
+Without that, every dawn a farther field's longer leg landed its TOT after
+sunrise first and won the target, and less important targets with longer
+legs took the nearest fields' squadrons ahead of the most important ones.
+Busy, out of sorties or turning round is a fact about the squadron, and
+another base may go instead.
+
+TODO(seam): night-capable squadrons (`SortieRate.day_only` False on a
+squadron with night attack kit). Both Syria types have it in reality; the
+map flies by day until something tells the squadrons apart.
+
+**The campaign has a date and a time of day.** `Campaign.start` is the local
+date and time at campaign second zero, naive on purpose: it is the theater's
+own clock, as a mission's editor time is. It is saved (save version 6), so a
+reloaded war keeps its sun. The default is 06:00 on 22 September 2025, the
+September equinox: its twelve-hour day is the year's mean, so the default
+neither lengthens the flying day as summer would nor shortens it as winter
+would, and 06:00 opens the campaign at first light, about twenty minutes
+before sunrise over the map. `--start YYYY-MM-DDTHH:MM` (or
+`Campaign(start=...)`) sets it for a new war; a save keeps its own, and the
+flag is ignored with a warning, as `--theater` is.
+
+**The parameters are published figures, never tuned.** They are the order of
+battle's (`oob.SortieRate` on each squadron), labelled placeholders as the
+threat model's radii are, chosen before any war was flown on them:
+
+| | figure | source |
+|---|---|---|
+| F-16 turnaround | 45 min | DVIDS, "F-16 Integrated Combat Turns enable ACE at Northern Strike 24-2" (180th Fighter Wing, 20 August 2024): "The maximum allotted time for an F-16 ICT is 45 minutes", an integrated combat turn being refuel and rearm |
+| Su-24M turnaround | 45 min | none found for the Su-24M; the F-16's, for the reason every site type carries the SA-6's kill probability |
+| F-16 sustained rate | 1.35 sorties per airframe per day | Cordesman and Wagner, *The Lessons of Modern War, Volume IV: The Gulf War* (CSIS, 1994), chapter 7: the F-16s "had the highest use rate of any aircraft in theater -- 1.35 sorties per day" over the 43 days of Desert Storm |
+| Su-24M sustained rate | 1.27 sorties per airframe per day | derived from Yermakov, "Russian Aces in Syrian Skies" (RIAC, 23 October 2015): "strike aircraft have made 669 sorties over two and a half weeks", flown by 12 Su-24M, 12 Su-25SM and 6 Su-34, so 669 / (17.5 x 30). A mixed group in which the Su-24M flew about half the sorties; no Su-24M-only figure was found |
+
+Both rates are the same statistic -- an achieved combat average over weeks --
+so the two sides' limits differ by what was measured, not by a choice of
+statistic. The turnaround is a routine turn with no fault to fix; the
+maintenance a sustained campaign also needs is what the daily rate carries.
+Desert Storm's F-16 sorties averaged over three hours and these last 30 to
+45 minutes, so on this map turnaround almost never binds and the daily rate
+does: on every full day of a war each strike squadron flies 60 to 100
+percent of its limit, mostly over 80 (seeds 0 to 3).
+
+**One mechanism, two theaters.** The slice is the fixture the tests and the
+recorded wars were written against. Its squadrons carry
+`oob.UNCONSTRAINED` -- no turnaround, no daily limit, any hour -- and go
+through the same readiness code as Syria's. With one target a side and one
+strike squadron a side, the two deconfliction rules are the old "one open
+package a side" exactly, so nothing in it moves: the eleven recorded wars in
+`tests/fixtures/pre_sead_wars.json` replay frame for frame and die for die
+(`tests/test_single_element.py`), and they fail if the slice is given a
+daily limit or a turnaround.
+
+**"Cannot task" means dry, not waiting.** A side with nothing open and
+nothing it can send is told it cannot task only if no base has the stock for
+a strike at all. One whose jets are busy, turning round, out of sorties for
+the day or waiting for the sun is keeping the tempo of a war.
+
+**DCS's clock is not the campaign's.** A DCS mission always starts at its
+editor date and time; a persistent campaign is wherever the war has got to.
+At `hello` the engine compares the mission's local time (its
+`mission_start_epoch` plus `t`) with the campaign's (`start` plus the
+clock) and logs a warning when they differ by more than a minute, giving
+both and the difference in time of day. It does not correct it: the
+protocol has no frame for setting DCS's clock, and the time is fixed when
+the server loads the mission. TODO(seam): whatever generates or restarts
+missions should start each one at the campaign's local time. Nothing sent
+or saved depends on the check, so a replay is unaffected.
+
+**What a war looks like now.** Measured offline over seeds 0 to 49 with the
+defaults, nobody connected; not asserted anywhere. "Before" is the same
+seeds on the engine as it stood before this section (commit f5143f6):
+
+| | before | after |
+|---|---|---|
+| war length, median (range) | 41 h (34-50) | 54 h (50-60) |
+| result | blue won 30, red 20 | blue won 13, red 37 |
+| packages per war, median, blue / red | 62.5 / 57.5 | 61 / 62.5 |
+| packages per day of war, median, blue / red | 36.5 / 33.6 | 27.4 / 27.5 |
+| packages airborne at once, share of the war, blue | one 89%, none 11% | none 55%, one 20%, two 25% |
+| packages airborne at once, share of the war, red | one 90%, none 10% | none 57%, one 14%, two 20%, three 9% |
+| airframes ready / reserved / turning, mean share | 96 / 4 / 0 % | 93 / 4 / 4 % |
+| airframes lost, median (range), blue | 5 (0-24) | 6 (1-14) |
+| airframes lost, median (range), red | 1.5 (0-7) | 6 (2-11) |
+| enemy targets destroyed, median, blue / red | 7 / 6 | 6 / 7 |
+| enemy sites destroyed, median, blue / red | 6 of 7 / 5 of 5 | 6.5 of 7 / 5 of 5 |
+| SEAD-escorted packages per war, mean, blue / red | 24.3 / 19.8 | 25.5 / 19.6 |
+
+Every war ended in a victory, none in a draw. Bombs left at the end never
+fell below 76 of a side's 360. The earliest TOT of any day was about 06:18
+and the latest about 18:24, local.
+
+*Does the war unfold over days?* Over three days of flying, not several. A
+war starting at 06:00 is now always decided on its third day, between 08:00
+and 18:00, where before it ran round the clock and ended between the second
+afternoon and the third morning. The daily limit is what binds: it allows a
+side about 80 aircraft sorties a day across its squadrons, which at these
+figures is about 27 packages, against 35 before -- but packed into twelve
+hours, two and three at a time. Concurrency gives back most of what the nights take. That is
+what the published figures give with this content (104 target units a side,
+44 strike airframes); nothing was adjusted to lengthen it.
+
+*What it does to the cost of a war.* Red now loses a median of 6 airframes
+a war, not 1.5, and the result has turned over: red wins 37 of 50, where
+blue won 30. Red's extra losses are on deep strikes flown without SEAD while
+blue's sites still stand: 88 airframes over seeds 0 to 19 against none
+before, when every deep strike red flew alone went in after the sites on its
+route were gone. With three strike squadrons red now reaches its deep
+targets in parallel with its middle ones, its SEAD squadrons busy or out of
+sorties for the day, where before it worked inward one package at a time
+and its SEAD had eroded the Hawks first. Why red wins more is not
+established; that red has three fields to blue's two, and so more packages
+in the air at once, is the obvious candidate and was not tested. Standoff
+SEAD still makes escorted packages cheap; that is the separate, known issue
+in the theater section, not addressed here.
+
+*Cost.* Planning tries every target and base each pulse rather than stopping
+at the first open package, so a Syria day on paper takes about 2.9 s of CPU
+instead of 1.0 s. The slice's is unchanged.
+
 ## Out of scope, deliberately
 
 Multi-package deconfliction, escort and CAP, tankers and AWACS, the ground
@@ -553,9 +742,10 @@ radius stays its published figure. The slice and the standoff tests depend on
 it, and the trade is the map's content, not a different physics.
 
 **What a war looks like.** Measured offline over 50 seeds, with nobody
-connected, with SEAD standoff and the Hawks. Not asserted anywhere. Each
-"was" is the same batch measured before standoff, when blue's area sites
-were 40 km Patriots and the point defences a shared 10 km:
+connected, with SEAD standoff and the Hawks, and before the sortie-rate
+model: section 6 has the war on it. Not asserted anywhere. Each "was" is the
+same batch measured before standoff, when blue's area sites were 40 km
+Patriots and the point defences a shared 10 km:
 
 | | blue | red |
 |---|---|---|
@@ -585,12 +775,12 @@ between them, so its deep strikes still cost something (0.15 a package), and
 blue now wins more often. A Syria war is close to bloodless, as the slice
 became.
 
-Two things this content cannot fix. First, *a war lasts about two days, not
-several*, because the engine's tempo is one package per side in the air at
-all times, around the clock: about 35 packages a side a day. The war's
-length is then set by the target units, and two days already needs 24-object
-statics. Several days needs a sortie-rate model (turnaround, crew rest,
-night), which is engine work. Second, *defences on paper are cheap to beat
+Two things this content cannot fix. First, *a war lasted about two days,
+not several*, because the engine's tempo was one package per side in the air
+at all times, around the clock: about 35 packages a side a day. The sortie-rate
+model (section 6) replaced that with readiness, turnaround, a daily limit and
+daylight, at published figures; a war now lasts 50 to 60 hours, decided on
+its third day of flying. Second, *defences on paper are cheap to beat
 and erode*. Standoff SEAD flies unhurt, its suppression is strong, and a
 two-ship's four missiles take about one unit off the sites on its route per
 sortie (ARM Pk 0.25), while a site keeps firing at full Pk until its last

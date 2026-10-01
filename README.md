@@ -130,7 +130,10 @@ python -m campaign --port 7777 --save saves/campaign.json --theater slice
 is the real Syria map (docs/design.md, "Theater: the Syria map"); `slice` is
 the two-base test slice the unit tests are written against, and the one this
 walkthrough and the harness's scripted observer describe. A save carries its
-own theater, so the flag is ignored once the save exists.
+own theater, so the flag is ignored once the save exists. `--start
+YYYY-MM-DDTHH:MM` sets a new war's local date and time on the theater's clock
+(default 2025-09-22T06:00), which on Syria decides when the sun lets it
+strike (docs/design.md, section 6); a save keeps its own too.
 
 In another, run the DCS stand-in. It speaks the mission-client half of the
 protocol over a real socket, flies a scripted observer out of Incirlik, obeys
@@ -302,6 +305,7 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
 | `campaign/theater.py` | the map: airbases, targets, threat sites, who has lost, and the one correct way to measure distance. |
 | `campaign/oob.py` | order of battle. Inventory is conserved, not merely decremented. |
 | `campaign/planner.py` | the minimal ATO: select a target, build a package of elements (strike, and SEAD when the route is exposed), schedule a TOT — for whichever side asks. |
+| `campaign/sun.py` | where the sun is: NOAA's solar formula, for the daylight rule. |
 | `campaign/bubble.py` | what DCS is allowed to know about, with hysteresis so it does not thrash. |
 | `campaign/attrition.py` | reconciliation. The load-bearing module. |
 | `campaign/resolver.py` | what happened where nobody was looking: unobserved strikes, SEAD missiles and suppression, and flights through air defences. |
@@ -318,12 +322,20 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
 
 **What works, and has been run end to end offline:**
 
-- Both sides plan. Every coalition with a squadron and an airbase frags one
-  package at a time against the other's highest-priority strategic target,
-  in coalition-name order, under the same inventory, attrition, threat and
+- Both sides plan. Every coalition with a squadron and an airbase frags
+  packages against the other's strategic targets in priority order, in
+  coalition-name order, under the same inventory, attrition, threat and
   authority rules. `player_coalition` decides only who is told what; the
   side nobody flies is told nothing. Red's raids are resolved, on paper or in
   DCS, exactly as blue's strikes are.
+- A sortie rate (docs/design.md, section 6). A side flies as many packages at
+  once as its squadrons are ready for -- never two against one target, never
+  one squadron in two -- and a squadron is ready only when its jets are
+  turned round, it has sorties left in its daily limit, and, if it flies by
+  day, the time on target is in daylight by NOAA's solar formula. Syria's
+  turnaround and daily rates are published figures; the slice's squadrons
+  are unconstrained through the same code. The engine logs a warning when a
+  connecting mission's time of day is not the campaign's.
 - Target selection, a TOT computed from distance, and a package of
   **elements** (docs/design.md, section 5): a 2-ship strike and, when its
   route enters a live enemy SAM envelope and its base has anti-radiation
@@ -388,11 +400,18 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   release altitude. Exposure is rolled once, at the TOT, for the whole route.
   Seams: `theater.ThreatSite`, `oob.ANTI_RADIATION_LAUNCH_RANGE`,
   `resolver.resolve_exposure`.
-- **One package a side at a time**, and SEAD is the only support element:
-  no DEAD, no routing around an envelope, no escort, tanker or AWACS. A
-  package whose strike is lost stays open, blocking the next, until its SEAD
-  element is home. Seams: `Campaign._plan_for`, `planner.build_package`,
+- **No deconfliction between packages**, and SEAD is the only support
+  element: no DEAD, no routing around an envelope, no escort, tanker or
+  AWACS. Two rules stand in for deconfliction (one open package a target,
+  one open package a squadron); packages are not sequenced against each
+  other, one package's SEAD never covers another's strike, and a strike
+  whose SEAD squadron is busy or out of sorties goes in alone. Seams:
+  `Campaign._plan`, `Campaign._plan_for`, `planner.build_package`,
   `planner`'s module docstring.
+- **Day only, and DCS's clock is not set.** Every Syria squadron strikes by
+  day; night-capable squadrons are a seam (`oob.SortieRate.day_only`). A DCS
+  mission starts at its editor time whatever time the campaign has reached;
+  the engine only logs the mismatch. Seam: `Campaign._check_mission_clock`.
 - **Nothing plans to destroy a threat site.** SEAD missiles take units off a
   site only on the way to a strike's target, and a site keeps its full kill
   probability until its last unit goes: units are counted, not typed, so a

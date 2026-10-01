@@ -22,9 +22,14 @@ the other side's targets, and the campaign asks once per coalition
 (docs/design.md, section 4). That is what keeps red subject to exactly the
 rules blue is.
 
+A side may have several packages open at once, as many as its squadrons are
+ready for (docs/design.md, "Sortie rate"); the campaign keeps two of them off
+one target and one squadron out of two of them.
+
 TODO(seam): escort, tanker and AWACS elements are built here, off the same
 target selection, and then deconflicted against other packages on time and
-route. This slice builds one package per coalition at a time.
+route: shared routes, shared envelopes, one package's SEAD covering
+another's strike. Nothing deconflicts open packages yet.
 """
 
 from __future__ import annotations
@@ -363,17 +368,24 @@ class Package:
         )
 
 
-def select_target(theater: Any, enemy_coalition: str) -> Target | None:
-    """Highest-priority surviving enemy target, or None if the list is empty.
+def targets_by_priority(theater: Any, enemy_coalition: str) -> list[Target]:
+    """Surviving enemy targets, the one the planner wants most first.
 
     Ties break on target id so that two engines fed the same log make the same
-    choice. Never return a destroyed target: a package tasked against rubble
-    would consume real inventory for nothing.
+    choice. Never a destroyed target: a package tasked against rubble would
+    consume real inventory for nothing.
     """
-    surviving = theater.surviving_targets_of(enemy_coalition)
-    if not surviving:
-        return None
-    return max(surviving, key=lambda t: (t.priority, t.id))
+    return sorted(
+        theater.surviving_targets_of(enemy_coalition),
+        key=lambda t: (t.priority, t.id),
+        reverse=True,
+    )
+
+
+def select_target(theater: Any, enemy_coalition: str) -> Target | None:
+    """Highest-priority surviving enemy target, or None if the list is empty."""
+    ranked = targets_by_priority(theater, enemy_coalition)
+    return ranked[0] if ranked else None
 
 
 def _leg_time(base: Airbase, target: Target) -> float:
@@ -382,6 +394,22 @@ def _leg_time(base: Airbase, target: Target) -> float:
 
 def reservation_id_for(package_id: str, role: str) -> str:
     return f"{package_id}-{role}"
+
+
+#: Whether a squadron may fly `airframes` aircraft on an element taking off at
+#: `t_takeoff` in a package whose TOT is `t_tot`: the readiness the campaign
+#: knows and the planner does not (docs/design.md, "Sortie rate"). Asked only
+#: of a squadron whose stock already covers the element.
+Readiness = Callable[[Squadron, int, float, float], bool]
+
+
+def package_schedule(base: Airbase, target: Target, now: float) -> tuple[float, float, float]:
+    """(takeoff, TOT, home) of the strike element fragged at `now`."""
+    leg = _leg_time(base, target)
+    t_takeoff = now + PLANNING_LEAD
+    t_tot = t_takeoff + leg + DEPARTURE_ALLOWANCE
+    t_rtb = t_tot + leg + RECOVERY_ALLOWANCE
+    return t_takeoff, t_tot, t_rtb
 
 
 def build_package(
@@ -393,11 +421,12 @@ def build_package(
     target: Target,
     now: float,
     rng: random.Random,
-    threats: Sequence[Any] = (),
+    threats: Sequence[Any] | Callable[[], Sequence[Any]] = (),
     next_spawn_id: Callable[[], str] | None = None,
     flight_size: int = FLIGHT_SIZE,
     rounds_per_aircraft: int = ROUNDS_PER_AIRCRAFT,
     munition: str | None = None,
+    ready: Readiness | None = None,
 ) -> Package | None:
     """Commit a package, or return None if inventory cannot cover its strike.
 
@@ -406,14 +435,26 @@ def build_package(
     are any, and the base has a squadron with anti-radiation missiles to cover
     a SEAD element, one is attached, with a spawn id from `next_spawn_id`.
     Without either, the package is its strike element alone -- the one-flight
-    package this always built, drawing the same dice.
+    package this always built, drawing the same dice. `threats` may be a
+    callable returning them, asked only once the strike is reserved: most
+    attempts to plan fail before that, and finding the sites is the dearest
+    part of an attempt.
+
+    `ready` is asked of each squadron whose stock could cover an element, and
+    one it refuses is passed over exactly as a dry one is: the strike tries
+    the base's next squadron, and the SEAD element is not attached. Without
+    it every squadron with the stock is ready.
 
     On success every element's airframes and ordnance are already reserved
     when this returns: there is no window in which a package exists but its
     inventory does not, and no way for a caller to forget.
     """
     rounds = flight_size * rounds_per_aircraft
-    squadron = _pick_squadron(inventory, base, flight_size, munition, rounds)
+    t_takeoff, t_tot, t_rtb = package_schedule(base, target, now)
+    squadron = _pick_squadron(
+        inventory, base, flight_size, munition, rounds,
+        lambda s: ready is None or ready(s, flight_size, t_takeoff, t_tot),
+    )
     if squadron is None:
         return None
     chosen_munition = munition or _default_munition(squadron)
@@ -425,10 +466,6 @@ def build_package(
     except InsufficientInventory:
         return None
 
-    leg = _leg_time(base, target)
-    t_takeoff = now + PLANNING_LEAD
-    t_tot = t_takeoff + leg + DEPARTURE_ALLOWANCE
-    t_rtb = t_tot + leg + RECOVERY_ALLOWANCE
     elements = [
         Element(
             role=ROLE_STRIKE,
@@ -444,9 +481,11 @@ def build_package(
             t_rtb=t_rtb,
         )
     ]
+    if callable(threats):
+        threats = threats()
     if threats and next_spawn_id is not None:
         sead = _build_sead_element(
-            package_id, inventory, base, t_takeoff, t_tot, t_rtb, next_spawn_id
+            package_id, inventory, base, t_takeoff, t_tot, t_rtb, next_spawn_id, ready
         )
         if sead is not None:
             elements.append(sead)
@@ -470,6 +509,7 @@ def _build_sead_element(
     t_tot: float,
     t_rtb: float,
     next_spawn_id: Callable[[], str],
+    ready: Readiness | None = None,
 ) -> Element | None:
     """Reserve a SEAD two-ship, or None if the base has no ARMs to send.
 
@@ -477,12 +517,20 @@ def _build_sead_element(
     round, so the two elements share one paper route and one TOT. Out of the
     base's own squadrons only: a SEAD element from another field would fly
     another route, and the envelope it suppressed might not be the strike's.
+
+    Readiness is asked about the package's TOT, not the element's own 120 s
+    earlier: the TOT is the one instant the whole package is resolved at
+    (docs/design.md, section 5), so it is the one the daylight rule judges.
     """
     rounds = SEAD_FLIGHT_SIZE * SEAD_ROUNDS_PER_AIRCRAFT
     for squadron in inventory.squadrons_at(base.id):
         munition = _anti_radiation_munition(squadron)
         if munition is None or not squadron.can_support(
             SEAD_FLIGHT_SIZE, munition, rounds
+        ):
+            continue
+        if ready is not None and not ready(
+            squadron, SEAD_FLIGHT_SIZE, t_takeoff - SEAD_LEAD, t_tot
         ):
             continue
         reservation = reservation_id_for(package_id, ROLE_SEAD)
@@ -532,14 +580,41 @@ def _pick_squadron(
     flight_size: int,
     munition: str | None,
     rounds: int,
+    ready: Callable[[Squadron], bool] | None = None,
 ) -> Squadron | None:
     for squadron in inventory.squadrons_at(base.id):
         wanted = munition or _default_munition(squadron)
         if wanted is None:
             continue
-        if squadron.can_support(flight_size, wanted, rounds):
+        if squadron.can_support(flight_size, wanted, rounds) and (
+            ready is None or ready(squadron)
+        ):
             return squadron
     return None
+
+
+def strike_squadron(
+    inventory: SideInventory,
+    base: Airbase,
+    ready: Callable[[Squadron], bool] | None = None,
+) -> Squadron | None:
+    """The squadron `build_package` would send a standard strike with, if any.
+
+    Reserves nothing. `ready` filters squadrons whose stock covers it.
+    """
+    return _pick_squadron(
+        inventory, base, FLIGHT_SIZE, None, FLIGHT_SIZE * ROUNDS_PER_AIRCRAFT, ready
+    )
+
+
+def can_strike_from(inventory: SideInventory, base: Airbase) -> bool:
+    """Has the base the stock for a strike, were every squadron ready?
+
+    Tells a base that is dry from one that is only busy, turning its jets
+    round or out of sorties for the day: the first is news, the second is the
+    tempo of a war.
+    """
+    return strike_squadron(inventory, base) is not None
 
 
 def element_position(element: Element, base: Airbase, target: Target, now: float) -> Vec3:
@@ -656,11 +731,16 @@ __all__ = [
     "TERMINAL_STATES",
     "Element",
     "Package",
+    "Readiness",
     "build_package",
+    "can_strike_from",
     "element_heading",
     "element_position",
     "element_route",
     "estimated_mission_duration",
+    "package_schedule",
     "reservation_id_for",
     "select_target",
+    "strike_squadron",
+    "targets_by_priority",
 ]

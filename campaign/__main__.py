@@ -12,6 +12,7 @@ import contextlib
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from campaign.api import PAPER_STEP, CampaignEngine
@@ -40,16 +41,23 @@ DEFAULT_THEATER = "syria"
 # only place in the process that names the concrete implementation. Replace the
 # body; keep the signature. Anything satisfying campaign.api.CampaignEngine
 # works, which is also how tests and tools/fake_dcs.py stay honest.
-def build_engine(save: Path, theater: str = DEFAULT_THEATER) -> CampaignEngine:
-    """Load the campaign from `save`, or start a new one on `theater`."""
+def build_engine(
+    save: Path, theater: str = DEFAULT_THEATER, start: datetime | None = None
+) -> CampaignEngine:
+    """Load the campaign from `save`, or start a new one on `theater`.
+
+    `start` is a new war's local date and time on the theater's clock; None
+    takes the campaign's default. A save keeps its own.
+    """
     from campaign.campaign import Campaign  # INTEGRATION SEAM: the real brain
 
     if save.exists():
         return Campaign.load(save)
+    when = {} if start is None else {"start": start}
     if theater == "slice":
-        # Campaign()'s own default, so the slice started here is the one the
-        # tests build.
-        return Campaign()
+        # Campaign()'s own theater and order of battle, so the slice started
+        # here is the one the tests build.
+        return Campaign(**when)
     if theater == "syria":
         from campaign.oob import build_syria_oob
         from campaign.theater import build_syria_theater
@@ -58,6 +66,7 @@ def build_engine(save: Path, theater: str = DEFAULT_THEATER) -> CampaignEngine:
         return Campaign(
             theater=build_syria_theater(),
             inventories={blue.coalition: blue, red.coalition: red},
+            **when,
         )
     raise ValueError(f"unknown theater {theater!r}; want one of {', '.join(THEATERS)}")
 
@@ -137,6 +146,20 @@ def _non_negative(text: str) -> float:
     return value
 
 
+def _local_datetime(text: str) -> datetime:
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"want a local date and time like 2025-09-22T06:00, got {text!r}"
+        ) from None
+    if value.tzinfo is not None:
+        raise argparse.ArgumentTypeError(
+            f"want the theater's local time with no UTC offset, got {text!r}"
+        )
+    return value
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m campaign",
@@ -153,6 +176,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=f"map to start a new campaign on (default {DEFAULT_THEATER}); "
         "ignored when the save already exists, since a save carries its own",
+    )
+    parser.add_argument(
+        "--start",
+        type=_local_datetime,
+        default=None,
+        metavar="YYYY-MM-DDTHH:MM",
+        help="local date and time on the theater's clock at which a new "
+        "campaign starts (default 2025-09-22T06:00); ignored when the save "
+        "already exists, since a save carries its own",
     )
     parser.add_argument(
         "--tick-period",
@@ -247,11 +279,17 @@ def main(argv: list[str] | None = None) -> int:
             args.theater,
             args.save,
         )
+    if args.start is not None and args.save.exists() and not args.engine:
+        logging.getLogger("campaign").warning(
+            "--start %s ignored: continuing the war in %s, which carries its own",
+            args.start.isoformat(),
+            args.save,
+        )
     try:
         engine = (
             _load_engine_factory(args.engine)
             if args.engine
-            else build_engine(args.save, args.theater or DEFAULT_THEATER)
+            else build_engine(args.save, args.theater or DEFAULT_THEATER, args.start)
         )
     except ImportError as exc:
         print(

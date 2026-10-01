@@ -1,20 +1,24 @@
 """Order of battle: who owns what, and how much of it is left.
 
 Inventory in this engine is conserved, not merely decremented. Every airframe
-and every round of ordnance is in exactly one of four buckets at all times:
+is in exactly one of four buckets at all times, and every round of ordnance in
+one of four:
 
-    available + reserved + lost + expended == total
+    airframes: available + reserved + turning + lost == total
+    rounds:    available + reserved + expended + lost == total
 
 `reserve` moves stock into a named reservation, `release` puts whatever is
-still reserved back, and `debit_*` moves reserved stock into the loss or
+still reserved back -- an airframe that flew going first through turnaround
+(`turning`) -- and `debit_*` moves reserved stock into the loss or
 expenditure buckets. A cancelled or failed package therefore cannot leak
 inventory: the only way out of a reservation is through one of those calls,
-and both of them preserve the sum. :meth:`Squadron.check_invariant` is the
+and all of them preserve the sum. :meth:`Squadron.check_invariant` is the
 assertion that says so, and the tests lean on it.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,6 +62,81 @@ def launch_range(munition: str) -> float:
     flies into every envelope on its route, as every flight did before.
     """
     return ANTI_RADIATION_LAUNCH_RANGE.get(munition, 0.0)
+
+
+@dataclass(frozen=True)
+class SortieRate:
+    """How hard a squadron can be worked: docs/design.md, "Sortie rate".
+
+    Content, like the airframe count, so it lives with the squadron and comes
+    from the order of battle. Every squadron goes through the same readiness
+    code; a squadron that is not constrained simply carries the values that
+    constrain nothing (:data:`UNCONSTRAINED`).
+    """
+
+    #: Seconds an airframe that has landed spends being refuelled and rearmed
+    #: before it can be fragged again.
+    turnaround: float = 0.0
+    #: Sustained aircraft sorties a day per airframe on strength, or None for
+    #: no daily limit.
+    sorties_per_day: float | None = None
+    #: Whether the squadron may only be fragged for a time on target in
+    #: daylight.
+    #: TODO(seam): night-capable squadrons (LANTIRN, the Su-24M's own night
+    #: attack kit) clear this; nothing distinguishes them yet.
+    day_only: bool = False
+
+    def daily_limit(self, strength: int) -> int | None:
+        """Aircraft sorties a day for `strength` airframes, or None if unlimited.
+
+        Floored, because a fraction of a sortie cannot be flown; the epsilon
+        keeps 1.35 * 20 from flooring to 26 on a float that came out a hair
+        under 27.
+        """
+        if self.sorties_per_day is None:
+            return None
+        return math.floor(self.sorties_per_day * strength + 1e-9)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "turnaround": self.turnaround,
+            "sorties_per_day": self.sorties_per_day,
+            "day_only": self.day_only,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> SortieRate:
+        rate = raw["sorties_per_day"]
+        return cls(
+            turnaround=float(raw["turnaround"]),
+            sorties_per_day=None if rate is None else float(rate),
+            day_only=bool(raw["day_only"]),
+        )
+
+
+#: No turnaround, no daily limit, any hour: the slice's squadrons, which its
+#: tests and its recorded wars were written against.
+UNCONSTRAINED = SortieRate()
+
+
+@dataclass
+class Turnaround:
+    """Airframes back from one sortie, not ready until `ready_at`.
+
+    One record per landing rather than per airframe: airframes are anonymous,
+    and every airframe that comes home in one element lands at the same
+    instant, so a per-airframe timestamp would carry nothing this does not.
+    """
+
+    airframes: int
+    ready_at: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"airframes": self.airframes, "ready_at": self.ready_at}
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> Turnaround:
+        return cls(airframes=int(raw["airframes"]), ready_at=float(raw["ready_at"]))
 
 
 class InsufficientInventory(Exception):
@@ -133,12 +212,34 @@ class Squadron:
     munitions_expended: dict[str, int] = field(default_factory=dict)
     munitions_lost: dict[str, int] = field(default_factory=dict)
     open_reservations: dict[str, Reservation] = field(default_factory=dict)
+    sortie_rate: SortieRate = UNCONSTRAINED
+    #: Airframes home from a sortie and not yet ready, in landing order.
+    turning: list[Turnaround] = field(default_factory=list)
+    #: Aircraft sorties fragged, by the local day (`campaign.sun.DAY`s since
+    #: 1970-01-01) each element takes off on. What the daily limit counts.
+    sorties_by_day: dict[int, int] = field(default_factory=dict)
 
     # -- queries ----------------------------------------------------------
 
     @property
     def airframes_reserved(self) -> int:
         return sum(r.airframes for r in self.open_reservations.values())
+
+    @property
+    def airframes_turning(self) -> int:
+        return sum(batch.airframes for batch in self.turning)
+
+    @property
+    def airframes_on_strength(self) -> int:
+        """Every airframe the squadron still has, whatever it is doing."""
+        return self.airframes_total - self.airframes_lost
+
+    def sorties_left(self, day: int) -> int | None:
+        """Aircraft sorties the daily limit still allows on `day`, or None."""
+        limit = self.sortie_rate.daily_limit(self.airframes_on_strength)
+        if limit is None:
+            return None
+        return limit - self.sorties_by_day.get(day, 0)
 
     def rounds_reserved(self, munition: str) -> int:
         return sum(
@@ -153,7 +254,12 @@ class Squadron:
 
     def check_invariant(self) -> None:
         """Raise if a single airframe or round has been created or destroyed."""
-        held = self.airframes_available + self.airframes_reserved + self.airframes_lost
+        held = (
+            self.airframes_available
+            + self.airframes_reserved
+            + self.airframes_turning
+            + self.airframes_lost
+        )
         if held != self.airframes_total:
             raise InventoryCorrupt(
                 f"{self.id}: airframes {held} != total {self.airframes_total}"
@@ -229,16 +335,46 @@ class Squadron:
         self.check_invariant()
         return taken
 
-    def release(self, reservation_id: str) -> None:
-        """Close a reservation, returning everything still held to stock."""
+    def release(self, reservation_id: str, *, landed_at: float | None = None) -> None:
+        """Close a reservation, returning everything still held to stock.
+
+        `landed_at` is when the airframes came home from a sortie, or None if
+        they never left the ground. Airframes that flew are not ready until
+        the squadron's turnaround has passed; unflown ones, and unspent
+        ordnance, go straight back, because nothing has to be done to them.
+        A turnaround of zero makes them ready the instant they land.
+        """
         res = self.open_reservations.pop(reservation_id, None)
         if res is None:
             raise UnknownReservation(reservation_id)
-        self.airframes_available += res.airframes
+        ready_at = None if landed_at is None else landed_at + self.sortie_rate.turnaround
+        if res.airframes > 0 and ready_at is not None and ready_at > landed_at:
+            self.turning.append(Turnaround(airframes=res.airframes, ready_at=ready_at))
+        else:
+            self.airframes_available += res.airframes
         self.munitions_available[res.munition] = (
             self.munitions_available.get(res.munition, 0) + res.rounds
         )
         self.check_invariant()
+
+    def mature(self, now: float) -> int:
+        """Make ready every airframe whose turnaround is over by `now`.
+
+        Returns how many. In landing order, so the books move the same way on
+        every replay.
+        """
+        ready = [batch for batch in self.turning if batch.ready_at <= now]
+        if not ready:
+            return 0
+        self.turning = [batch for batch in self.turning if batch.ready_at > now]
+        count = sum(batch.airframes for batch in ready)
+        self.airframes_available += count
+        self.check_invariant()
+        return count
+
+    def count_sorties(self, day: int, airframes: int) -> None:
+        """Charge `airframes` aircraft sorties to the daily limit for `day`."""
+        self.sorties_by_day[day] = self.sorties_by_day.get(day, 0) + airframes
 
     # -- persistence ------------------------------------------------------
 
@@ -259,6 +395,12 @@ class Squadron:
             "munitions_lost": dict(self.munitions_lost),
             "open_reservations": {
                 k: v.to_dict() for k, v in self.open_reservations.items()
+            },
+            "sortie_rate": self.sortie_rate.to_dict(),
+            "turning": [batch.to_dict() for batch in self.turning],
+            # JSON keys are strings; written in day order for a diffable save.
+            "sorties_by_day": {
+                str(day): count for day, count in sorted(self.sorties_by_day.items())
             },
         }
 
@@ -283,6 +425,11 @@ class Squadron:
             open_reservations={
                 k: Reservation.from_dict(v)
                 for k, v in raw["open_reservations"].items()
+            },
+            sortie_rate=SortieRate.from_dict(raw["sortie_rate"]),
+            turning=[Turnaround.from_dict(b) for b in raw["turning"]],
+            sorties_by_day={
+                int(day): int(count) for day, count in raw["sorties_by_day"].items()
             },
         )
         sqn.check_invariant()
@@ -380,6 +527,11 @@ def build_slice_oob() -> tuple[SideInventory, SideInventory]:
     the planner takes the first squadron that can cover a strike, and a
     squadron carrying only anti-radiation missiles never can.
 
+    Every squadron here is UNCONSTRAINED: no turnaround, no daily limit, any
+    hour. The slice is the fixture the tests and the recorded wars were
+    written against, and it goes through the same readiness code as Syria
+    with values that constrain nothing (docs/design.md, "Sortie rate").
+
     TODO(seam): fighters, escorts and further squadrons hang off this, along
     with the multi-package deconfliction that would task them.
     """
@@ -396,6 +548,7 @@ def build_slice_oob() -> tuple[SideInventory, SideInventory]:
             airframes_available=12,
             munitions_total={"GBU-38": 48},
             munitions_available={"GBU-38": 48},
+            sortie_rate=UNCONSTRAINED,
         )
     )
     red = SideInventory(coalition="red")
@@ -413,6 +566,7 @@ def build_slice_oob() -> tuple[SideInventory, SideInventory]:
             airframes_available=12,
             munitions_total={"FAB-500": 48},
             munitions_available={"FAB-500": 48},
+            sortie_rate=UNCONSTRAINED,
         )
     )
     # Smaller than the strike squadrons: eight airframes and twenty-four
@@ -432,6 +586,7 @@ def build_slice_oob() -> tuple[SideInventory, SideInventory]:
             airframes_available=8,
             munitions_total={"AGM-88C": 24},
             munitions_available={"AGM-88C": 24},
+            sortie_rate=UNCONSTRAINED,
         )
     )
     red.add(
@@ -446,6 +601,7 @@ def build_slice_oob() -> tuple[SideInventory, SideInventory]:
             airframes_available=8,
             munitions_total={"Kh-58U": 24},
             munitions_available={"Kh-58U": 24},
+            sortie_rate=UNCONSTRAINED,
         )
     )
     return blue, red
@@ -461,6 +617,7 @@ def _squadron(
     airframes: int,
     munition: str,
     rounds: int,
+    sortie_rate: SortieRate,
 ) -> Squadron:
     return Squadron(
         id=squadron_id,
@@ -473,7 +630,60 @@ def _squadron(
         airframes_available=airframes,
         munitions_total={munition: rounds},
         munitions_available={munition: rounds},
+        sortie_rate=sortie_rate,
     )
+
+
+# Sortie-generation figures for the Syria map's types, from published
+# sources and labelled placeholders, as the threat model's radii are: none was
+# chosen for the war it gives, and the war was measured only after they were
+# set (docs/design.md, "Sortie rate", has the result).
+
+#: An F-16's ground time between sorties: 45 minutes, the maximum allotted
+#: for an F-16 integrated combat turn -- refuel and rearm -- in Air National
+#: Guard practice (DVIDS, "F-16 Integrated Combat Turns enable ACE at
+#: Northern Strike 24-2", 180th Fighter Wing, 20 August 2024). A routine
+#: turn with no fault to fix; the maintenance a sustained campaign also
+#: needs is in the daily rate below, not here.
+F16_TURNAROUND = 45.0 * 60.0
+
+#: No published Su-24M turnaround figure was found, so red's is the F-16's,
+#: for the reason every site type carries the SA-6's kill probability: a
+#: better guess for one side than the other would decide the war by content
+#: nobody has measured.
+SU24M_TURNAROUND = F16_TURNAROUND
+
+#: Sustained F-16 sorties a day per airframe: 1.35, the F-16's average over
+#: the 43 days of Desert Storm, "the highest use rate of any aircraft in
+#: theater" (Cordesman and Wagner, *The Lessons of Modern War, Volume IV:
+#: The Gulf War*, CSIS, 1994, chapter 7). An achieved wartime average, which
+#: is what a planner sizes a sustained campaign by, rather than a surge.
+F16_SORTIES_PER_DAY = 1.35
+
+#: Sustained Su-24M sorties a day per airframe: about 1.27, the same
+#: statistic for the Russian strike group's first weeks in Syria, derived
+#: from Alexander Yermakov, "Russian Aces in Syrian Skies" (Russian
+#: International Affairs Council, 23 October 2015): "strike aircraft have
+#: made 669 sorties over two and a half weeks", flown by twelve Su-24Ms,
+#: twelve Su-25SMs and six Su-34s, so 669 / (17.5 days x 30 aircraft). A
+#: mixed group, of which the Su-24M flew about half the sorties; no
+#: Su-24M-only figure was found. The same kind of figure as the F-16's -- an
+#: achieved combat average over weeks -- so the two sides' limits differ by
+#: what was measured, not by a choice of statistic.
+SU24M_SORTIES_PER_DAY = 669.0 / (17.5 * 30.0)
+
+#: Each Syria type's sortie rate. Day-only on both sides: the daylight rule
+#: is the map's planning rule, not a claim about the jets (both types have
+#: night attack kit), until night-capable squadrons exist (the TODO(seam) on
+#: SortieRate.day_only).
+SYRIA_SORTIE_RATES: dict[str, SortieRate] = {
+    "F-16C_50": SortieRate(
+        turnaround=F16_TURNAROUND, sorties_per_day=F16_SORTIES_PER_DAY, day_only=True
+    ),
+    "Su-24M": SortieRate(
+        turnaround=SU24M_TURNAROUND, sorties_per_day=SU24M_SORTIES_PER_DAY, day_only=True
+    ),
+}
 
 
 #: (base, strike airframes, bombs, SEAD airframes, anti-radiation missiles)
@@ -548,6 +758,7 @@ def build_syria_oob() -> tuple[SideInventory, SideInventory]:
                     strike_n,
                     bomb,
                     bombs,
+                    SYRIA_SORTIE_RATES[airframe],
                 )
             )
             if sead_n > 0:
@@ -562,6 +773,7 @@ def build_syria_oob() -> tuple[SideInventory, SideInventory]:
                         sead_n,
                         arm,
                         arms,
+                        SYRIA_SORTIE_RATES[airframe],
                     )
                 )
         inventories[coalition] = inventory

@@ -259,9 +259,30 @@ class ThreatSite:
         )
 
 
+#: Where the sun is reckoned from on the DCS Syria map: Aleppo, 36 deg 12'
+#: N, 37 deg 12' E, the middle of the fighting -- between the two sides'
+#: fields and inside the box their targets span. One point for the whole
+#: map: across it sunrise moves by about a quarter of an hour, which is
+#: finer than anything the daylight rule decides.
+SYRIA_LATITUDE = 36.2
+SYRIA_LONGITUDE = 37.2
+
+#: The DCS Syria map's local time is UTC+3 (pydcs,
+#: dcs/terrain/syria/syria.py, `utc_offset=datetime.timezone(
+#: datetime.timedelta(hours=3))`), which is also Syria's and Turkey's
+#: civil time year round. A mission's editor time is in it, and so is the
+#: campaign's.
+SYRIA_UTC_OFFSET = 3.0
+
+
 @dataclass
 class Theater:
     """The map: named airbases, strategic targets and threat sites.
+
+    `latitude`, `longitude` and `utc_offset` say where on Earth the map is and
+    what its local clock is, which is all the daylight rule needs to know
+    (`campaign.sun`). Every theater in this repository is on the Syria map,
+    so that is the default.
 
     TODO(seam): the front line, the ground order of battle and the logistics
     network hang off the theater. None of them exist in this slice.
@@ -271,6 +292,9 @@ class Theater:
     airbases: dict[str, Airbase] = field(default_factory=dict)
     targets: dict[str, Target] = field(default_factory=dict)
     threats: dict[str, ThreatSite] = field(default_factory=dict)
+    latitude: float = SYRIA_LATITUDE
+    longitude: float = SYRIA_LONGITUDE
+    utc_offset: float = SYRIA_UTC_OFFSET
 
     def airbase(self, airbase_id: str) -> Airbase:
         return self.airbases[airbase_id]
@@ -331,6 +355,9 @@ class Theater:
             "airbases": {k: v.to_dict() for k, v in self.airbases.items()},
             "targets": {k: v.to_dict() for k, v in self.targets.items()},
             "threats": {k: v.to_dict() for k, v in self.threats.items()},
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "utc_offset": self.utc_offset,
         }
 
     @classmethod
@@ -340,6 +367,9 @@ class Theater:
             airbases={k: Airbase.from_dict(v) for k, v in raw["airbases"].items()},
             targets={k: Target.from_dict(v) for k, v in raw["targets"].items()},
             threats={k: ThreatSite.from_dict(v) for k, v in raw["threats"].items()},
+            latitude=float(raw["latitude"]),
+            longitude=float(raw["longitude"]),
+            utc_offset=float(raw["utc_offset"]),
         )
 
 
@@ -736,4 +766,7 @@ def build_syria_theater() -> Theater:
         airbases={b.id: b for b in airbases},
         targets={t.id: t for t in targets},
         threats={s.id: s for s in threats},
+        latitude=SYRIA_LATITUDE,
+        longitude=SYRIA_LONGITUDE,
+        utc_offset=SYRIA_UTC_OFFSET,
     )
