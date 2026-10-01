@@ -38,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from campaign.theater import SITE_UNIT_TYPES
 from tools import parse_validation
 
 try:
@@ -340,6 +341,18 @@ class TestTheValidatorRuns(unittest.TestCase):
         self.assertTrue(all(u["alt"] == 0 for u in units))
         self.assertEqual(call["data"]["task"], "Ground Nothing")
 
+    def test_every_site_case_names_its_units_as_the_engine_reads_them(self):
+        """Protocol v4: what getTypeName answers is what the engine reconciles."""
+        for template, (radar, launcher) in SITE_UNIT_TYPES.items():
+            with self.subTest(template):
+                case = self.by_id[f"template.{template}"]
+                self.assertEqual(case["status"], "OK", case.get("error"))
+                count = int(case["detail"]["units"])
+                want = ({radar: count} if radar == launcher
+                        else {radar: 1, launcher: count - 1})
+                self.assertEqual(case["detail"]["unit_types"], ",".join(
+                    f"{name}={n}" for name, n in sorted(want.items())))
+
     def _call(self, name: str) -> dict:
         return next(c for c in self.runner.mock.spawn_calls() if c.get("name") == name)
 
@@ -614,6 +627,38 @@ class TestOneCaseFailingDoesNotStopTheRun(unittest.TestCase):
         self.assertEqual(by_id["template.F-16C_cap"]["status"], "OK")
         self.assertEqual(by_id["task.AttackGroup"]["status"], "OK")
         self.assertEqual(run.mock.scheduler_errors(), [])
+
+
+@requires_lua
+class TestASiteDcsNamesDifferentlyIsRejected(unittest.TestCase):
+    """A type DCS spells its own way would have the engine write the site off.
+
+    The engine reads a snapshot's `unit_types` against the types it built
+    (docs/design.md, section 7), so a radar DCS calls something else reads
+    as a radar destroyed, on the first snapshot. That has to fail the case,
+    not pass it because the group spawned.
+    """
+
+    def _sa6(self, prepare) -> dict:
+        run = ValidatorRun()
+        self.addCleanup(run.close)
+        prepare(run.mock)
+        by_id = {r["id"]: r for r in run.run_now()["results"]}
+        self.assertEqual(by_id["template.Patriot_site"]["status"], "OK")
+        return by_id["template.SA-6_Kub_site"]
+
+    def test_a_radar_named_otherwise_rejects_the_site(self):
+        case = self._sa6(lambda mock: mock.answer_type_name(
+            "cmpval_SA-6_Kub_site_1", "SA-6 STR"))
+        self.assertEqual(case["status"], "REJECTED")
+        self.assertIn("answered 'SA-6 STR'", case["error"])
+        self.assertIn("built as 'Kub 1S91 str'", case["error"])
+        self.assertTrue(case["required"])
+
+    def test_a_unit_that_cannot_name_its_type_rejects_the_site(self):
+        case = self._sa6(lambda mock: mock.fail_get_type_name("cmpval_SA-6_Kub_site_3"))
+        self.assertEqual(case["status"], "REJECTED")
+        self.assertIn("gave no type name", case["error"])
 
 
 # --------------------------------------------------------------------------

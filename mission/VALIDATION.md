@@ -43,7 +43,12 @@ out one crash at a time, a week apart, in the middle of a sortie.
 - whether the SA-6 site spawns as the client builds it: a red (`RUSSIA`)
   ground group on the ground, radar as unit 1, launchers after, no payload;
   and the same of the Patriot site, as a blue (`USA`) one, and of the Syria
-  theater's SA-11 and SA-15 (red) and Hawk and Roland (blue) sites. Its four static
+  theater's SA-11 and SA-15 (red) and Hawk and Roland (blue) sites. Each
+  site case also asks every unit's `getTypeName` and fails unless DCS names
+  it exactly as the type it was built as (`unit_types` in the detail):
+  since protocol v4 the engine reads a snapshot's units by those names, and
+  a radar DCS spells differently would read as a radar destroyed, writing
+  the site off on its first snapshot. Its four static
   templates are probed as one object each, like the slice's;
 - whether each of the other templates spawns for the country the client
   spawns it for: red's Su-24M strike two-ship for `RUSSIA`, red's fuel depot
@@ -68,7 +73,12 @@ out one crash at a time, a week apart, in the middle of a sortie.
   exactly how a strike package ends up unarmed with nobody noticing;
 - **what DCS calls the SEAD elements' missiles** in `Unit.getAmmo`'s
   `desc.typeName`, and whether the client's `WEAPON_NAMES` table reports
-  them under the engine's names (`ammo.*`, section 4a).
+  them under the engine's names (`ammo.*`, section 4a);
+- whether `Group:enableEmission` turns an SA-6 battery's radars off and on
+  (`emission.SA-6_Kub_site`, not required): the client uses it to keep a
+  battery the campaign has shut down on paper off the air in the sim.
+  Accepted is not the same as silent; whether the radar really stops
+  emitting is for a flown mission's RWR to say.
 
 **It cannot tell you:**
 
