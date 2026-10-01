@@ -2189,14 +2189,20 @@ class TestFramingAndBackpressure(unittest.TestCase):
             self.mission.step(1)
             if self.mission.mock.status()["phase"] != "open":
                 break
+        # Failed once in about thirty runs, in a full suite under heavy CPU
+        # load, and never reproduced; the message from that run was lost. Both
+        # assertions now carry the client's state and log, so a recurrence
+        # says which of them fired and why instead of only that one did.
         self.assertNotEqual(
             self.mission.mock.status()["phase"],
             "open",
-            "the client kept buffering a frame that will never end",
+            "the client kept buffering a frame that will never end: "
+            f"status={self.mission.mock.status()!r} logs={self.mission.mock.logs()!r}",
         )
         self.assertTrue(
             any("MAX_FRAME_BYTES" in msg for msg in self.mission.mock.logs("warning")),
-            self.mission.mock.logs(),
+            f"dropped, but not for the frame cap: status={self.mission.mock.status()!r} "
+            f"logs={self.mission.mock.logs()!r}",
         )
 
     def test_an_engine_that_stops_reading_is_dropped_before_memory_runs_out(self):
