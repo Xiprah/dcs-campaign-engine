@@ -970,6 +970,53 @@ local function try_group(rec, opts, cid, category)
     return rec
 end
 
+--- Does DCS name each unit of a ground group as the type it was built as?
+---
+--- Since protocol v4 a snapshot counts a ground group's living units by
+--- `Unit.getTypeName`, and the engine reconciles each type it built against
+--- that count (docs/design.md, section 7). A type DCS spells differently
+--- from the one the client asked for reads as every unit of that type gone,
+--- so the engine would write a whole battery off on its first snapshot; and
+--- a `getTypeName` that raises leaves the client unable to name its units,
+--- so the engine could never book a loss DCS inflicted on it. Either is a
+--- failure of the template case, not an unknown.
+local function check_unit_types(rec, data)
+    local built = {}
+    for i = 1, #data.units do built[data.units[i].name] = data.units[i].type end
+    local grp = live_group(data.name)
+    local units = grp and (try(grp.getUnits, grp) or {}) or {}
+    local counts, problems = {}, {}
+    for i = 1, #units do
+        local u = units[i]
+        local uname = try(u.getName, u)
+        local ok, answer = pcall(function() return u:getTypeName() end)
+        local wanted = uname and built[uname]
+        if not ok or type(answer) ~= "string" then
+            problems[#problems + 1] = "getTypeName on " .. tostring(uname)
+                .. " gave no type name: " .. tostring(answer)
+        else
+            counts[answer] = (counts[answer] or 0) + 1
+            if answer ~= wanted then
+                problems[#problems + 1] = "getTypeName answered '" .. answer
+                    .. "' for " .. tostring(uname) .. ", built as '"
+                    .. tostring(wanted) .. "'"
+            end
+        end
+    end
+    local names = {}
+    for type_name in pairs(counts) do names[#names + 1] = type_name end
+    table.sort(names)
+    for i = 1, #names do names[i] = names[i] .. "=" .. counts[names[i]] end
+    rec.detail.unit_types = table.concat(names, ",")
+    if #problems > 0 then
+        rec.status = "REJECTED"
+        rec.error = table.concat(problems, "; ") .. " -- the engine reads a "
+            .. "snapshot's unit_types by these names, and would write the "
+            .. "site off"
+    end
+    return rec
+end
+
 local function try_static(rec, data, cid)
     local created, err = add_static(cid, data)
     rec.detail.created = created
@@ -1057,7 +1104,7 @@ local function build_cases()
                         local x, y = case_position(index)
                         -- Ground groups sit on the ground at the case point,
                         -- which is why the origin has to be land.
-                        return try_group(rec, {data = build_group_data({
+                        local data = build_group_data({
                             name = NAME_PREFIX .. key,
                             unit_type = tmpl.unit_type,
                             lead_type = tmpl.lead_type,
@@ -1068,7 +1115,12 @@ local function build_cases()
                             ground = ground,
                             x = x, y = y,
                             alt = ground and 0 or CONFIG.altitude,
-                        })}, cid, cat)
+                        })
+                        rec = try_group(rec, {data = data}, cid, cat)
+                        if ground and rec.status == "OK" then
+                            rec = check_unit_types(rec, data)
+                        end
+                        return rec
                     end,
                 })
             end

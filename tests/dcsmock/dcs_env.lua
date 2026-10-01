@@ -79,6 +79,9 @@ local M = {
     no_get_ammo = false,
     --- unit name -> true: that unit's getTypeName raises.
     type_name_raises = {},
+    --- unit name -> string: what that unit's getTypeName answers instead of
+    --- the type it was built as, as a DCS that spells a type its own way would.
+    type_name_answers = {},
     --- Group:enableEmission raises, as an API this DCS lacks or rejects would.
     emission_raises = false,
     --- Every enableEmission call that took, on any group, in order, kept
@@ -144,7 +147,7 @@ local function make_unit(group, udata, side)
         if M.type_name_raises[self.__name] then
             error("getTypeName: injected failure on " .. self.__name, 0)
         end
-        return self.__type
+        return M.type_name_answers[self.__name] or self.__type
     end
     function u:isExist() return self.__exists end
     function u:getCoalition() return self.__side end

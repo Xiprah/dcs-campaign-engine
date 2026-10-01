@@ -457,6 +457,10 @@ class DCSMock:
         """Make one unit's getTypeName raise, as a stale or broken handle does."""
         self.env.type_name_raises[unit_name] = True if fail else None
 
+    def answer_type_name(self, unit_name: str, type_name: str | None) -> None:
+        """Make one unit's getTypeName answer `type_name`; None restores it."""
+        self.env.type_name_answers[unit_name] = type_name
+
     def emission(self, name: str) -> list[tuple[bool, float]]:
         """Every enableEmission call on a live group, in order: (on, mission time)."""
         group = self.env.groups[name]
