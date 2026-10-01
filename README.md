@@ -31,8 +31,7 @@ DCS's mission-scripting environment is a bad place to keep a campaign.
 * **It cannot be tested.** Anything inside the mission environment needs DCS
   running to execute one line. The engine is standard-library Python: the
   whole loop, including the transport, runs in a few seconds on any machine
-  with no DCS installed. (There is no CI yet; `python -m unittest discover -s
-  tests -t .` is the whole of the check.)
+  with no DCS installed, and CI runs it on every push (below).
 * **It is not the whole map.** The campaign simulates a theater; DCS can only
   hold the part of it a player is near. That split — a paper track everywhere,
   real units inside a bubble — only works if something outside DCS owns the
@@ -263,6 +262,17 @@ pip install -r requirements-dev.txt
 
 Skipping is the dangerous default, because the Lua is the half of this system
 that has never run inside DCS. Install it.
+
+CI (`.github/workflows/ci.yml`) runs the suite on every push and pull request
+to `main`, on Windows and Linux, twice: once with the standard library alone,
+where the Lua-backed tests must skip, and once with `lupa`, where **nothing may
+skip** — `tools/ci_tests.py` fails the run if a single test does, so a broken
+`lupa` install cannot report green while testing no Lua at all. Run the same
+check locally with `python tools/ci_tests.py --lua required`.
+
+The engine also ships as a standalone Windows exe that needs no Python: see
+[docs/building.md](docs/building.md). CI builds it after the tests pass and
+keeps it as a run artifact for seven days.
 
 What no test here can settle is *content* — the unit type strings, static
 categories, task schemas and pylon CLSIDs the client hands to DCS. The mock
