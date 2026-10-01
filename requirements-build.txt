@@ -1,0 +1,18 @@
+# Build-time only: freezing the engine into dist/dcs-campaign-engine.exe.
+# The engine itself has no runtime dependencies. Install these into a separate
+# virtualenv, never the one you run tests from:
+#
+#     python -m venv .venv-build
+#     .venv-build\Scripts\python -m pip install -r requirements-build.txt
+#     .venv-build\Scripts\python tools\build_exe.py
+#
+# PyInstaller 6.22.3 declares Requires-Python <3.16,>=3.8 and lists 3.14 in its
+# classifiers. The rest is its resolved dependency set on Windows/CPython 3.14,
+# pinned so two builds of the same commit use the same toolchain.
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+altgraph==0.17.5
+packaging==26.3
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+setuptools==84.0.0
