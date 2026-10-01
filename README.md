@@ -157,10 +157,9 @@ strike at t=1407: cmp_0005 -> cmp_0002, target destroyed, flight 1/2 remaining
 MSG [blue] Latakia Fuel Depot destroyed.
 MSG [blue] All assigned strategic targets destroyed.
 MSG [blue] Incirlik Patriot engaged: 2 enemy aircraft down.
-MSG [blue] Incirlik Munitions Storage hit: 3 unit(s) destroyed, 1 of 4 remaining.
 MSG [blue] VIPER SEAD off target, 2 aircraft egressing.
 MSG [blue] VIPER off target, 1 aircraft egressing.
-spawned cmp_0007 (Su-24M_strike_fab, plane) 2 unit(s), 2 waypoint(s)
+spawned cmp_0008 (Su-24M_sead_kh58, plane) 2 unit(s), 2 waypoint(s)
 despawned cmp_0006 (mission_complete)
 MSG [blue] VIPER SEAD recovered, 2 aircraft home.
 despawned cmp_0005 (mission_complete)
@@ -180,21 +179,26 @@ Both SEAD elements meet an enemy SAM in the bubble and engage it; the
 harness's scripted SEAD kills nothing unless `--sead-kills` says so, and
 whatever it kills comes back by snapshot. By red's time on target the
 observer is chasing VIPER near Latakia, so nobody is watching Incirlik, and
-the engine flies the raid on paper: the Patriot kills both SEAD jets, which
-leaves nothing to suppress it, and misses both Su-24Ms, which destroy three
-of the storage area's four units. `cmp_0004` is the SA-6 covering the
-approach to Latakia; the observer brings it into the bubble, so here DCS,
+the engine flies the raid on paper. Red's Kh-58Us out-range the Patriot, so
+its SEAD element fires from standoff and is not shot at; but DCS held it
+alongside the Patriot at t=1049, which was the sim's chance to fire those
+missiles, so the paper fires none again and buys no suppression
+(docs/design.md, section 5). The Patriot meets both Su-24Ms at its full kill
+probability and kills both, and the storage area is untouched. `cmp_0004`
+is the SA-6 covering the approach to Latakia; the observer brings it into
+the bubble, so here DCS,
 not the engine, decides what it shoots down, and the harness's scripted loss
 stands in for that. The war ends the moment the depot does; red's raid,
-already airborne, flies out its sortie. Its strikers pass back through the
-bubble on the way home, and are spawned with two waypoints and no task, not
-their strike task: their bombs were resolved at their TOT, once.)
+already airborne, flies out its sortie. Its SEAD element passes back
+through the bubble on the way home, and is spawned with two waypoints and no
+task, not its SEAD task: its part was resolved at the TOT, once.)
 
 and in the save afterwards: the depot at `units_alive: 0`, blue's strike
 squadron at 11 of 12 airframes with 1 lost, 2 GBU-38 expended and 2 lost with
 the jet that carried them, its SEAD squadron whole with 4 AGM-88C expended,
-red's strike squadron whole with 4 FAB-500 expended, red's SEAD squadron at
-6 of 8 with 4 Kh-58U lost, both packages closed, no reservation left open, and
+red's strike squadron at 10 of 12 with 4 FAB-500 lost with its jets, red's
+SEAD squadron whole with 4 Kh-58U expended, both packages closed, no
+reservation left open, and
 `war_result` naming red as defeated. Start the engine again on the same save
 and it carries on from there — which, the war being over, means it plans
 nothing.
@@ -218,18 +222,18 @@ simulated 17280 paper step(s) of 5s; campaign clock 0s -> 86400s
 ```
 
 Run against a fresh save, that day is over in a little more than an hour of
-it, and blue loses it. Every package on both sides flies escorted. Red's
-first raid loses its whole SEAD element to the Patriot, but both Su-24Ms get
-through and destroy three of the storage area's four units. Blue's first
-sortie loses a SEAD jet and a striker to the SA-6 and destroys two of the
-depot's four units. Red's second raid loses one jet from each element; its
-missiles destroy one Patriot launcher, and its surviving striker finishes
-the storage area at 3945 s. The humans are told the war is lost. Blue's
-second package, already airborne, flies out its sortie and hits the depot
-again, after the result is fixed. Other seeds win it: at seed 3 blue
-flattens the depot at 4000 s. That is the point of sections 3 and 4 of
-docs/design.md: an unwatched war can be lost as well as won, and the enemy
-is fighting it too.
+it, and blue wins it. Every package on both sides flies escorted, and every
+SEAD element fires from standoff, so no SEAD jet is shot at. Red's first
+raid's Kh-58Us destroy two Patriot launchers, and both Su-24Ms get through
+and destroy two of the storage area's four units. Blue's first sortie's
+HARMs destroy one SA-6 launcher, and its strikers one of the depot's four
+units. Red's second raid takes a third launcher and misses the storage
+area. Blue's second takes a second SA-6 launcher and finishes the depot at
+4000 s. Nobody loses an aircraft. Other seeds lose it, and bleed: at seed 20
+each side's strike element loses a jet and red finishes the storage area at
+3945 s. That is the point of sections 3 and 4 of docs/design.md: an
+unwatched war can be lost as well as won, and the enemy is fighting it
+too.
 
 Three flags earn their keep:
 
@@ -312,8 +316,10 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   the SEAD element can be shot down, scrubbed or run dry while the strike
   flies on. Both sides fly SEAD: blue's F-16Cs with AGM-88C, red's Su-24Ms
   with Kh-58U. Every element's airframes and munitions are reserved up front.
-- SEAD on paper, in order at the TOT: the SEAD element flies its exposure,
-  its survivors' missiles are rolled against the sites (and may destroy
+- SEAD on paper, in order at the TOT: the SEAD element flies its exposure
+  to any site its missile does not out-range (one it out-ranges, it engages
+  from standoff and is not shot at by), its survivors' missiles are rolled
+  against the sites (and may destroy
   units), each surviving SEAD aircraft halves each engaged site's kill
   probability for the strike element, the strike flies its exposure, and its
   survivors release. Observed, the SEAD element is tasked in DCS
@@ -362,8 +368,10 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
 
 - **A real threat model.** Each site is one ground radius and one flat
   per-aircraft kill probability, with no altitude bands, terrain masking or
-  EW. Exposure is rolled once, at the TOT, for the whole route. Seams:
-  `theater.ThreatSite`, `resolver.resolve_exposure`.
+  EW, and each anti-radiation missile is one launch range whatever the
+  release altitude. Exposure is rolled once, at the TOT, for the whole route.
+  Seams: `theater.ThreatSite`, `oob.ANTI_RADIATION_LAUNCH_RANGE`,
+  `resolver.resolve_exposure`.
 - **One package a side at a time**, and SEAD is the only support element:
   no DEAD, no routing around an envelope, no escort, tanker or AWACS. A
   package whose strike is lost stays open, blocking the next, until its SEAD
@@ -386,12 +394,18 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   twenty-four missiles, one four-unit target and one site with the same flat
   Pk; the missile Pk (0.25) and the suppression (half the site's Pk per
   surviving SEAD aircraft) are as uncalibrated. The war is short — usually
-  decided within two or three sorties a side. At these numbers SEAD cuts the
-  strike element's losses by about two-thirds (0.27 to 0.10 aircraft on a
-  first sortie, over 400 seeds) and costs more aircraft than it saves,
-  because the SEAD element flies into the unsuppressed site first;
-  docs/design.md, section 5, has the figures. That is what uncalibrated
-  numbers give, not a model of anything.
+  decided within two or three sorties a side. A SEAD element is shot at on
+  paper only by a site its missile does not out-range, and the launch ranges
+  and engagement radii are published maxima (AGM-88C 148 km, Kh-58U 250 km,
+  SA-6 24 km, Patriot 160 km), so on this map both sides' SEAD fires from
+  standoff. At these numbers SEAD cuts the strike element's losses from 0.27
+  to 0.08 aircraft on a first sortie (over 400 seeds) and costs no SEAD
+  aircraft on paper, so an escorted package loses fewer aircraft in total
+  than one sent alone. Before standoff it cost more than it saved: the SEAD
+  element flew into the unsuppressed site first. Red's standoff rests on the
+  Kh-58U's published 250 km; the original Kh-58's 120 km would not out-range
+  the Patriot. docs/design.md, section 5, has the figures and sources. That
+  is what uncalibrated numbers give, not a model of anything.
 - **No pilots.** A package draws anonymous airframes; ejections and deaths are
   events nobody records. Seam: `oob.Squadron`.
 - **Placeholder DCS templates.** `TEMPLATES` in `campaign_client.lua` maps

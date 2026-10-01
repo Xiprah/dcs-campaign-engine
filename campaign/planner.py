@@ -58,14 +58,16 @@ SEAD_ROUNDS_PER_AIRCRAFT = 2
 #: Seconds the SEAD element is scheduled ahead of the strike element, over
 #: the same track. Suppression has to be under way before the strikers are
 #: inside an envelope, not after. At the slice's paper-track ground speed of
-#: about 140 m/s this is 17 km: blue's strikers cross into the SA-6's 20 km
-#: envelope 310 s before their TOT, and the SEAD element, 120 s ahead, is
-#: then abeam the battery (293 s before the TOT), the closest it comes and
-#: the shortest shot it has. Red's route runs 394 s inside the Patriot's
-#: larger envelope, and the same lead has the Su-24M SEAD element 17 km into
-#: it before the strikers arrive. Much more and the SEAD element is off the
-#: target and turning for home while the strikers are still inbound; much
-#: less and the two are one formation, and each envelope meets both at once.
+#: about 140 m/s this is 17 km: blue's strikers cross into the SA-6's 24 km
+#: envelope 339 s before their TOT, when the SEAD element, 120 s ahead, is
+#: 8 km from the battery and closing on its abeam point (293 s before the
+#: TOT), the closest it comes and the shortest shot it has. Red's route is
+#: inside the Patriot's 160 km envelope from takeoff, Bassel al-Assad being
+#: 146 km from the battery, and the same lead keeps the Su-24M SEAD element
+#: 17 km ahead of the strikers all the way in. Much more and the SEAD
+#: element is off the target and turning for home while the strikers are
+#: still inbound; much less and the two are one formation, and each envelope
+#: meets both at once.
 #: A constant rather than one derived from each route's geometry, because on
 #: paper exposure is resolved as one event at the TOT (section 3) and the
 #: lead does not enter that arithmetic: it decides where the SEAD element is

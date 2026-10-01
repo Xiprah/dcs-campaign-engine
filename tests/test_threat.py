@@ -32,6 +32,7 @@ from campaign.attrition import (
     AttritionTracker,
 )
 from campaign.campaign import Campaign
+from campaign.oob import launch_range
 from campaign.planner import DESTROYED, OPEN_STATES, select_target
 from campaign.protocol import GroupSnapshot, Spawn, StateReport
 from campaign.resolver import ExposureOutcome, resolve_exposure
@@ -45,15 +46,20 @@ SQUADRON = "vfa_incirlik_f16"
 SEAD_SQUADRON = "vfa_incirlik_f16_sead"
 
 #: Seeds pinned against the slice's placeholder Pk, found by flying blue's
-#: first offline sortie: seed 3 gets through untouched, seed 2 loses one
-#: strike aircraft on the way in and nothing else, seed 480 loses the whole
-#: package -- both SEAD jets, and then both strikers behind them. Re-pinned
-#: when red started planning, and again when SEAD elements arrived: an
-#: escorted TOT draws the SEAD element's dice before the strike's, so every
-#: seed's dice fall differently for blue than they used to.
+#: first offline sortie: seed 3 gets through untouched, seed 8 loses one
+#: strike aircraft on the way in and nothing else, seed 2806 -- against an
+#: SA-6 the HARM cannot out-range, see the test that uses it -- loses the
+#: whole package, both SEAD jets and then both strikers behind them.
+#: Re-pinned when red started planning, again when SEAD elements arrived,
+#: and again when SEAD elements began firing from standoff: a SEAD element
+#: that out-ranges the site it faces throws no exposure dice, so every
+#: escorted TOT, red's before blue's, draws fewer than it did. Seed 2 now
+#: loses nothing on blue's first sortie; 3 still loses nothing; 480 is no
+#: longer a whole package lost. Each new seed is the first, in order, that
+#: does what its name says.
 SEED_UNTOUCHED = 3
-SEED_ONE_LOST = 2
-SEED_BOTH_LOST = 480
+SEED_ONE_LOST = 8
+SEED_BOTH_LOST = 2806
 
 
 def theater_with(**site_changes: object) -> Theater:
@@ -313,13 +319,17 @@ class TestPaperExposure(unittest.TestCase):
         self.assertEqual(sqn.munitions_expended.get("GBU-38", 0), 2, "the dead jet bombed")
         self.assertEqual(sqn.munitions_lost.get("GBU-38", 0), 2)
 
-        # Seed 3: red's first raid, which reaches Incirlik twenty seconds
+        # Seed 53: red's first raid, which reaches Incirlik twenty seconds
         # before blue reaches the depot, misses. The last line below asserts
         # that no target anywhere took a loss, and it can only mean what it
         # says -- that blue's dead jets bombed nothing -- in a war where red
         # has not hit anything yet either. The default seed was one until
-        # SEAD elements changed red's dice.
-        wholly = Campaign(theater=theater_with(kill_probability=1.0), seed=3)
+        # SEAD elements changed red's dice, and seed 3 until they fired from
+        # standoff. Since then a Pk of one is no longer certain death for
+        # blue's strikers: the SEAD element survives the SA-6, which it
+        # out-ranges, and two suppressors leave a quarter of the Pk. Seed 53
+        # is the first at which both strikers die anyway and red misses.
+        wholly = Campaign(theater=theater_with(kill_probability=1.0), seed=53)
         fly_first_sortie(wholly)
         sqn = squadron(wholly)
         self.assertEqual(sqn.munitions_expended.get("GBU-38", 0), 0)
@@ -329,7 +339,16 @@ class TestPaperExposure(unittest.TestCase):
         self.assertFalse([x for x in wholly.tracker.losses if x.entity_kind == KIND_TARGET])
 
     def test_a_flight_lost_whole_on_paper_closes_out_like_any_other(self):
-        campaign = Campaign(seed=SEED_BOTH_LOST)
+        """Both elements shot down on paper, and each closes out on its own.
+
+        Against an SA-6 whose envelope reaches as far as the AGM-88C: the SEAD
+        element can be lost on paper only to a site it cannot out-range, and
+        the slice's own SA-6 it out-ranges (docs/design.md, section 5).
+        """
+        campaign = Campaign(
+            theater=theater_with(engagement_radius=launch_range("AGM-88C")),
+            seed=SEED_BOTH_LOST,
+        )
         frames: list = []
         while not blue_packages(campaign) or not first_blue_package(campaign).weapons_released:
             frames.extend(campaign.advance(PAPER_STEP))
@@ -358,13 +377,16 @@ class TestPaperExposure(unittest.TestCase):
     def test_conservation_holds_through_paper_flight_losses(self):
         """A deadlier site, a long war, the books checked at every step.
 
-        Seed 4, not the 14 this flew before SEAD, nor the 5 before red
-        planned: red's raids end most wars within two or three blue sorties,
-        and a suppressed SA-6 kills fewer strikers, so at 14 blue's strike
-        element now loses three aircraft before its war is decided -- too few
-        to prove anything. At 4 the war runs to 8925 s and it loses seven.
+        Seed 370, not the 4 this flew before SEAD elements fired from
+        standoff, the 14 before SEAD, nor the 5 before red planned: red's
+        raids end most wars within two or three blue sorties, a suppressed
+        SA-6 kills fewer strikers, and since red's SEAD element stopped dying
+        to the Patriot red's raids end them sooner still. At 4 blue now wins at
+        4000 s and its strike element loses nothing. Seed 370 is the
+        first, in order, at which it loses at least four: the war runs to
+        11295 s and it loses six.
         """
-        campaign = Campaign(theater=theater_with(kill_probability=0.5), seed=4)
+        campaign = Campaign(theater=theater_with(kill_probability=0.5), seed=370)
         sqn = squadron(campaign)
         sead = sead_squadron(campaign)
         for _ in range(12_000):
@@ -410,11 +432,14 @@ class TestPaperExposure(unittest.TestCase):
         in two blue sorties that both slip past the SA-6 -- about an even
         chance at the placeholder Pk -- so it no longer shows the one thing
         this test is for. Seed 9 was a war blue won *and* paid for, until
-        SEAD elements changed every seed's dice; seed 2 is one now, and its
-        strike element pays. Whether both sides pay is TestBothSidesFight's
+        SEAD elements changed every seed's dice; then seed 2, until SEAD
+        elements fired from standoff and red's raids, no longer losing their
+        SEAD element to the Patriot, began winning most wars by 3945 s. Seed
+        48 is the first, in order, that blue wins (at 4000 s) and its strike
+        element pays for. Whether both sides pay is TestBothSidesFight's
         business.
         """
-        campaign = Campaign(seed=2)
+        campaign = Campaign(seed=48)
         run_steps(campaign, int(40_000 / PAPER_STEP))
         sqn = squadron(campaign)
         self.assertGreaterEqual(sqn.airframes_lost, 1, "blue cannot lose a war it does not watch")

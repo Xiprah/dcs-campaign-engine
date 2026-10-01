@@ -421,12 +421,17 @@ class TestObserversDoNotOutliveTheWarMovingOn(unittest.TestCase):
 def _mid_sortie_save(path: Path, *, disconnect: bool) -> Campaign:
     """A real save, written with the flight and the depot instantiated.
 
-    Seed 3, a war blue wins at 4000 s, because what the tests below read off
-    the result is the depot destroyed: proof that paper strikes reached it.
-    The default seed was such a war until SEAD elements changed every seed's
-    dice; at it, red now wins first.
+    Seed 10, a war blue wins at 1475 s with the paper strike that follows
+    this save, because what the tests below read off the result is the depot
+    destroyed: proof that paper strikes reached it. The default seed was such
+    a war until SEAD elements changed every seed's dice, and seed 3 until
+    they fired from standoff: an escorted TOT now draws no exposure dice for
+    a SEAD element that out-ranges its site, and at 3 red now wins at 6435 s
+    with the depot standing. Seed 10 is the first, in order, that blue wins
+    whether or not the save was detached; at 4, 8 and 9 the depot falls
+    too, but only after red has won.
     """
-    campaign = Campaign(seed=3)
+    campaign = Campaign(seed=10)
     drive(
         campaign,
         observer_positions=OBSERVER_AT_TARGET,

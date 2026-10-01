@@ -28,8 +28,15 @@ not holding at its TOT is flown through the enemy's air defences on paper
 can be lost as well as won. A SEAD element flies first, and its missiles are
 rolled here too (:func:`resolve_strike` at :data:`ARM_PK`); what it buys the
 strikers is a lower kill probability (:func:`suppressed_kill_probability`),
-never a different roll. When SEAD may act on paper at all is
-docs/design.md, section 5.
+never a different roll. A SEAD element whose missile out-ranges a site fires
+from outside its envelope and is never rolled against it: the caller leaves
+that site out of the list it passes :func:`resolve_exposure`. When SEAD may
+act on paper at all is docs/design.md, section 5.
+
+**Dice.** How many draws a resolution takes is decided by the situation --
+the geometry, the content, and what earlier steps left alive -- and never by
+how the dice in it fall. An out-ranged site is content, so the rolls it no
+longer takes are a different situation, not a different outcome.
 
 This is also the one place the campaign's seeded RNG earns its keep. Every roll
 here comes off `Campaign.rng`, whose state round-trips through the save, so an
@@ -101,10 +108,10 @@ def resolve_exposure(
 ) -> ExposureOutcome:
     """Roll a flight's exposure to the threat sites along its route.
 
-    `kill_probabilities` has one entry per site whose envelope the route
-    enters, in the order the sites are to fire. Every site rolls once for
-    every aircraft, and an aircraft is lost if any site's roll against it
-    succeeds.
+    `kill_probabilities` has one entry per site whose envelope the flight
+    has to enter, in the order the sites are to fire. Every site rolls once
+    for every aircraft, and an aircraft is lost if any site's roll against
+    it succeeds.
 
     Every aircraft is rolled against every site even once it is already dead,
     so the draws taken from `rng` are exactly `aircraft * len(sites)` whatever

@@ -58,7 +58,13 @@ from campaign.attrition import (
     LossRecord,
 )
 from campaign.bubble import bubble_delta, resolve_bubble
-from campaign.oob import SideInventory, Squadron, UnknownReservation, build_slice_oob
+from campaign.oob import (
+    SideInventory,
+    Squadron,
+    UnknownReservation,
+    build_slice_oob,
+    launch_range,
+)
 from campaign.resolver import (
     ARM_PK,
     resolve_exposure,
@@ -694,13 +700,13 @@ class Campaign:
         """Resolve every element's part in the package's time on target.
 
         docs/design.md, section 5, in this order: the SEAD element flies its
-        exposure at the sites' full kill probability, because it goes in
-        first; its survivors' missiles are resolved against the sites and
-        may destroy units; the suppression they bought cuts the sites' kill
-        probability for the strike element; the strike element flies its
-        exposure; its survivors release. Each step reads what the one before
-        it left, so a site the SEAD element destroyed does not fire at the
-        strikers at all.
+        exposure to the sites it cannot out-range, at their full kill
+        probability, because it goes in first; its survivors' missiles are
+        resolved against the sites and may destroy units; the suppression
+        they bought cuts the sites' kill probability for the strike element;
+        the strike element flies its exposure; its survivors release. Each
+        step reads what the one before it left, so a site the SEAD element
+        destroyed does not fire at the strikers at all.
 
         Authority is decided per entity, here, exactly as section 1 says. An
         element DCS is holding is never flown through the sites on paper, and
@@ -776,6 +782,29 @@ class Campaign:
             enemy_of(package.coalition), base.pos, target.pos
         )
 
+    def _exposed_sites(self, package: Package, element: Element) -> list[ThreatSite]:
+        """The sites on the route whose envelope this element has to enter.
+
+        A strike element has to reach its target, so it meets every site the
+        route passes. A SEAD element's targets are the sites themselves, and
+        an anti-radiation missile is fired from outside the envelope of a
+        site it out-ranges (docs/design.md, section 5): that site never gets
+        a shot at it. Without this the SEAD element flew into each site at
+        its full kill probability, and a package lost more aircraft escorted
+        than alone -- the opposite of why SEAD is flown.
+
+        Decided by content alone -- the munition's launch range against the
+        site's radius -- never by who holds the site or whether this element
+        has a paper shot at it, so an out-ranged site is out-ranged in every
+        row of section 5's table. Fewer sites is fewer dice, and that is the
+        situation's doing, never the dice's.
+        """
+        sites = self._route_threats(package)
+        if element.role != ROLE_SEAD:
+            return sites
+        reach = launch_range(element.munition)
+        return [site for site in sites if not site.outranged_by(reach)]
+
     def _expose(
         self, package: Package, element: Element, suppression: dict[str, int]
     ) -> list[Downlink]:
@@ -788,13 +817,16 @@ class Campaign:
         `suppression` is what a SEAD element bought against each site, and
         only reaches the kill probability: the draws are the same whether or
         not anyone suppressed anything.
+
+        A SEAD element meets only the sites it cannot out-range
+        (`_exposed_sites`).
         """
         if self.tracker.is_instantiated(element.spawn_id):
             return []  # DCS has it; the snapshot is the authority.
         group = self.tracker.groups.get(element.spawn_id)
         if group is None:
             return []
-        sites = self._route_threats(package)
+        sites = self._exposed_sites(package, element)
         outcome = resolve_exposure(
             aircraft=group.units_alive,
             kill_probabilities=[

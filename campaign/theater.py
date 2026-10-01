@@ -218,6 +218,15 @@ class ThreatSite:
         """Does the leg `a`-`b` enter this site's engagement envelope?"""
         return ground_distance_to_segment(self.pos, a, b) <= self.engagement_radius
 
+    def outranged_by(self, launch_range: float) -> bool:
+        """Can a weapon with this launch range reach the site from outside it?
+
+        Strictly greater: a missile that can only be fired from the edge of
+        the envelope has to be carried to that edge, and a site whose radius
+        is at least the launch range gets its shot at the carrier.
+        """
+        return launch_range > self.engagement_radius
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -336,9 +345,15 @@ def enemy_of(coalition: Coalition) -> Coalition:
     return OPPOSING[coalition]
 
 
-#: Placeholder envelope for an SA-6 battery: roughly the 2K12's published
-#: maximum engagement range, trimmed, as one ground radius. See ThreatSite.
-SA6_ENGAGEMENT_RADIUS = 20_000.0
+#: Placeholder envelope for an SA-6 battery, as one ground radius: the
+#: published maximum range of its 3M9 missile, 24 km (Wikipedia, "2K12 Kub",
+#: infobox; its variant table gives 22 to 25 km). The published maximum and
+#: not a trimmed one, because it is compared against the anti-radiation
+#: missiles' published maxima (`oob.ANTI_RADIATION_LAUNCH_RANGE`) to decide
+#: whether a SEAD element can stand off, and trimming one side of that
+#: comparison would decide it by the trim. A maximum overstates the envelope
+#: against a low flyer; the paper track has one altitude. See ThreatSite.
+SA6_ENGAGEMENT_RADIUS = 24_000.0
 
 #: Placeholder per-aircraft kill probability for one pass through an SA-6
 #: envelope. Not derived from anything: it is set so that an undefended strike
@@ -346,11 +361,12 @@ SA6_ENGAGEMENT_RADIUS = 20_000.0
 #: offline war to be losable. TODO(threat-model) replaces it.
 SA6_KILL_PROBABILITY = 0.15
 
-#: Placeholder envelope for a Patriot battery, as one ground radius. Well
-#: inside the system's published reach against aircraft, and trimmed the same
-#: way the SA-6's is: a flat radius stands for an envelope that really depends
-#: on altitude, aspect and terrain. See ThreatSite.
-PATRIOT_ENGAGEMENT_RADIUS = 40_000.0
+#: Placeholder envelope for a Patriot battery, as one ground radius: the
+#: system's published maximum range, 160 km (Wikipedia, "MIM-104 Patriot",
+#: infobox; its table marks the PAC-2 GEM figure an estimate). Untrimmed for
+#: the SA-6's reason. A flat radius stands for an envelope that really
+#: depends on altitude, aspect and terrain. See ThreatSite.
+PATRIOT_ENGAGEMENT_RADIUS = 160_000.0
 
 #: Deliberately the SA-6's number, not a judgement that the two systems are
 #: equals. Both are uncalibrated placeholders, and giving one side a better

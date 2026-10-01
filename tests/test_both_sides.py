@@ -32,7 +32,7 @@ import unittest
 from campaign.api import PAPER_STEP
 from campaign.attrition import CAUSE_UNOBSERVED, KIND_FLIGHT, KIND_TARGET
 from campaign.campaign import Campaign
-from campaign.oob import ANTI_RADIATION_MUNITIONS
+from campaign.oob import ANTI_RADIATION_MUNITIONS, launch_range
 from campaign.planner import ABORTED, DESTROYED, OPEN_STATES, PLANNED
 from campaign.protocol import Message
 from campaign.theater import Theater, build_slice_theater
@@ -52,17 +52,27 @@ DRAWN = (
 )
 
 #: Seeds pinned by flying the slice as shipped, offline, to its end: at seed
-#: 3 blue wins at 4000 s, at seed 1 red wins at 6435 s. Re-pinned when SEAD
-#: elements arrived: they draw dice at every escorted TOT, so every seed's
-#: war fell differently, and the default seed became a red win (3945 s).
+#: 3 blue wins at 6525 s, at seed 6 red wins at 3945 s with blue's depot
+#: still standing. Re-pinned when SEAD elements arrived: they draw dice at
+#: every escorted TOT, so every seed's war fell differently, and the default
+#: seed became a red win (3945 s). Re-pinned again when SEAD elements began
+#: firing from standoff: an element that out-ranges the site it faces draws
+#: no exposure dice, so every escorted TOT draws fewer. Seed 3 still ends in
+#: a blue win, now at 6525 s rather than 4000 s. Seed 1 still ends in a red
+#: win at 6435 s, but blue's third package, already airborne, flattens the
+#: depot 90 s later; seed 6 is the first, in order, at which red wins and the
+#: depot survives. The default seed is now a blue win, at 4000 s.
 SEED_BLUE_WINS = 3
-SEED_RED_WINS = 1
+SEED_RED_WINS = 6
 #: A day of war on the slice as shipped in which each side's strike element
 #: loses aircraft to the other's air defences and each side's bombs destroy
-#: part of the other's target. Found by flying seeds in order: at seed 2 blue
-#: wins at 9050 s after both sides have bled. Re-pinned from 9 with SEAD, for
-#: the reason above.
-SEED_BOTH_BLEED = 2
+#: part of the other's target. Found by flying seeds in order: at seed 20 red
+#: wins at 3945 s after both strike elements have lost a jet. Re-pinned from
+#: 9 with SEAD, and from 2 with standoff, for the reasons above: at 2 neither
+#: strike element now loses anything. With neither SEAD element exposed and
+#: both sites suppressed, a strike element that loses a jet is rarer than it
+#: was, and seed 20 is the first at which both sides' do.
+SEED_BOTH_BLEED = 20
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +326,15 @@ class TestRedFacesBlueAirDefences(unittest.TestCase):
         self.assertEqual([s.id for s in theater.live_threats_along("blue", *route)], [PATRIOT])
 
     def test_a_red_raid_can_be_shot_down_on_paper(self):
-        campaign = Campaign(theater=slice_with(**{PATRIOT: {"kill_probability": 1.0}}))
+        # A Patriot that reaches as far as the Kh-58U, so red's SEAD element
+        # has to fly into it to fire: from standoff -- the slice's own
+        # Patriot -- it would live, suppress, and spare the strikers some of
+        # the time (test_sead.TestStandoff says so).
+        campaign = Campaign(
+            theater=slice_with(
+                **{PATRIOT: {"kill_probability": 1.0, "engagement_radius": launch_range("Kh-58U")}}
+            )
+        )
         frames = fly_until(campaign, first_red_raid_released, limit=5_000.0)
         package = packages_of(campaign, "red")[0]
 
@@ -338,7 +356,10 @@ class TestRedFacesBlueAirDefences(unittest.TestCase):
         self.assertIn("Incirlik Patriot engaged: 2 enemy aircraft down.", texts(frames))
 
     def test_a_route_clear_of_the_patriot_takes_no_losses_and_no_dice(self):
-        far = slice_with(**{PATRIOT: {"kill_probability": 1.0, "pos": (-60_000.0, 0.0, 120_000.0)}})
+        # Far enough that the Patriot's published 160 km envelope misses red's
+        # route: the 100 km this test used when the radius was a trimmed 40 km
+        # would now put Bassel al-Assad itself inside it.
+        far = slice_with(**{PATRIOT: {"kill_probability": 1.0, "pos": (-250_000.0, 0.0, 300_000.0)}})
         missed = Campaign(theater=far)
         fly_until(missed, first_red_raid_released, limit=5_000.0)
         self.assertEqual(flight_losses(missed, "red"), [])
@@ -406,15 +427,20 @@ class TestConservationOnBothSides(unittest.TestCase):
         a Pk of 0.3 at both sites makes losses common on both sides. Forty
         units a site too, now that SEAD missiles can destroy one: a five-unit
         battery is gone within a few escorted sorties, and after that nobody
-        loses anything and the books balance trivially. Every squadron and
-        every reservation is checked after every paper step.
+        loses anything and the books balance trivially. And sites that reach
+        as far as the missiles fired at them: a SEAD element that out-ranges
+        its site is never shot at on paper, and the SEAD squadrons' books
+        would balance trivially too. Every squadron and every reservation is
+        checked after every paper step.
         """
         theater = slice_with(
             **{
                 DEPOT: {"units_initial": 40, "units_alive": 40},
                 STORAGE: {"units_initial": 40, "units_alive": 40},
-                SA6: {"kill_probability": 0.3, "units_initial": 40, "units_alive": 40},
-                PATRIOT: {"kill_probability": 0.3, "units_initial": 40, "units_alive": 40},
+                SA6: {"kill_probability": 0.3, "units_initial": 40, "units_alive": 40,
+                      "engagement_radius": launch_range("AGM-88C")},
+                PATRIOT: {"kill_probability": 0.3, "units_initial": 40, "units_alive": 40,
+                          "engagement_radius": launch_range("Kh-58U")},
             }
         )
         campaign = Campaign(theater=theater)

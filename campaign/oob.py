@@ -20,12 +20,44 @@ from typing import Any
 
 from campaign.protocol import Coalition
 
+#: Launch range in metres of each anti-radiation munition: how far from a
+#: site a SEAD element can fire at it. A SEAD element whose missile out-ranges
+#: a site engages it from outside its envelope and, on paper, is not exposed
+#: to it (docs/design.md, section 5). Each figure is the munition's published
+#: *maximum*, because each site's `engagement_radius` is its published
+#: maximum too, and comparing one statistic against a different one would
+#: decide the standoff by the choice of statistic. Placeholders, untuned.
+#: TODO(threat-model): launch range really depends on release altitude and
+#: speed, as the sources below say; the paper track has one altitude.
+ANTI_RADIATION_LAUNCH_RANGE: dict[str, float] = {
+    # 80 nmi "standoff", Wikipedia, "AGM-88 HARM", infobox (uncited there;
+    # the same infobox gives 25 km low-level and 80 km medium-level). No
+    # separate figure is published for the C model. The USAF fact sheet
+    # gives only "48 plus kilometers".
+    "AGM-88C": 148_000.0,
+    # Wikipedia, "Kh-58", infobox, "Kh-58U: 250 km", citing the Journal of
+    # Electronic Defense's International Electronic Countermeasures Handbook
+    # (2004). The same article gives the original Kh-58 36 km from low level
+    # and 120 km from 10,000 m.
+    "Kh-58U": 250_000.0,
+}
+
 #: Munitions that home on an emitting radar. What the planner looks for when
 #: it wants a SEAD element (docs/design.md, section 5), and what it will not
 #: hang on a strike: an anti-radiation missile has nothing to guide on at a
 #: fuel depot. Content, like the stock itself: a side whose squadrons carry
 #: none of these simply never flies SEAD.
-ANTI_RADIATION_MUNITIONS = frozenset({"AGM-88C", "Kh-58U"})
+ANTI_RADIATION_MUNITIONS = frozenset(ANTI_RADIATION_LAUNCH_RANGE)
+
+
+def launch_range(munition: str) -> float:
+    """How far from its target `munition` can be released, in metres.
+
+    Zero for anything not in :data:`ANTI_RADIATION_LAUNCH_RANGE`, so a
+    munition nobody has given a range out-ranges nothing and its carrier
+    flies into every envelope on its route, as every flight did before.
+    """
+    return ANTI_RADIATION_LAUNCH_RANGE.get(munition, 0.0)
 
 
 class InsufficientInventory(Exception):
