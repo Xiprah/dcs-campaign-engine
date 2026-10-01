@@ -439,8 +439,9 @@ def build_package(
 ) -> Package | None:
     """Commit a package, or return None if inventory cannot cover its strike.
 
-    `spawn_id` is the strike element's. `threats` are the live enemy sites
-    whose envelopes the route enters (`Theater.live_threats_along`); when there
+    `spawn_id` is the strike element's. `threats` are the enemy sites that can
+    engage -- a battery whose radar is gone cannot (docs/design.md, section 7)
+    -- whose envelopes the route enters (`Theater.live_threats_along`); when there
     are any, and the base has a squadron with anti-radiation missiles to cover
     a SEAD element, one is attached, with a spawn id from `next_spawn_id`.
     Without either, the package is its strike element alone -- the one-flight

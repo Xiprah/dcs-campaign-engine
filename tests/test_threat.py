@@ -57,9 +57,20 @@ SEAD_SQUADRON = "vfa_incirlik_f16_sead"
 #: loses nothing on blue's first sortie; 3 still loses nothing; 480 is no
 #: longer a whole package lost. Each new seed is the first, in order, that
 #: does what its name says.
+#:
+#: Re-pinned again when site units became typed (docs/design.md, section 7):
+#: an anti-radiation missile that hits now destroys the battery's radar, and
+#: a battery without one throws no dice at the strikers behind it -- red's
+#: raid, a TOT before blue's, included, so every later draw moved. At seed 8
+#: red's Kh-58Us take the Patriot's radar and blue's HARMs the SA-6's, and
+#: blue's first sortie loses nothing; at 2806 the SEAD element's HARMs blind
+#: the in-reach SA-6 before the strikers arrive and nobody is lost. Seed 35
+#: is the first, in order, at which blue's first sortie loses one strike
+#: aircraft and nothing else, and seed 729 the first at which it loses both
+#: elements whole. Seed 3 still gets through untouched.
 SEED_UNTOUCHED = 3
-SEED_ONE_LOST = 8
-SEED_BOTH_LOST = 2806
+SEED_ONE_LOST = 35
+SEED_BOTH_LOST = 729
 
 
 def theater_with(**site_changes: object) -> Theater:
@@ -228,7 +239,9 @@ class TestThreatSitesAreNotTargets(unittest.TestCase):
 
     def test_it_survives_a_save_with_its_damage(self):
         campaign = Campaign()
-        campaign.tracker.record_unobserved(campaign.theater.threats[SA6].spawn_id, 2, 0.0)
+        campaign.tracker.record_unobserved(
+            campaign.theater.threats[SA6].spawn_id, 2, 0.0, unit_type="Kub 2P25 ln"
+        )
         campaign.theater.threats[SA6].units_alive = 3
         reloaded = Campaign.from_dict(campaign.to_dict())
         self.assertEqual(reloaded.to_dict(), campaign.to_dict())
@@ -328,8 +341,13 @@ class TestPaperExposure(unittest.TestCase):
         # standoff. Since then a Pk of one is no longer certain death for
         # blue's strikers: the SEAD element survives the SA-6, which it
         # out-ranges, and two suppressors leave a quarter of the Pk. Seed 53
-        # is the first at which both strikers die anyway and red misses.
-        wholly = Campaign(theater=theater_with(kill_probability=1.0), seed=53)
+        # was the first at which both strikers die anyway and red misses,
+        # until site units were typed (docs/design.md, section 7): a HARM that
+        # hits now takes the SA-6's radar and a blind battery fires at no one,
+        # so at 53 the strikers live and flatten the depot. Seed 369 is the
+        # first, in order, at which no HARM hits, both strikers die, and red's
+        # raid -- which blinded the Patriot -- misses the storage area.
+        wholly = Campaign(theater=theater_with(kill_probability=1.0), seed=369)
         fly_first_sortie(wholly)
         sqn = squadron(wholly)
         self.assertEqual(sqn.munitions_expended.get("GBU-38", 0), 0)
@@ -385,8 +403,16 @@ class TestPaperExposure(unittest.TestCase):
         4000 s and its strike element loses nothing. Seed 370 is the
         first, in order, at which it loses at least four: the war runs to
         11295 s and it loses six.
+
+        Re-pinned from 370 when site units became typed (docs/design.md,
+        section 7): the first HARM to hit now blinds the SA-6, and the slice
+        never repairs it, so every sortie after that crosses a battery that
+        cannot fire. At 370 that happens early enough that blue's strike
+        element loses three, and red wins at 8925 s. Seed 1632 is the first,
+        in order, at which it still loses at least four: five, before red
+        wins at 6435 s with the SA-6's radar never hit.
         """
-        campaign = Campaign(theater=theater_with(kill_probability=0.5), seed=370)
+        campaign = Campaign(theater=theater_with(kill_probability=0.5), seed=1632)
         sqn = squadron(campaign)
         sead = sead_squadron(campaign)
         for _ in range(12_000):
@@ -438,8 +464,14 @@ class TestPaperExposure(unittest.TestCase):
         48 is the first, in order, that blue wins (at 4000 s) and its strike
         element pays for. Whether both sides pay is TestBothSidesFight's
         business.
+
+        Re-pinned from 48 when site units became typed (docs/design.md,
+        section 7): a HARM hit now blinds the SA-6 instead of taking a
+        launcher, and at 48 red's raids win at 3945 s with blue's strikers
+        untouched. Seed 118 is the first, in order, at which blue wins (at
+        4000 s) and its strike element loses an aircraft.
         """
-        campaign = Campaign(seed=48)
+        campaign = Campaign(seed=118)
         run_steps(campaign, int(40_000 / PAPER_STEP))
         sqn = squadron(campaign)
         self.assertGreaterEqual(sqn.airframes_lost, 1, "blue cannot lose a war it does not watch")

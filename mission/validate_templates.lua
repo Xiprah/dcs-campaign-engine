@@ -36,6 +36,10 @@
   them to the engine through its WEAPON_NAMES table, which is a guess; these
   cases record the names DCS actually uses and whether the table knows them.
 
+  The `emission.*` case answers a fourth: does Group:enableEmission turn an
+  air-defence battery's radars off and on? The client relies on it to keep a
+  battery the campaign has off the air on paper off the air in the sim.
+
   WHERE THE VALUES COME FROM
 
   The client keeps its content in locals. Only `TEMPLATES` is exported
@@ -1562,6 +1566,62 @@ local function build_cases()
                     payload = payload,
                     x = x, y = y, alt = CONFIG.altitude,
                 })}, cid, cat)
+            end,
+        })
+    end
+
+    -- 9. Emission control on an air-defence battery. The client keeps a
+    -- battery built mid-shutdown off the air with Group:enableEmission(false)
+    -- and turns it back on at the instant the paper has it back
+    -- (docs/design.md, section 7). Nobody has seen that call work on a SAM
+    -- group in this DCS; this case asks it both ways. Not required: until it
+    -- passes, the client's guarded call leaves the battery emitting, which
+    -- is the documented mismatch, not a broken spawn.
+    local sam = SPEC.templates["SA-6_Kub_site"]
+    if sam then
+        add({
+            id = "emission.SA-6_Kub_site",
+            kind = "group",
+            required = false,
+            label = "Group:enableEmission(false) then (true) on SA-6_Kub_site",
+            attempt = function(case, index)
+                local rec = new_case_record(case)
+                local cid = country_id(sam.probe_country or "RUSSIA")
+                local cat = group_category(SPEC.category[sam.probe_category or "ground"])
+                if cid == nil or cat == nil then
+                    rec.status = "SKIP"
+                    rec.error = "country or Group.Category unavailable"
+                    return rec
+                end
+                local x, y = case_position(index)
+                local name = NAME_PREFIX .. "emission_sa6"
+                rec = try_group(rec, {data = build_group_data({
+                    name = name,
+                    unit_type = sam.unit_type,
+                    lead_type = sam.lead_type,
+                    count = sam.count,
+                    task = sam.task,
+                    skill = sam.skill,
+                    ground = true,
+                    x = x, y = y, alt = 0,
+                })}, cid, cat)
+                if rec.status ~= "OK" then return rec end
+                local grp = live_group(name)
+                if not grp or type(grp.enableEmission) ~= "function" then
+                    rec.status = "REJECTED"
+                    rec.error = "Group:enableEmission is not available"
+                    return rec
+                end
+                local off_ok, off_err = pcall(function() grp:enableEmission(false) end)
+                local on_ok, on_err = pcall(function() grp:enableEmission(true) end)
+                rec.detail.emission_off = off_ok
+                rec.detail.emission_on = on_ok
+                if not (off_ok and on_ok) then
+                    rec.status = "REJECTED"
+                    rec.error = "enableEmission raised: "
+                                .. tostring(off_ok and on_err or off_err)
+                end
+                return rec
             end,
         })
     end

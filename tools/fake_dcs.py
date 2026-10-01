@@ -115,6 +115,20 @@ TEMPLATE_CAPACITY: dict[str, int] = {
     "munitions_storage_large": 24,
     "fuel_depot_large": 24,
 }
+#: Each air-defence template's (lead_type, unit_type), as the client's
+#: TEMPLATES declare them: the radar built first, then launchers. A Tor is its
+#: own radar, so the SA-15 names one type twice. The harness builds and
+#: reports a ground group's units by these names, as the client does
+#: (docs/protocol.md, `unit_types`), and refuses a `composition` that names
+#: anything else, in the client's words.
+TEMPLATE_UNIT_TYPES: dict[str, tuple[str, str]] = {
+    "SA-6_Kub_site": ("Kub 1S91 str", "Kub 2P25 ln"),
+    "Patriot_site": ("Patriot str", "Patriot ln"),
+    "SA-11_Buk_site": ("SA-11 Buk SR 9S18M1", "SA-11 Buk LN 9A310M1"),
+    "SA-15_Tor_site": ("Tor 9A331", "Tor 9A331"),
+    "Hawk_site": ("Hawk tr", "Hawk ln"),
+    "Roland_site": ("Roland Radar", "Roland ADS"),
+}
 #: Who the harness's scripted defender is, by the coalition of the flight it
 #: shoots at. Attribution only -- the engine may never act on it -- but a red
 #: jet "killed by red_sa6_bassel" would make a misleading ledger to read.
@@ -213,10 +227,26 @@ class SimGroup:
     #: aircraft, which the client reports no ammunition for either.
     ammo: dict[str, int] | None = None
     ammo_initial: dict[str, int] | None = None
+    #: A ground group's living units' DCS types, in the order they were
+    #: built; as long as `units`. None for anything else, which the client
+    #: reports no types for.
+    types: list[str] | None = None
+    #: Mission time until which a ground group's radars are off the air, as
+    #: the client's emission control holds them (`emission_off_until`).
+    dark_until: float | None = None
 
     @property
     def name(self) -> str:
         return group_name(self.spawn_id)
+
+    def unit_types(self) -> dict[str, int] | None:
+        """The living units by type, as the client's census counts them."""
+        if self.types is None:
+            return None
+        counts: dict[str, int] = {}
+        for unit_type in self.types[: max(0, self.units)] if self.alive else []:
+            counts[unit_type] = counts.get(unit_type, 0) + 1
+        return dict(sorted(counts.items()))
 
 
 def _whole(value: object) -> bool:
@@ -226,6 +256,44 @@ def _whole(value: object) -> bool:
     if isinstance(value, int):
         return True
     return isinstance(value, float) and value.is_integer()
+
+
+def _composition_types(
+    template: str, units: int, composition: object
+) -> tuple[list[str] | None, str | None]:
+    """The unit types a ground spawn builds, in order; or why it is refused.
+
+    The client's `unit_types_for`, word for word: with no `composition`, the
+    template's lead type first and then its unit type; with one, exactly the
+    units it names, lead type first, each a type the template declares, no
+    more of each than the template holds, adding up to `units`.
+    """
+    if template not in TEMPLATE_UNIT_TYPES:
+        return None, None
+    lead, unit = TEMPLATE_UNIT_TYPES[template]
+    if composition is None:
+        return [lead if i == 0 else unit for i in range(units)], None
+    if not isinstance(composition, dict):
+        return None, "bad composition: not an object"
+    capacity = TEMPLATE_CAPACITY.get(template, DEFAULT_GROUND_UNITS)
+    limits = {lead: capacity} if lead == unit else {lead: 1, unit: capacity - 1}
+    total = 0
+    for unit_type in sorted(composition):
+        count = composition[unit_type]
+        if unit_type not in limits:
+            return None, f"bad composition: {template} has no unit type {unit_type}"
+        if not _whole(count) or count < 0:
+            return None, f"bad composition: {unit_type} count is not a whole number"
+        if count > limits[unit_type]:
+            return None, (
+                f"bad composition: {int(count)} {unit_type} exceeds template "
+                f"{template} capacity of {limits[unit_type]}"
+            )
+        total += int(count)
+    if total != units:
+        return None, f"bad composition: {total} unit(s), spawn says {units}"
+    order = [lead] + ([unit] if unit != lead else [])
+    return [t for t in order for _ in range(int(composition.get(t, 0)))], None
 
 
 def _hdist(a: list[float] | tuple[float, ...], b: list[float] | tuple[float, ...]) -> float:
@@ -395,6 +463,17 @@ class FakeDCS:
                 f"units {int(units)} exceeds template {frame.template} "
                 f"capacity of {capacity}"
             )
+        if frame.category == "ground" and isinstance(frame.tasking, dict):
+            _, why = _composition_types(
+                frame.template, int(units), frame.tasking.get("composition")
+            )
+            if why is not None:
+                return why
+            dark = frame.tasking.get("emission_off_until")
+            if dark is not None and (isinstance(dark, bool) or not isinstance(dark, (int, float))):
+                # In the client's words: Lua's tostring spells booleans lower-case.
+                shown = str(dark).lower() if isinstance(dark, bool) else str(dark)
+                return f"bad spawn payload: malformed emission_off_until: {shown}"
         for wp in frame.route:
             if wp.airdrome_id is not None and not _whole(wp.airdrome_id):
                 return f"bad spawn payload: malformed airdrome_id: {wp.airdrome_id!r}"
@@ -435,6 +514,17 @@ class FakeDCS:
             resolved=frame.spawn_id in self.struck,
             ammo=ammo,
             ammo_initial=None if ammo is None else dict(ammo),
+            types=(
+                _composition_types(frame.template, units, tasking.get("composition"))[0]
+                if frame.category == "ground"
+                else None
+            ),
+            dark_until=(
+                float(tasking["emission_off_until"])
+                if frame.category == "ground"
+                and tasking.get("emission_off_until") is not None
+                else None
+            ),
         )
         self.groups[frame.spawn_id] = group
         self.saw_spawn = True
@@ -632,7 +722,10 @@ class FakeDCS:
                 "shot", initiator=flight.name, target=site.name, weapon=weapon
             )
             before = site.units
-            site.units = max(0, site.units - max(0, self.cfg.sead_kills))
+            # A battery whose radars are off the air has nothing for the
+            # missiles to home on, exactly as in DCS under emission control.
+            dark = site.dark_until is not None and self.t < site.dark_until
+            self._kill_emitters(site, 0 if dark else max(0, self.cfg.sead_kills))
             site.alive = site.units > 0
             for _ in range(before - site.units):
                 await self._emit_event(
@@ -740,6 +833,25 @@ class FakeDCS:
         )
 
     @staticmethod
+    def _kill_emitters(site: SimGroup, count: int) -> None:
+        """An anti-radiation missile destroys the radar it homes on.
+
+        So a SEAD pass takes the site's emitters -- its lead type, or every
+        unit of a battery whose units are their own radars -- and nothing
+        else: with no radar left there is nothing to home on. The engine
+        reads which units went from the census's `unit_types`.
+        """
+        if site.types is None:
+            site.units = max(0, site.units - count)
+            return
+        emitter = TEMPLATE_UNIT_TYPES[site.template][0]
+        for _ in range(count):
+            if emitter not in site.types[: site.units]:
+                return
+            site.types.remove(emitter)
+            site.units -= 1
+
+    @staticmethod
     def _expend(group: SimGroup, munition: str, count: int) -> None:
         if group.ammo is None or count <= 0:
             return
@@ -831,6 +943,7 @@ class FakeDCS:
                     pos=(group.pos[0], group.pos[1], group.pos[2]),
                     ammo=self._ammo_report(group.ammo, group.units),
                     ammo_initial=self._ammo_report(group.ammo_initial, group.units_initial),
+                    unit_types=group.unit_types(),
                 )
             )
         await self._send(StateReport(seq=self._next_seq(), t=self.t, groups=snapshots))

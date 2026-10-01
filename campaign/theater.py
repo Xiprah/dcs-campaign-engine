@@ -175,6 +175,62 @@ class Target:
         )
 
 
+#: Each air-defence template's emitter and launcher, by the DCS unit type
+#: names the client's TEMPLATES build it from (mission/campaign_client.lua:
+#: `lead_type`, then `unit_type`). The emitter is the radar an anti-radiation
+#: missile homes on, and without which the battery cannot engage. A Tor
+#: vehicle is its own radar and launcher, so the SA-15 names one type twice:
+#: every unit is an emitter, and the battery is blind only when it is gone.
+#:
+#: The SA-11's 9A310M1 and the Roland ADS carry fire-control radars of their
+#: own and could in principle engage without the battery's search radar. Here
+#: the lead type is the battery's one emitter, as docs/design.md, section 7,
+#: decides, which makes those two easier to blind than the real systems.
+#: TODO(threat-model): per-unit emitters, with the rest of the envelope model.
+SITE_UNIT_TYPES: dict[str, tuple[str, str]] = {
+    "SA-6_Kub_site": ("Kub 1S91 str", "Kub 2P25 ln"),
+    "Patriot_site": ("Patriot str", "Patriot ln"),
+    "SA-11_Buk_site": ("SA-11 Buk SR 9S18M1", "SA-11 Buk LN 9A310M1"),
+    "SA-15_Tor_site": ("Tor 9A331", "Tor 9A331"),
+    "Hawk_site": ("Hawk tr", "Hawk ln"),
+    "Roland_site": ("Roland Radar", "Roland ADS"),
+}
+
+
+@dataclass(frozen=True)
+class SiteRepair:
+    """How fast a theater's air defences are repaired while DCS is not holding them.
+
+    Seconds of repair work, accrued only while the site is outside DCS, to
+    replace one destroyed radar and to restore one destroyed launcher. The
+    two run side by side, one unit at a time each. None turns that half off,
+    so a theater without repair runs the same code and changes nothing.
+
+    TODO(seam: logistics): repair is free. A logistics model makes it draw
+    spares and crews from a supply network, and stall when that is cut.
+    """
+
+    radar_time: float | None = None
+    launcher_time: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"radar_time": self.radar_time, "launcher_time": self.launcher_time}
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> SiteRepair:
+        def seconds(value: Any) -> float | None:
+            return None if value is None else float(value)
+
+        return cls(
+            radar_time=seconds(raw["radar_time"]),
+            launcher_time=seconds(raw["launcher_time"]),
+        )
+
+
+#: No repair at all: a destroyed unit stays destroyed.
+REPAIR_OFF = SiteRepair()
+
+
 @dataclass
 class ThreatSite:
     """An air-defence site: something that shoots at aircraft flying past it.
@@ -189,6 +245,11 @@ class ThreatSite:
     element's missiles when it does not (docs/design.md, section 5), and a
     destroyed site stops shooting.
 
+    Its units are typed (`units_by_type`, keyed by DCS unit type): a radar and
+    launchers (`SITE_UNIT_TYPES`). An anti-radiation missile homes on the
+    radar, so a paper ARM kill removes the radar, and a site whose radar is
+    gone cannot engage until it is repaired (docs/design.md, section 7).
+
     TODO(threat-model): `engagement_radius` and `kill_probability` are flat
     placeholders -- one ground radius and one per-aircraft Pk for the whole
     site, regardless of altitude, terrain, EW or how many of its launchers are
@@ -202,6 +263,10 @@ class ThreatSite:
     template: str
     category: str
     units_initial: int
+    #: Settable as a bare count, which means the battery the template builds
+    #: from that count: its radar first, then launchers, as a spawn without a
+    #: `composition` builds it. The engine itself only ever changes the typed
+    #: composition (`units_by_type`); see the property installed below.
     units_alive: int
     #: Ground range in metres inside which the site engages.
     engagement_radius: float
@@ -209,6 +274,65 @@ class ThreatSite:
     kill_probability: float
     #: Engine-owned identity, allocated lazily by the Campaign like a target's.
     spawn_id: str = ""
+    #: Seconds of repair work done toward the next radar and the next
+    #: launcher (`SiteRepair`). Saved, because a reload mid-repair must not
+    #: start the work over.
+    radar_repair: float = 0.0
+    launcher_repair: float = 0.0
+    #: Campaign time until which the battery's radar is off the air, forced
+    #: down by an anti-radiation missile on paper; None when it is not. A
+    #: paper state only: the radar is alive, so no snapshot can show it, and
+    #: a spawn carries it to DCS as emission control instead. Saved.
+    dark_until: float | None = None
+
+    @property
+    def radar_type(self) -> str:
+        return SITE_UNIT_TYPES[self.template][0]
+
+    @property
+    def launcher_type(self) -> str:
+        return SITE_UNIT_TYPES[self.template][1]
+
+    def front_built(self, units: int) -> dict[str, int]:
+        """The units the template builds from a bare count: radar first.
+
+        What a spawn without a `composition` builds (docs/protocol.md), and
+        so the battery a count with no types describes.
+        """
+        units = max(0, units)
+        if self.radar_type == self.launcher_type:
+            built = {self.radar_type: units}
+        else:
+            built = {self.radar_type: min(units, 1), self.launcher_type: max(0, units - 1)}
+        return {t: n for t, n in sorted(built.items()) if n > 0}
+
+    @property
+    def full_battery(self) -> dict[str, int]:
+        """Every unit the site has when nothing is destroyed."""
+        return self.front_built(self.units_initial)
+
+    @property
+    def radars_alive(self) -> int:
+        return self.units_by_type.get(self.radar_type, 0)
+
+    @property
+    def can_engage(self) -> bool:
+        """Has the site a radar to engage with?
+
+        Launchers do not enter it: the kill probability was already flat
+        whatever was left of them (TODO(threat-model) above), and on paper
+        nothing takes a launcher off a battery -- only DCS does.
+        """
+        return self.radars_alive > 0
+
+    def engages_at(self, t: float) -> bool:
+        """Can the site engage at campaign time `t`?
+
+        It needs a radar, and the radar on the air: one an anti-radiation
+        missile forced down is off until `dark_until`, and then simply back
+        (docs/design.md, section 7).
+        """
+        return self.can_engage and (self.dark_until is None or t >= self.dark_until)
 
     @property
     def destroyed(self) -> bool:
@@ -227,6 +351,36 @@ class ThreatSite:
         """
         return launch_range > self.engagement_radius
 
+    def repair(self, dt: float, rates: SiteRepair) -> list[str]:
+        """`dt` seconds of repair work. Returns the unit types restored, in order.
+
+        The radar and the launchers are separate jobs, each restoring one
+        unit per period and carrying the remainder toward the next. Work
+        toward a unit that is not missing is not banked: a battery whole again
+        starts from nothing when it next loses something. Draws no dice.
+        Whether to call it at all -- never while DCS holds the site, never
+        for a site with nothing left -- is the caller's (`Campaign._repair`).
+        """
+        restored: list[str] = []
+        full = self.full_battery
+        jobs = [("radar_repair", self.radar_type, rates.radar_time)]
+        if self.launcher_type != self.radar_type:
+            jobs.append(("launcher_repair", self.launcher_type, rates.launcher_time))
+        for attribute, unit_type, period in jobs:
+            missing = full.get(unit_type, 0) - self.units_by_type.get(unit_type, 0)
+            if period is None or missing <= 0:
+                setattr(self, attribute, 0.0)
+                continue
+            progress = getattr(self, attribute) + dt
+            while missing > 0 and progress >= period:
+                progress -= period
+                missing -= 1
+                self.units_by_type[unit_type] = self.units_by_type.get(unit_type, 0) + 1
+                restored.append(unit_type)
+            setattr(self, attribute, progress if missing > 0 else 0.0)
+        self.units_by_type = dict(sorted(self.units_by_type.items()))
+        return restored
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -237,14 +391,18 @@ class ThreatSite:
             "category": self.category,
             "units_initial": self.units_initial,
             "units_alive": self.units_alive,
+            "units_by_type": dict(sorted(self.units_by_type.items())),
             "engagement_radius": self.engagement_radius,
             "kill_probability": self.kill_probability,
             "spawn_id": self.spawn_id,
+            "radar_repair": self.radar_repair,
+            "launcher_repair": self.launcher_repair,
+            "dark_until": self.dark_until,
         }
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> ThreatSite:
-        return cls(
+        site = cls(
             id=raw["id"],
             name=raw["name"],
             coalition=raw["coalition"],
@@ -256,7 +414,30 @@ class ThreatSite:
             engagement_radius=float(raw["engagement_radius"]),
             kill_probability=float(raw["kill_probability"]),
             spawn_id=raw.get("spawn_id", ""),
+            radar_repair=float(raw["radar_repair"]),
+            launcher_repair=float(raw["launcher_repair"]),
+            dark_until=None if raw["dark_until"] is None else float(raw["dark_until"]),
         )
+        site.units_by_type = {
+            str(t): int(n) for t, n in sorted(raw["units_by_type"].items()) if int(n) > 0
+        }
+        return site
+
+
+def _units_alive(site: ThreatSite) -> int:
+    return sum(site.units_by_type.values())
+
+
+def _set_units_alive(site: ThreatSite, units: int) -> None:
+    site.units_by_type = site.front_built(int(units))
+
+
+# Installed after the dataclass is built, so the generated __init__ assigns
+# `units_alive` through the setter: a site constructed, or edited, with a bare
+# count gets the typed battery that count describes, and the two can never
+# disagree. The field stays in the dataclass's fields, so equality and repr
+# still see the count.
+ThreatSite.units_alive = property(_units_alive, _set_units_alive)  # type: ignore[assignment]
 
 
 #: Where the sun is reckoned from on the DCS Syria map: Aleppo, 36 deg 12'
@@ -292,6 +473,10 @@ class Theater:
     airbases: dict[str, Airbase] = field(default_factory=dict)
     targets: dict[str, Target] = field(default_factory=dict)
     threats: dict[str, ThreatSite] = field(default_factory=dict)
+    #: How fast this map's air defences are repaired (docs/design.md, section
+    #: 7). Content, like the sites themselves: one mechanism, and a theater
+    #: that wants none says so here.
+    repair: SiteRepair = REPAIR_OFF
     latitude: float = SYRIA_LATITUDE
     longitude: float = SYRIA_LONGITUDE
     utc_offset: float = SYRIA_UTC_OFFSET
@@ -331,9 +516,16 @@ class Theater:
         return [c for c in owners if not self.surviving_targets_of(c)]
 
     def live_threats_along(
-        self, coalition: Coalition, a: Vec3, b: Vec3
+        self, coalition: Coalition, a: Vec3, b: Vec3, at: float | None = None
     ) -> list[ThreatSite]:
-        """`coalition`'s surviving sites whose envelope the leg `a`-`b` enters.
+        """`coalition`'s engaging sites whose envelope the leg `a`-`b` enters.
+
+        A site with no radar left is not among them: it cannot engage
+        (docs/design.md, section 7), so it exposes no route, gives a SEAD
+        element nothing to home on, and is no reason to send one. With `at`,
+        nor is one whose radar will still be off the air then -- the planner
+        asks at the package's TOT, the TOT at its own instant. Without it,
+        only the radars count: the map with no clock.
 
         Sorted by id, because the caller rolls dice in this order and a replay
         has to roll them in the same one.
@@ -344,6 +536,7 @@ class Theater:
                 for site in self.threats.values()
                 if site.coalition == coalition
                 and not site.destroyed
+                and (site.can_engage if at is None else site.engages_at(at))
                 and site.covers(a, b)
             ),
             key=lambda site: site.id,
@@ -355,6 +548,7 @@ class Theater:
             "airbases": {k: v.to_dict() for k, v in self.airbases.items()},
             "targets": {k: v.to_dict() for k, v in self.targets.items()},
             "threats": {k: v.to_dict() for k, v in self.threats.items()},
+            "repair": self.repair.to_dict(),
             "latitude": self.latitude,
             "longitude": self.longitude,
             "utc_offset": self.utc_offset,
@@ -367,6 +561,7 @@ class Theater:
             airbases={k: Airbase.from_dict(v) for k, v in raw["airbases"].items()},
             targets={k: Target.from_dict(v) for k, v in raw["targets"].items()},
             threats={k: ThreatSite.from_dict(v) for k, v in raw["threats"].items()},
+            repair=SiteRepair.from_dict(raw["repair"]),
             latitude=float(raw["latitude"]),
             longitude=float(raw["longitude"]),
             utc_offset=float(raw["utc_offset"]),
@@ -502,6 +697,10 @@ def build_slice_theater() -> Theater:
         airbases={incirlik.id: incirlik, bassel.id: bassel},
         targets={depot.id: depot, storage.id: storage},
         threats={sa6.id: sa6, patriot.id: patriot},
+        # No repair: the slice's war is decided in two or three sorties, and
+        # every test of it was written against sites that do not come back.
+        # The same repair pass runs on it and restores nothing.
+        repair=REPAIR_OFF,
     )
 
 
@@ -599,6 +798,29 @@ SA11_KILL_PROBABILITY = SA6_KILL_PROBABILITY
 SA15_KILL_PROBABILITY = SA6_KILL_PROBABILITY
 ROLAND_KILL_PROBABILITY = SA6_KILL_PROBABILITY
 HAWK_KILL_PROBABILITY = SA6_KILL_PROBABILITY
+
+
+#: Seconds of repair work, outside DCS, to put a destroyed radar back:
+#: twelve hours. A PLACEHOLDER. No published figure for how long an air
+#: defence takes to replace a radar was found; the nearest thing is
+#: qualitative -- Wikipedia, "AGM-45 Shrike", on the Vietnam war: the
+#: warhead's damage to a Fan Song radar rarely went "beyond a shattered
+#: radar dish, an easy item to replace or repair". Half a day stands for
+#: "easy, but not before the next raid". Chosen before any war was flown
+#: with it, and not to be tuned against the loss rates it produces.
+SYRIA_RADAR_REPAIR_TIME = 12 * 3600.0
+
+#: Seconds of repair work, outside DCS, to restore one destroyed launcher: a
+#: day. A PLACEHOLDER, with no published figure behind it either. Longer than
+#: the radar's because nothing on paper destroys a launcher -- only DCS does,
+#: with bombs, guns or missiles that wreck a vehicle rather than shatter a
+#: dish -- and a wrecked launcher is replaced, not mended.
+SYRIA_LAUNCHER_REPAIR_TIME = 24 * 3600.0
+
+SYRIA_REPAIR = SiteRepair(
+    radar_time=SYRIA_RADAR_REPAIR_TIME,
+    launcher_time=SYRIA_LAUNCHER_REPAIR_TIME,
+)
 
 
 #: Red's strategic targets, which blue strikes, then blue's, which red
@@ -766,6 +988,7 @@ def build_syria_theater() -> Theater:
         airbases={b.id: b for b in airbases},
         targets={t.id: t for t in targets},
         threats={s.id: s for s in threats},
+        repair=SYRIA_REPAIR,
         latitude=SYRIA_LATITUDE,
         longitude=SYRIA_LONGITUDE,
         utc_offset=SYRIA_UTC_OFFSET,

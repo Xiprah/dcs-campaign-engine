@@ -133,6 +133,19 @@ def slice_with(**changes) -> Theater:
 HARM_RANGE = launch_range("AGM-88C")
 
 
+#: The slice's SA-6 rebuilt as a battery whose every unit is its own radar,
+#: as a Tor's is (`theater.SITE_UNIT_TYPES`). Since docs/design.md, section
+#: 7, an anti-radiation missile destroys only an emitter, so against the
+#: real SA-6 -- one radar, four launchers -- the first hit blinds the battery
+#: and no later one destroys anything. The tests that count missiles by the
+#: units they take, and then fly the strike against what is left, are
+#: flown against this battery instead: every hit is a unit, and the battery
+#: engages until its last one, as every site did before units were typed.
+#: Same position, radius and Pk; `units_alive` after `template`, because a
+#: bare count re-types the battery for the template it now has.
+ALL_EMITTERS = {"template": "SA-15_Tor_site", "units_alive": 5}
+
+
 def sa6_in_reach(**fields) -> Theater:
     """The slice with an SA-6 the HARM does not out-range, and `fields` on it.
 
@@ -218,7 +231,8 @@ def share_the_sim(campaign: Campaign, package, site, spent: int) -> None:
                     ammo={"AGM-88C": left} if left else {},
                     ammo_initial={"AGM-88C": FULL_LOAD},
                 ),
-                GroupSnapshot(spawn_id=site.spawn_id, alive=True, units=5, units_initial=5),
+                GroupSnapshot(spawn_id=site.spawn_id, alive=True, units=5, units_initial=5,
+                              unit_types=dict(site.units_by_type)),
             ],
         )
     )
@@ -595,8 +609,13 @@ class TestThePaperTot(unittest.TestCase):
                 self.assertEqual(dice.drawn, 2 + 4 + len(strike_exposure) + 4)
 
     def test_the_missiles_are_resolved_through_the_tracker(self):
-        """A site damaged on paper comes into DCS with only what survived."""
-        campaign = Campaign(theater=sa6_in_reach())
+        """A site damaged on paper comes into DCS with only what survived.
+
+        Against `ALL_EMITTERS`: four hits on the real SA-6 take its radar and
+        nothing more. What a respawned battery without its radar looks like
+        is tests/test_typed_sites.py's.
+        """
+        campaign = Campaign(theater=sa6_in_reach(**ALL_EMITTERS))
         to_the_brink(campaign)
         resolve_blue_tot(campaign, [SURVIVES] * 2 + [HITS] * 4 + [SURVIVES] * 2 + [SURVIVES] * 4)
         site = campaign.theater.threats[SA6]
@@ -840,6 +859,11 @@ class TestMixedAuthority(unittest.TestCase):
     from, whoever holds the site. Standoff takes dice out of the SEAD
     element's exposure and nowhere else: the missiles, the suppression and
     the strike are the same in both.
+
+    Both batteries are `ALL_EMITTERS`, so that "every missile hits" still
+    means one unit a missile and a battery that still engages the strike:
+    this is the rule for who may fire what, not the rule for what a missile
+    kills (docs/design.md, section 7, and tests/test_typed_sites.py).
     """
 
     def _run(
@@ -851,7 +875,10 @@ class TestMixedAuthority(unittest.TestCase):
         spent: int = 0,
         standoff: bool = False,
     ):
-        campaign = Campaign(theater=build_slice_theater() if standoff else sa6_in_reach())
+        campaign = Campaign(
+            theater=slice_with(**{SA6: ALL_EMITTERS}) if standoff
+            else sa6_in_reach(**ALL_EMITTERS)
+        )
         to_the_brink(campaign)
         package = blue_package(campaign)
         site = campaign.theater.threats[SA6]
@@ -898,7 +925,8 @@ class TestMixedAuthority(unittest.TestCase):
         # units to the SEAD element in DCS. A snapshot is the only source of
         # that, and it lands once, on top of nothing the paper did.
         if site_held:
-            groups = [GroupSnapshot(spawn_id=site.spawn_id, alive=True, units=3, units_initial=5)]
+            groups = [GroupSnapshot(spawn_id=site.spawn_id, alive=True, units=3, units_initial=5,
+                                    unit_types={site.radar_type: 3})]
             groups += [
                 GroupSnapshot(spawn_id=e.spawn_id, alive=True,
                               units=campaign.tracker.units_alive(e.spawn_id),
@@ -976,14 +1004,19 @@ class TestSpentThroughTheProtocol(unittest.TestCase):
     the observer sits on the battery -- and then the observer leaves, so at
     the TOT the element and the site are both on paper. Every missile hits
     and no site can kill, so what the SA-6 loses says how many missiles the
-    paper fired.
+    paper fired -- the SA-6 rebuilt as `ALL_EMITTERS`, so that each hit is a
+    unit lost rather than the first one blinding it, and every hit destroys:
+    a hit that only forced the battery off the air would leave the missiles
+    behind it nothing to home on (docs/design.md, section 7).
     """
 
     def _war(self, *, early_contact: bool, loadouts=None, damages=()):
-        campaign = Campaign(theater=slice_with(**{SA6: {"kill_probability": 0.0}}))
+        campaign = Campaign(
+            theater=slice_with(**{SA6: {**ALL_EMITTERS, "kill_probability": 0.0}})
+        )
         site = campaign.theater.threats[SA6]
         start = [(site.pos[0], 100.0, site.pos[2])] if early_contact else OBSERVER_FAR_AWAY
-        with mock.patch("campaign.campaign.ARM_PK", 1.0):
+        with mock.patch("campaign.resolver.ARM_PK", 1.0),                 mock.patch("campaign.resolver.ARM_DESTROY_FRACTION", 1.0):
             dcs = drive(campaign, observer_positions=start, damages=list(damages),
                         deliver_events=False, start=0, duration=1_200,
                         loadouts=loadouts)
@@ -1184,7 +1217,9 @@ class TestSeadIsWorthFlying(unittest.TestCase):
 
     Two claims. The strike element loses fewer aircraft escorted: at the
     placeholder numbers (Pk 0.15, suppression halving it per surviving SEAD
-    aircraft) 7 against 26 for blue and 10 against 26 for red. And, where the
+    aircraft) 3 against 26 for blue and 4 against 26 for red -- 7 and 10
+    before site units were typed, when a missile that hit took a launcher
+    rather than the battery's radar (docs/design.md, section 7). And, where the
     SEAD element's missile out-ranges the site it faces, the whole package
     loses fewer aircraft escorted than the strike alone does: the SEAD
     element fires from standoff and takes no exposure, so it costs no

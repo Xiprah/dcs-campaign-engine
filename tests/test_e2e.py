@@ -244,7 +244,7 @@ class TestTheLoopCloses(unittest.TestCase):
             path = Path(self.enterContext(_tempdir())) / "campaign.json"
             self.campaign.save(path)
             raw = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(raw["save_version"], 7)
+            self.assertEqual(raw["save_version"], 9)
         reloaded = Campaign.load(path)
         self.assertEqual(reloaded.to_dict(), self.campaign.to_dict())
         # And it is an engine rather than a deserialised blob. `tick` cannot
@@ -738,10 +738,11 @@ class TestTheHarnessFiresOnlyWhatItCarries(unittest.TestCase):
         sim._send = record
         return sim, sent
 
-    def _setup(self, sim):
+    def _setup(self, sim, **site_tasking):
         site = dict(seq=1, t=0.0, ref=1, spawn_id="5a60", coalition="red",
                     category="ground", template="SA-6_Kub_site", units=5,
-                    position=(16000.0, 0.0, 25000.0), tasking={"kind": "air_defence"})
+                    position=(16000.0, 0.0, 25000.0),
+                    tasking={"kind": "air_defence", **site_tasking})
         sead = dict(seq=2, t=0.0, ref=2, spawn_id="5ead", coalition="blue",
                     category="plane", template="F-16C_sead_harm", units=2,
                     position=(17000.0, 6000.0, 26000.0),
@@ -759,6 +760,17 @@ class TestTheHarnessFiresOnlyWhatItCarries(unittest.TestCase):
         state = [f for f in sent if f.type == "state"][-1]
         reported = {g.spawn_id: g for g in state.groups}
         return flight, site, reported
+
+    def test_a_battery_off_the_air_gives_the_missiles_nothing_to_home_on(self):
+        """As DCS under emission control would: a spawn carrying
+        `emission_off_until` is dark until then, and a SEAD pass in that
+        window destroys nothing (docs/design.md, section 7)."""
+        sim, _ = self._sim(loadout=2, sead_kills=1, sead_shots=1)
+        with self.assertLogs("fake_dcs", level="INFO"):
+            flight, site = self._setup(sim, emission_off_until=1_000.0)
+            asyncio.run(sim._resolve_strikes())
+        self.assertTrue(flight.resolved, "the pass was never made")
+        self.assertEqual(site.units, 5)
 
     def test_with_empty_pylons_a_sead_pass_fires_and_destroys_nothing(self):
         flight, site, reported = self._pass(loadout=0, sead_kills=1)
@@ -835,7 +847,7 @@ class TestAnOlderClientIsRefused(unittest.TestCase):
         self.assertTrue(closed, "the engine left a v1 client connected")
         self.assertFalse(campaign.connected)
         self.assertTrue(
-            any("client protocol 1 != engine 3" in line for line in output),
+            any("client protocol 1 != engine 4" in line for line in output),
             output,
         )
 
@@ -847,7 +859,20 @@ class TestAnOlderClientIsRefused(unittest.TestCase):
         self.assertTrue(closed, "the engine left a v2 client connected")
         self.assertFalse(campaign.connected)
         self.assertTrue(
-            any("client protocol 2 != engine 3" in line for line in output),
+            any("client protocol 2 != engine 4" in line for line in output),
+            output,
+        )
+
+    def test_a_version_3_client_is_refused_the_same_way(self):
+        """A v3 client reports a site's surviving units as a bare count, and
+        the engine could not tell a radar the sim destroyed from a launcher;
+        it builds a battery without a radar back with one."""
+        campaign, received, closed, output = self._refused(3)
+        self.assertEqual(received, b"", "the engine answered a v3 client")
+        self.assertTrue(closed, "the engine left a v3 client connected")
+        self.assertFalse(campaign.connected)
+        self.assertTrue(
+            any("client protocol 3 != engine 4" in line for line in output),
             output,
         )
 

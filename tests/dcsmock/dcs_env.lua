@@ -77,6 +77,13 @@ local M = {
     --- Build units with no getAmmo at all, as an environment without the
     --- call would.
     no_get_ammo = false,
+    --- unit name -> true: that unit's getTypeName raises.
+    type_name_raises = {},
+    --- Group:enableEmission raises, as an API this DCS lacks or rejects would.
+    emission_raises = false,
+    --- Every enableEmission call that took, on any group, in order, kept
+    --- after the group is destroyed: {group, on, t}.
+    emission_log = {},
 
     --- What coalition.getAirbases lists. Kinds and sides are mixed and ids are
     --- out of order on purpose: a caller after an airdrome has to filter for
@@ -133,7 +140,12 @@ local function make_unit(group, udata, side)
     u.__ammo = copy_ammo(M.ammo_by_type[udata.type])
 
     function u:getName() return self.__name end
-    function u:getTypeName() return self.__type end
+    function u:getTypeName()
+        if M.type_name_raises[self.__name] then
+            error("getTypeName: injected failure on " .. self.__name, 0)
+        end
+        return self.__type
+    end
     function u:isExist() return self.__exists end
     function u:getCoalition() return self.__side end
     function u:getPlayerName() return self.__player end
@@ -204,6 +216,19 @@ local function make_group(name, data, category, side)
         return n
     end
     function g:destroy() M.kill_group(self.__name) end
+    --- Emission control, as far as a test can see it: the last state asked
+    --- for (nil until anyone asks), and every call in order.
+    g.__emission = nil
+    g.__emission_calls = {}
+    function g:enableEmission(on)
+        if not self.__exists then error("group " .. self.__name .. " is gone", 0) end
+        if M.emission_raises then
+            error("enableEmission: injected failure on " .. self.__name, 0)
+        end
+        self.__emission = on and true or false
+        self.__emission_calls[#self.__emission_calls + 1] = {on = self.__emission, t = M.time}
+        M.emission_log[#M.emission_log + 1] = {group = self.__name, on = self.__emission, t = M.time}
+    end
 
     return g
 end

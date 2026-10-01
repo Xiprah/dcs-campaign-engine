@@ -253,11 +253,12 @@ class RejectionTests(unittest.TestCase):
 class Version2Tests(unittest.TestCase):
     """What protocol 2 changed on the wire. docs/protocol.md, Changes from v1.
 
-    Still the wire in v3, which only adds to the snapshot.
+    Still the wire in v3 and v4, which only add to the snapshot (and v4 to
+    an air-defence spawn's tasking).
     """
 
-    def test_the_version_is_3(self) -> None:
-        self.assertEqual(PROTOCOL_VERSION, 3)
+    def test_the_version_is_4(self) -> None:
+        self.assertEqual(PROTOCOL_VERSION, 4)
 
     def test_a_spawn_without_a_unit_count_does_not_decode(self) -> None:
         """`units` is required. A v1-shaped spawn is malformed, not a guess."""

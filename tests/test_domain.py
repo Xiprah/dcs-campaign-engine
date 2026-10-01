@@ -74,6 +74,7 @@ from campaign.protocol import (
     group_name,
 )
 from campaign.theater import (
+    SITE_UNIT_TYPES,
     Target,
     Theater,
     build_slice_theater,
@@ -118,6 +119,10 @@ class Damage:
     #: that still has one, as a lead shoots before his wingman.
     fire: int = 0
     munition: str | None = None
+    #: For a ground group, which DCS unit type `remove` takes. None takes the
+    #: last units built -- the launchers, since the client builds a battery
+    #: radar first.
+    unit_type: str | None = None
 
 
 #: Categories that carry ammunition in a snapshot, as the Lua client's
@@ -140,6 +145,21 @@ class _LiveGroup:
     ammo: list[dict[str, int]] = field(default_factory=list)
     #: What the group carried when it was built; None if not an aircraft.
     ammo_initial: dict[str, int] | None = None
+    #: A ground group's living units' DCS types, in the order the client
+    #: built them; as long as `units`. None for anything else, which reports
+    #: no types.
+    types: list[str] | None = None
+
+    def unit_types(self) -> dict[str, int] | None:
+        """What the client's census says of the living units' types."""
+        if self.types is None:
+            return None
+        if not self.alive:
+            return {}
+        counts: dict[str, int] = {}
+        for unit_type in self.types:
+            counts[unit_type] = counts.get(unit_type, 0) + 1
+        return dict(sorted(counts.items()))
 
     def ammo_now(self) -> dict[str, int] | None:
         if self.ammo_initial is None:
@@ -149,6 +169,23 @@ class _LiveGroup:
             for weapon, count in sorted(load.items()):
                 total[weapon] = total.get(weapon, 0) + count
         return total
+
+
+def _built_types(frame: Spawn) -> list[str] | None:
+    """The DCS types a ground spawn builds, in order, as the Lua client does.
+
+    The frame's `composition` when it has one; otherwise the template's
+    radar first, then launchers, as many as `units`. Only ground groups are
+    typed on the wire, so anything else is None.
+    """
+    if frame.category != "ground":
+        return None
+    radar, launcher = SITE_UNIT_TYPES[frame.template]
+    composition = frame.tasking.get("composition")
+    if composition is None:
+        return [radar if i == 0 else launcher for i in range(frame.units)]
+    order = [radar] + ([launcher] if launcher != radar else [])
+    return [t for t in order for _ in range(composition.get(t, 0))]
 
 
 @dataclass
@@ -217,6 +254,7 @@ class FakeDCS:
             coalition=frame.coalition,
             ammo=per_unit,
             ammo_initial=initial,
+            types=_built_types(frame),
         )
         self.pump(
             self.campaign.on_ack(
@@ -280,6 +318,7 @@ class FakeDCS:
                             ammo_initial=(
                                 None if g.ammo_initial is None else dict(g.ammo_initial)
                             ),
+                            unit_types=g.unit_types(),
                         )
                         for g in self.groups.values()
                     ],
@@ -315,6 +354,11 @@ class FakeDCS:
                 continue
             self._fire(group, damage)
             removed = min(damage.remove, group.units)
+            for _ in range(removed if group.types is not None else 0):
+                if damage.unit_type is None:
+                    group.types.pop()
+                else:
+                    group.types.remove(damage.unit_type)
             group.units -= removed
             if group.units == 0:
                 group.alive = False

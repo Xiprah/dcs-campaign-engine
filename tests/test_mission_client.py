@@ -81,7 +81,8 @@ from campaign.protocol import (
     encode,
     group_name,
 )
-from campaign.theater import ground_distance
+from campaign.theater import SITE_UNIT_TYPES, ground_distance
+from tools.fake_dcs import TEMPLATE_UNIT_TYPES, Config, FakeDCS
 
 try:
     import lupa  # noqa: F401
@@ -91,7 +92,7 @@ except ImportError:  # pragma: no cover - exercised on hosts without lupa
     HAVE_LUPA = False
 
 if HAVE_LUPA:
-    from tests.dcsmock import DCSMock
+    from tests.dcsmock import DCSMock, lua_to_py
 
 requires_lua = unittest.skipUnless(
     HAVE_LUPA, "lupa is not installed; the Lua client cannot be executed"
@@ -1469,7 +1470,24 @@ class TestNonBlockingDiscipline(unittest.TestCase):
             any("engine speaks protocol 2" in msg for msg in mission.mock.logs("error")),
             mission.mock.logs(),
         )
-        self.assertEqual(mission.engine.uplink_of(Hello)[0].protocol, 3)
+        self.assertEqual(mission.engine.uplink_of(Hello)[0].protocol, 4)
+
+    def test_a_version_3_engine_is_refused(self):
+        """A v3 engine has never heard of unit types: it would refuse the
+        first snapshot that held a site, and never send a composition, so a
+        battery the war blinded would come back with its radar."""
+        mission = sortie_with_observer_over_the_target()
+        self.addCleanup(mission.close)
+        mission.engine.mute = True
+        mission.run_until(lambda m: bool(m.engine.uplink_of(Hello)), limit=60.0)
+        mission.engine.send([Sync(seq=1, t=0.0, campaign_time=0.0, protocol=3)])
+        mission.step(3)
+        self.assertFalse(mission.mock.status()["synced"], "the client served a v3 engine")
+        self.assertTrue(
+            any("engine speaks protocol 3" in msg for msg in mission.mock.logs("error")),
+            mission.mock.logs(),
+        )
+        self.assertEqual(mission.engine.uplink_of(Hello)[0].protocol, 4)
 
     def test_a_protocol_mismatch_tears_the_connection_down(self):
         mission = sortie_with_observer_over_the_target()
@@ -2374,6 +2392,217 @@ class TestAmmunitionIsReported(unittest.TestCase):
             snap = self.next_snapshot(spawn_id)
             self.assertIsNone(snap.ammo, spawn_id)
             self.assertIsNone(snap.ammo_initial, spawn_id)
+
+
+@requires_lua
+class TestSitesAreBuiltAndReportedByType(unittest.TestCase):
+    """Protocol v4: which of a site's units are left, and which to build.
+
+    The client counts a ground group's living units by Unit:getTypeName, so
+    the engine can tell a dead radar from a dead launcher (docs/design.md,
+    section 7), and builds exactly the units a spawn's `composition` names.
+    A getTypeName that raises costs that group its type count, never the
+    snapshot and never the sim thread; a composition the template cannot
+    build is refused in the words tools/fake_dcs.py uses.
+    """
+
+    RADAR, LAUNCHER = "Kub 1S91 str", "Kub 2P25 ln"
+
+    def setUp(self) -> None:
+        self.mission = Mission(observer_pos=NOWHERE)
+        self.addCleanup(self.mission.close)
+        self.mission.run_until(lambda m: m.mock.status()["synced"], limit=60.0)
+        self.ref = 9000
+
+    def frame(self, spawn_id: str, **overrides) -> Spawn:
+        self.ref += 1
+        fields = dict(
+            seq=self.ref,
+            t=self.mission.mock.time,
+            ref=self.ref,
+            spawn_id=spawn_id,
+            coalition="red",
+            category="ground",
+            template="SA-6_Kub_site",
+            units=5,
+            position=(16000.0, 0.0, 25000.0),
+            heading=0.0,
+            route=[],
+            tasking={"kind": "air_defence"},
+        )
+        fields.update(overrides)
+        return Spawn(**fields)
+
+    def spawn(self, spawn_id: str, **overrides) -> Ack:
+        frame = self.frame(spawn_id, **overrides)
+        self.mission.engine.send([frame])
+        self.mission.step(3)
+        acks = [a for a in self.mission.engine.uplink_of(Ack) if a.ref == frame.ref]
+        self.assertTrue(acks, f"no ack for {spawn_id}")
+        return acks[-1]
+
+    def next_snapshot(self, spawn_id: str):
+        sent = len(self.mission.engine.uplink_of(StateReport))
+        self.mission.run_until(
+            lambda m: len(m.engine.uplink_of(StateReport)) > sent,
+            limit=self.mission.mock.time + 60.0,
+        )
+        reports = self.mission.engine.uplink_of(StateReport)
+        self.assertGreater(len(reports), sent, "no state report was sent")
+        groups = [g for g in reports[-1].groups if g.spawn_id == spawn_id]
+        self.assertEqual(len(groups), 1, reports[-1])
+        return groups[0]
+
+    def built_types(self, spawn_id: str) -> list[str]:
+        units = self.mission.mock.group_data(group_name(spawn_id))["units"]
+        if isinstance(units, dict):
+            units = [units[k] for k in sorted(units)]
+        return [u["type"] for u in units]
+
+    def test_a_battery_is_reported_by_type_and_a_dead_radar_shows(self):
+        self.assertTrue(self.spawn("5a60").ok)
+        self.assertEqual(self.built_types("5a60"), [self.RADAR] + [self.LAUNCHER] * 4)
+        snap = self.next_snapshot("5a60")
+        self.assertEqual(snap.unit_types, {self.RADAR: 1, self.LAUNCHER: 4})
+        self.mission.mock.kill_unit("cmp_5a60_1")
+        snap = self.next_snapshot("5a60")
+        self.assertEqual((snap.units, snap.unit_types), (4, {self.LAUNCHER: 4}))
+        self.mission.assert_lua_was_clean(self)
+
+    def test_a_battery_destroyed_whole_reports_no_units_of_any_type(self):
+        self.assertTrue(self.spawn("5a61").ok)
+        self.mission.mock.kill_group("cmp_5a61")
+        snap = self.next_snapshot("5a61")
+        self.assertEqual((snap.alive, snap.units, snap.unit_types), (False, 0, {}))
+
+    def test_a_composition_builds_exactly_the_units_it_names(self):
+        """A battery whose radar the war destroyed comes back without it."""
+        self.assertTrue(self.spawn(
+            "5a62", units=4,
+            tasking={"kind": "air_defence", "composition": {self.LAUNCHER: 4}},
+        ).ok)
+        self.assertEqual(self.built_types("5a62"), [self.LAUNCHER] * 4)
+        self.assertEqual(self.next_snapshot("5a62").unit_types, {self.LAUNCHER: 4})
+
+    def test_a_composition_the_template_cannot_build_is_refused_as_the_harness_refuses_it(self):
+        harness = FakeDCS(Config())
+        cases = [
+            (5, "a radar"),
+            (4, {"Tor 9A331": 4}),
+            (4, {self.LAUNCHER: 3.5, self.RADAR: 0.5}),
+            (5, {self.RADAR: 2, self.LAUNCHER: 3}),
+            (4, {self.LAUNCHER: 3}),
+        ]
+        for index, (units, composition) in enumerate(cases):
+            with self.subTest(composition=composition):
+                tasking = {"kind": "air_defence", "composition": composition}
+                frame = self.frame(f"b{index:03d}", units=units, tasking=tasking)
+                expected = harness._refusal(frame)
+                self.assertIsNotNone(expected, "the harness accepted it")
+                ack = self.spawn(f"b{index:03d}", units=units, tasking=tasking)
+                self.assertFalse(ack.ok, "the client built it")
+                self.assertEqual(ack.error, expected)
+        self.assertEqual(self.mission.mock.status()["live_spawns"], 0)
+        self.assertTrue(self.mission.mock.status()["synced"])
+
+    def test_a_gettypename_that_raises_costs_that_group_its_types_and_nothing_else(self):
+        self.assertTrue(self.spawn("5a63").ok)
+        self.assertTrue(self.spawn("5a64").ok)
+        self.mission.mock.fail_get_type_name("cmp_5a63_2")
+        snap = self.next_snapshot("5a63")
+        self.assertEqual((snap.alive, snap.units), (True, 5))
+        self.assertIsNone(snap.unit_types)
+        other = [g for g in self.mission.engine.uplink_of(StateReport)[-1].groups
+                 if g.spawn_id == "5a64"][0]
+        self.assertEqual(other.unit_types, {self.RADAR: 1, self.LAUNCHER: 4})
+        self.mission.assert_lua_was_clean(self)
+        self.assertTrue(self.mission.mock.status()["synced"])
+        self.mission.mock.fail_get_type_name("cmp_5a63_2", False)
+        self.assertEqual(self.next_snapshot("5a63").unit_types,
+                         {self.RADAR: 1, self.LAUNCHER: 4})
+
+    def test_aircraft_and_statics_report_no_unit_types(self):
+        self.assertTrue(self.spawn(
+            "f16a", coalition="blue", category="plane", template="F-16C_cap", units=2,
+            position=(1000.0, 5000.0, 2000.0), tasking={},
+        ).ok)
+        self.assertTrue(self.spawn(
+            "70f1", category="structure", template="fuel_depot_medium", units=4,
+            tasking={"kind": "static"},
+        ).ok)
+        for spawn_id in ("f16a", "70f1"):
+            self.assertIsNone(self.next_snapshot(spawn_id).unit_types, spawn_id)
+
+    # -- emission control: a battery the paper has off the air ---------------
+
+    def despawn(self, spawn_id: str) -> None:
+        self.ref += 1
+        self.mission.engine.send([Despawn(seq=self.ref, t=self.mission.mock.time,
+                                          ref=self.ref, spawn_id=spawn_id)])
+        self.mission.step(3)
+
+    def test_a_battery_spawned_mid_shutdown_is_dark_until_the_paper_has_it_back(self):
+        back = self.mission.mock.time + 120.0
+        self.assertTrue(self.spawn("5a70", tasking={
+            "kind": "air_defence", "emission_off_until": back}).ok)
+        calls = self.mission.mock.emission("cmp_5a70")
+        self.assertEqual([on for on, _ in calls], [False])
+        self.mission.run_until(lambda m: len(m.mock.emission("cmp_5a70")) > 1,
+                               limit=back + 10.0)
+        calls = self.mission.mock.emission("cmp_5a70")
+        self.assertEqual([on for on, _ in calls], [False, True])
+        self.assertGreaterEqual(calls[1][1], back)
+        self.assertLess(calls[1][1], back + 2.0, "switched back on late")
+        self.mission.assert_lua_was_clean(self)
+
+    def test_a_battery_not_in_shutdown_is_never_touched(self):
+        self.assertTrue(self.spawn("5a71").ok)
+        self.mission.step(60)
+        self.assertEqual(self.mission.mock.emission("cmp_5a71"), [])
+
+    def test_a_malformed_shutdown_is_refused_as_the_harness_refuses_it(self):
+        harness = FakeDCS(Config())
+        for index, value in enumerate(["soon", True]):
+            with self.subTest(value=value):
+                tasking = {"kind": "air_defence", "emission_off_until": value}
+                frame = self.frame(f"c{index:03d}", tasking=tasking)
+                expected = harness._refusal(frame)
+                self.assertIsNotNone(expected, "the harness accepted it")
+                ack = self.spawn(f"c{index:03d}", tasking=tasking)
+                self.assertFalse(ack.ok, "the client built it")
+                self.assertEqual(ack.error, expected)
+
+    def test_emission_control_that_raises_costs_the_switch_and_nothing_else(self):
+        self.mission.mock.fail_emission()
+        back = self.mission.mock.time + 30.0
+        self.assertTrue(self.spawn("5a72", tasking={
+            "kind": "air_defence", "emission_off_until": back}).ok)
+        self.mission.step(60)
+        self.assertEqual(self.next_snapshot("5a72").units, 5)
+        self.assertEqual(self.mission.mock.scheduler_errors(), [])
+        self.assertTrue(any("enableEmission" in msg for msg in self.mission.mock.logs("warning")),
+                        self.mission.mock.logs())
+        self.assertTrue(self.mission.mock.status()["synced"])
+
+    def test_an_old_instruction_does_not_switch_a_respawned_battery_on_early(self):
+        start = self.mission.mock.time
+        self.assertTrue(self.spawn("5a73", tasking={
+            "kind": "air_defence", "emission_off_until": start + 60.0}).ok)
+        self.despawn("5a73")
+        self.assertTrue(self.spawn("5a73", tasking={
+            "kind": "air_defence", "emission_off_until": start + 300.0}).ok)
+        self.mission.step(120)
+        self.assertEqual([on for on, _ in self.mission.mock.emission("cmp_5a73")], [False])
+        self.mission.assert_lua_was_clean(self)
+
+    def test_the_engine_harness_and_client_name_the_same_unit_types(self):
+        templates = lua_to_py(self.mission.mock.lua.globals().CampaignClient.TEMPLATES)
+        self.assertEqual(SITE_UNIT_TYPES, TEMPLATE_UNIT_TYPES)
+        for template, (radar, launcher) in sorted(SITE_UNIT_TYPES.items()):
+            with self.subTest(template=template):
+                declared = templates[template]
+                self.assertEqual(declared.get("lead_type", declared["unit_type"]), radar)
+                self.assertEqual(declared["unit_type"], launcher)
 
 
 @requires_lua

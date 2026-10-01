@@ -453,6 +453,31 @@ class DCSMock:
         """Make one unit's getAmmo raise, as a stale or broken handle does."""
         self.env.ammo_raises[unit_name] = True if fail else None
 
+    def fail_get_type_name(self, unit_name: str, fail: bool = True) -> None:
+        """Make one unit's getTypeName raise, as a stale or broken handle does."""
+        self.env.type_name_raises[unit_name] = True if fail else None
+
+    def emission(self, name: str) -> list[tuple[bool, float]]:
+        """Every enableEmission call on a live group, in order: (on, mission time)."""
+        group = self.env.groups[name]
+        if group is None:
+            return []
+        calls = lua_to_py(group["__emission_calls"]) or []
+        if isinstance(calls, dict):
+            calls = [calls[k] for k in sorted(calls)]
+        return [(bool(c["on"]), float(c["t"])) for c in calls]
+
+    def emission_history(self, name: str) -> list[bool]:
+        """Every enableEmission call that took on group `name`, destroyed or not."""
+        log = lua_to_py(self.env.emission_log) or []
+        if isinstance(log, dict):
+            log = [log[k] for k in sorted(log)]
+        return [bool(c["on"]) for c in log if c["group"] == name]
+
+    def fail_emission(self, fail: bool = True) -> None:
+        """Make every Group:enableEmission raise."""
+        self.env.emission_raises = fail
+
     def without_get_ammo(self) -> None:
         """Build units from now on with no getAmmo at all."""
         self.env.no_get_ammo = True

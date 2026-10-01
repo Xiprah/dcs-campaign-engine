@@ -243,6 +243,15 @@ the sandbox is gone for everything, and it stays gone.
   count for that report, never the report. The type names in `WEAPON_NAMES`
   are unverified; `validate_templates.lua`'s `ammo.*` cases record DCS's own
   (VALIDATION.md, section 4a).
+- **Builds and reports air-defence sites by unit type** (protocol v4). A
+  ground spawn builds its template's lead type (the radar) first and then its
+  launchers, unless its tasking carries a `composition` naming exactly which
+  units to build -- how a battery whose radar was destroyed comes back without
+  it. A composition the template cannot hold is refused, in the same words
+  `tools/fake_dcs.py` uses. Each state report counts a ground group's living
+  units by `Unit.getTypeName` (`unit_types`), so the engine can tell a dead
+  radar from a dead launcher; a `getTypeName` that raises costs that group its
+  type count for that report, never the report.
 - **Reports events** as attribution only, and filters them hard: an event is
   sent only when an engine-owned entity is the initiator or target. Dropping
   events is safe by design — the campaign must reach identical state with every

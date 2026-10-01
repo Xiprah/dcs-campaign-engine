@@ -46,6 +46,7 @@ from campaign.protocol import (
 )
 from tests.test_domain import STATE_PERIOD, FakeDCS
 from tests.test_sead import (
+    ALL_EMITTERS,
     HITS,
     SA6,
     SEAD_SQN,
@@ -92,8 +93,12 @@ def held_reservation(campaign: Campaign, element) -> int:
 
 
 class TestTheProtocolIsVersion3(unittest.TestCase):
-    def test_the_engine_speaks_3(self):
-        self.assertEqual(PROTOCOL_VERSION, 3)
+    """Version 3 brought ammunition; version 4 (typed site units) keeps it
+    unchanged, so this file's frames are v4 frames and a v2 peer is still
+    refused. The v3 refusal is tests/test_typed_sites.py's."""
+
+    def test_the_engine_speaks_4(self):
+        self.assertEqual(PROTOCOL_VERSION, 4)
 
     def test_a_version_2_hello_is_refused_and_changes_nothing(self):
         campaign = Campaign()
@@ -101,7 +106,7 @@ class TestTheProtocolIsVersion3(unittest.TestCase):
         before = campaign.to_dict()
         with self.assertRaises(ProtocolError) as caught:
             campaign.on_hello(Hello(seq=1, t=0.0, protocol=2, theater="Syria"))
-        self.assertIn("client protocol 2 != engine 3", str(caught.exception))
+        self.assertIn("client protocol 2 != engine 4", str(caught.exception))
         self.assertFalse(campaign.connected)
         self.assertEqual(campaign.to_dict(), before)
 
@@ -216,10 +221,15 @@ class TestAMissileAndAnAircraftGoneTogether(unittest.TestCase):
     The engine books the dead aircraft's share as lost and the rest as
     expended, which is exact whenever each jet carried its full load, and
     in every case leaves the paper only what the survivors still carry.
+
+    The SA-6 is `ALL_EMITTERS`, so the one paper missile that hits takes a
+    unit and leaves a battery that still fires at the strike, as before
+    units were typed; against the real SA-6 it takes the radar and the strike
+    throws no exposure dice (docs/design.md, section 7).
     """
 
     def setUp(self) -> None:
-        self.campaign = Campaign(theater=sa6_in_reach())
+        self.campaign = Campaign(theater=sa6_in_reach(**ALL_EMITTERS))
         to_the_brink(self.campaign)
         self.package = blue_package(self.campaign)
         self.sead = self.package.sead

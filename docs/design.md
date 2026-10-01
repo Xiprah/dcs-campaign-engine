@@ -16,7 +16,8 @@ The rule everything else rests on, in its complete form:
 The authority is decided **per entity, at the instant of resolution**, by
 asking `tracker.is_instantiated(spawn_id)`. It is never both. A target hit on
 paper and spawned later arrives carrying its damage, because a spawn sends its
-current unit count; an aircraft that dies in DCS is never also rolled on paper.
+current unit count -- and, for an air-defence site, which units (section 7);
+an aircraft that dies in DCS is never also rolled on paper.
 
 Rejected: letting the engine "correct" a snapshot from its paper track. The
 paper track is a prediction; the snapshot is an observation. An engine that
@@ -112,8 +113,8 @@ A **threat site** is an air-defence entity: strikable, instantiable in the
 bubble like any other entity, with an engagement radius and a per-aircraft
 kill probability. Threat sites are kept apart from strategic targets, so the
 strike planner does not pick them. Destroying them for their own sake is DEAD
-work, not built; a SEAD element's missiles can take units off one on the way
-(section 5).
+work, not built; a SEAD element's missiles can take its radar on the way
+(sections 5 and 7), and a site without one cannot engage.
 
 **Paper exposure.** At a package's TOT, for each flight *not* instantiated,
 every live enemy threat site whose engagement radius the route enters rolls
@@ -311,14 +312,17 @@ this order:
    (below), at the site's full kill probability, because it goes in first;
 2. its survivors' missiles — those the sim has not already spent (below)
    — are rolled against the sites, shared round-robin in site-id order,
-   each removing a unit at `resolver.ARM_PK` (0.25), through the tracker
+   each destroying the site's radar at `resolver.ARM_PK` (0.25) -- only a
+   site with a radar left is fired at, and a hit never takes a launcher
+   (section 7) -- through the tracker
    like any paper loss;
 3. every SEAD aircraft that fires in step 2 halves the kill probability of
    each site it engaged, compounding
    (`resolver.SEAD_SUPPRESSION_PER_AIRCRAFT`), so a SEAD element that lost a
    jet only half does its job;
 4. the strike element flies its exposure against the sites still standing,
-   at those probabilities: a site the missiles destroyed does not fire;
+   at those probabilities: a site the missiles blinded or destroyed does
+   not fire;
 5. the strike element's survivors release.
 
 Each element's survivors expend there what is left of its reservation,
@@ -520,7 +524,10 @@ the client reports them under are as unverified as the CLSIDs that would
 load them; mission/validate_templates.lua's `ammo.*` cases record the names
 DCS uses.
 
-**What it buys, at the placeholder numbers.** Over each side's first sortie
+**What it buys, at the placeholder numbers.** Measured before section 7
+made a missile hit take the radar rather than a launcher; over seeds 0 to 99
+the escorted strike elements' first-sortie losses have since fallen from 7
+and 10 to 3 and 4 (tests/test_sead.py). Over each side's first sortie
 on seeds 0 to 399, the only situation both configurations fly identically,
 blue's strike elements lost 28 aircraft escorted and 106 alone, red's 32 and
 111: about 0.08 a sortie against 0.27. The SEAD elements, firing from
@@ -772,6 +779,317 @@ in the theater section, not addressed here.
 at the first open package, so a Syria day on paper takes about 2.9 s of CPU
 instead of 1.0 s. The slice's is unchanged.
 
+## 7. Air defences: typed units, blind batteries, shutdowns, repair
+
+Measured on the Syria map (below), standoff SEAD had made the war nearly
+bloodless: a median of 1.5 airframes lost by red in a whole war, 5 by blue.
+Three causes stacked. Both anti-radiation missiles out-range every site, so
+SEAD is never at risk -- published maximum against published maximum, kept
+(section 5). Each surviving SEAD aircraft halves a site's kill probability,
+compounding -- kept too: no source was found for a different figure, and
+changing it for the outcome it gives would be tuning. And a destroyed unit
+never came back: red's SEAD destroyed all five of blue's sites in a median
+war, after which its deep strikes cost almost nothing. That third one is the
+real one. Real air defences are repaired, relocated and reinforced; here a
+battery killed on day one was gone for good. This section is what replaced
+it.
+
+**Units are typed.** A site's units are a radar and launchers
+(`theater.SITE_UNIT_TYPES`, by the DCS unit type names the client builds:
+the template's `lead_type` is the radar, its `unit_type` the launchers). A
+Tor vehicle is its own radar and launcher, so every unit of an SA-15 battery
+is both. The engine keeps a site's surviving units by type
+(`ThreatSite.units_by_type`, and the tracker's group beside it), not as a
+bare count.
+
+> An anti-radiation missile homes on an emitter, so an ARM kill removes the
+> radar, never a launcher. A site whose radar is gone cannot engage: its
+> kill probability is zero until the radar is back.
+
+On paper that means: missiles are rolled only at sites with a radar left,
+each hit destroys a radar (`ARM_PK` unchanged), and a hit once the radar is
+gone has nothing to home on and destroys nothing -- it is still rolled, by
+section 5's dice rule. (Since "Two tiers", below, a hit mostly forces the
+radar off the air instead, and seldom destroys it.) A site with no radar is not a live threat
+(`Theater.live_threats_along`): it throws no exposure dice, no SEAD is
+attached to a route it alone covers, and a SEAD element's missiles go to the
+sites still emitting. Which sites can engage is read afresh at each step of
+the TOT, so a battery the SEAD element blinded throws nothing at the
+strikers behind it, as a destroyed one already did not. Launchers do not
+enter the kill probability: it was already flat whatever was left of them
+(TODO(threat-model)), and on paper nothing takes a launcher off a battery.
+
+Two consequences worth knowing. A battery with a separate radar can no
+longer be *destroyed* by SEAD at all -- after its radar it has nothing to
+home on -- only blinded; only an all-emitter battery (the SA-15) can be
+destroyed by missiles alone. And the SA-11's 9A310M1 and the Roland ADS
+carry fire-control radars of their own, so the real systems could engage
+without the battery's search radar; with one emitter per battery these two
+are easier to blind than they should be. Per-unit emitters are threat-model
+work.
+
+*Bombs on a site.* No path aims bombs at a site: strikes are for strategic
+targets, and DEAD is not built (section 3). The rule, when one does, is
+that bombs take launchers first -- a radar is one vehicle among several and
+is not what a bomb homes on -- and the tracker's paper entry point demands
+the unit type of every typed loss, so whoever builds that path has to say
+which.
+
+Rejected: keeping units counted and making the *last* unit the radar, so a
+site fires until it is gone. That is the model this replaced, and it is
+what made SEAD buy only a launcher a hit.
+
+**Typed units are ground truth when DCS holds the site.** Before this a
+snapshot carried a unit count, so for a site DCS held the engine could not
+tell whether the sim killed the radar or a launcher -- and section 1 forbids
+guessing from the paper track. Protocol v4 (docs/protocol.md, "Changes from
+v3") has the client count a ground group's living units by
+`Unit.getTypeName` (`unit_types`), and the tracker reconciles each type the
+way it reconciled the count: clamped per type to what it believes, so a
+snapshot can neither resurrect a radar nor invent one. A snapshot that
+cannot name every living unit's type is no census of that group's units:
+the engine books nothing from it and waits for one that can. A ground spawn
+carries a `composition` when the client's radar-first build would get the
+battery wrong, so a site that lost its radar comes back into DCS without
+it.
+
+A way to keep typed ground truth without a protocol change was looked for
+and not found. The client could keep building radar-first and the engine
+could infer the type of each lost unit from which units the count says are
+gone -- but the count does not say which, and DCS kills whichever unit the
+sim decides. The client could report the dead unit's name in an event, but
+events are attribution only (section 1), and the engine must reach the same
+state with every event dropped. Unit names in the snapshot instead of types
+would be ground truth too, but no smaller a change, and the engine would
+still need each name's type. So v4.
+
+**Air defences reconstitute.** While DCS is not holding a site, the engine
+repairs it: a destroyed radar is replaced after `SiteRepair.radar_time` of
+repair work, destroyed launchers one per `SiteRepair.launcher_time`, the
+two jobs side by side. Repair is logistics, not combat, so it is the
+engine's authority -- but only where DCS is not. A site DCS holds changes
+only by snapshot and accrues no repair work while held; nor while a spawn of
+it is unacknowledged (DCS will build what the frame named) or a despawn is
+(its last census may still be on its way, and would read a repaired unit as
+one the sim destroyed). With no client connected nothing is held. Work is
+counted from the clock (`Campaign.repaired_to`), in id order, with no dice,
+and saved with the site, so a reload neither repeats nor skips it. A
+respawned site carries its repaired composition. Its owner is told what
+came back; the enemy is not.
+
+*A site with every unit destroyed stays gone.* Repair restores the
+equipment of a battery whose organisation survives -- crews, command,
+spares, the position it holds. One with nothing left has nothing to
+repair: replacing it is moving a new battery in from a reserve, which is
+reinforcement, an order-of-battle decision the engine has no model for.
+Rebuilding from nothing would also make every site indestructible given
+time, and "destroyed" would stop meaning what the players are told.
+TODO(seam: logistics): repair is free. A logistics model draws spares and
+crews from a supply network, can be cut, and is where reinforcement lives.
+
+**Per theater, one mechanism.** The rates are the theater's
+(`Theater.repair`). The slice keeps repair off (`REPAIR_OFF`), through the
+same pass, which restores nothing; the typed rule applies everywhere, so the
+slice's SEAD outcomes moved with it and its seed-pinned tests were re-found
+(each says why in its docstring). The eleven strike-only wars of section 5
+replay unchanged but for the `sync` frame's protocol integer: no site in
+them loses anything, so no spawn carries a `composition`.
+
+**The figures.** Every one a placeholder unless it says otherwise, and none
+chosen for the war it gives:
+
+| | figure | source |
+|---|---|---|
+| radar replaced after | 12 h of repair work | **placeholder**. No published repair time was found. The nearest is qualitative: Wikipedia, "AGM-45 Shrike", on Vietnam -- the warhead rarely did more than shatter the radar dish, "an easy item to replace or repair". Half a day stands for "easy, but not before the next raid" |
+| launcher restored every | 24 h of repair work | **placeholder**, no source. Longer than the radar: only DCS ever destroys a launcher, with weapons that wreck a vehicle rather than a dish, and a wrecked launcher is replaced, not mended |
+| ARM kill probability | 0.25 | unchanged placeholder (section 5) |
+| suppression per SEAD aircraft | halves the Pk | unchanged placeholder (section 5); no source found for another |
+
+**With the sortie rate.** Section 6 sends a strike in alone when its base's
+SEAD squadron is busy, turning round or out of sorties for the day. Both
+rules ask the same question of a route -- `Theater.live_threats_along`,
+which leaves a blind battery out -- so a route covered only by blind
+batteries is unexposed whatever the SEAD squadron is doing, and a strike
+sent alone through a battery whose radar has been repaired meets it at its
+full kill probability. Neither rule changes the other: readiness decides
+whether a SEAD element can be attached, this section whether one is
+needed.
+
+**What it did, measured.** Taken before section 6 was merged, so on the
+one-package-a-side engine. Offline Syria wars on seeds 0 to 49, nobody connected,
+before this section (commit 64ca9af, re-measured on these seeds, so a little
+off the table in "Theater: the Syria map") and after it. Not asserted
+anywhere. Packages are those that reached their TOT; a package's losses are
+every element's.
+
+| | before | after |
+|---|---|---|
+| blue airframes lost per war, median (range) | 5 (0-24) | 2.5 (0-19) |
+| red airframes lost per war, median (range) | 1.5 (0-7) | 0 (0-2); none at all in 26 wars |
+| blue, lost per package: shallow / middle / deep | 0.00 / 0.03 / 0.15 | 0.00 / 0.03 / 0.08 |
+| red, lost per package: shallow / middle / deep | 0.00 / 0.03 / 0.03 | 0.00 / 0.01 / 0.01 |
+| blue, lost per package by quarter of the war | 0.02 / 0.10 / 0.09 / 0.27 | 0.03 / 0.03 / 0.04 / 0.17 |
+| red, lost per package by quarter of the war | 0.03 / 0.07 / 0.01 / 0.01 | 0.01 / 0.01 / 0.00 / 0.02 |
+| red's 7 sites: destroyed / blinded / radars repaired, median | 6 / - / - | 5 / 3 / 2 |
+| blue's 5 sites: destroyed / blinded / radars repaired, median | 5 / - / - | 0 / 8 / 6 |
+| war length, median (range) | 40.9 h (33.6-49.6) | 39.9 h (33.1-45.3) |
+| wins, blue / red | 30 / 20 | 33 / 17 |
+
+**The war is not a fight again.** Cost still rises with depth for blue, but
+less than before, and red's war is bloodier for nobody: it was nearly
+bloodless and is now bloodless. The typed rule made SEAD stronger, not
+weaker. A hit used to take one launcher of five and leave the battery
+firing at its full kill probability; now it takes the radar and the
+battery's whole Pk with it. A two-ship's four missiles at 0.25, all at one
+battery, blind it about two times in three. Blue's two Hawks and three Rolands cannot be
+destroyed by missiles any more, only blinded -- eight times a war -- and
+each is repaired after twelve hours, but the next escorted raid through it
+blinds it again. Red's five SA-15s, all emitters, are still destroyed
+outright and stay gone. The repair figures are placeholders; at these ones,
+reconstitution does not outpace standoff SEAD that cannot be hurt.
+
+A first version spent missiles at nothing: it kept attaching SEAD to routes
+whose only batteries were blind, and the element fired its load into them.
+Both sides' main SEAD squadrons were dry by the last quarter of the war, and
+unescorted deep strikes into repaired batteries lost about half an aircraft
+a package -- eleven airframes a war a side, a steep cost arc. That arc was
+the bug, not the mechanism: an anti-radiation missile cannot be fired at a
+radar that is not there. With it fixed (a blind battery is not a live
+threat), the numbers are the table's.
+
+What the mechanism is sensitive to, measured to know and not adopted
+(twenty seeds each, every other figure unchanged): with the radar back after
+2 hours instead of 12, each side loses a median of about 11 airframes a war
+and a deep package about 0.25; after half an hour, about 23 and 0.4. The
+repair period is the lever, and nothing published fixes it. The other
+levers are the ones section 5 and this section already name: the
+suppression and ARM placeholders, and per-unit emitters (a TELAR or Roland
+fire unit that engages without the search radar).
+
+**Two tiers: a hit mostly shuts the radar down.** The table above is why.
+Typing made SEAD stronger, not weaker: a hit took the radar, and with it the
+battery's whole kill probability for twelve hours, so a route stayed
+unexposed long after the package that blinded it had gone home. Real
+anti-radiation missiles rarely work that way. A battery that sees a missile
+coming switches its radar off, and the missile loses what it was homing on;
+the point of the shot is often that, not a kill.
+
+> A missile that hits home on a battery's radar either destroys it -- and
+> the radar then has to be repaired, as above -- or, far more often, forces
+> the battery off the air for `resolver.ARM_SHUTDOWN_TIME`. A battery off
+> the air cannot engage. When the time is up its radar is simply back: it
+> was never broken, so nothing is repaired.
+
+*The dice.* One die a missile (`resolver.resolve_arm`): below `ARM_PK` x
+`ARM_DESTROY_FRACTION` it destroys a radar, below `ARM_PK` it forces the
+battery off the air, above it misses. One die carries both the hit and the
+kind of hit, so the draws are the missiles fired, whatever they say --
+section 5's rule. A missile after a shutdown, or after the last radar is
+gone, finds no emitter and does nothing, though it is still rolled.
+
+*The shutdown.* It sets the site's `dark_until` to the TOT plus ten minutes,
+and loses nothing: no unit, no repair work. A second shutdown before the
+first has ended moves the end to the later of the two and never adds them,
+so two packages through one envelope do not stack one blackout on another.
+The site's owner is told its radar is off the air and when it will be back,
+as it is told of any damage to its own sites (section 4); the enemy is not.
+
+*Asked at the TOT.* The planner asks which sites are live along a route at
+the package's TOT, not at the moment it plans (`Theater.live_threats_along`,
+`at`): a battery that will still be off the air then is no reason to send
+SEAD, and one that is off now but back by then is. The TOT asks at its own
+instant, so a battery the SEAD element shut down throws nothing at the
+strikers behind it, as a blind one already did not.
+
+*Authority.* A shutdown is a paper state. It arises only where section 5
+lets a SEAD element act on paper at all -- the element and the site both
+outside DCS at the TOT -- so a battery DCS holds is never shut down on
+paper; what DCS's own AI does under fire is the sim's. No snapshot can show
+a shutdown, because the radar is alive, so a battery spawned into DCS while
+the paper has it off the air would engage flights the paper says it cannot
+see. Instead its spawn carries `emission_off_until`, the mission time the
+paper has it back (protocol v4, docs/protocol.md, `spawn`), and the client
+builds it with its emitters off (`Group:enableEmission(false)`) and turns
+them on at that time, for that spawn only. Emission control is unverified
+DCS content, so the client guards it: a call that raises is logged and the
+battery left emitting, never a refused spawn or a broken tick.
+mission/validate_templates.lua's `emission.SA-6_Kub_site` case settles it
+in the sim. `dark_until` is saved with the site (save version 9).
+
+*The figures.* Neither new one was chosen for the war it gives:
+
+| | figure | source |
+|---|---|---|
+| a hit destroys the radar | 1.6% of hits (`ARM_DESTROY_FRACTION`); 0.4% of missiles fired | derived from the one published count of fired against destroyed found: in Allied Force "US and NATO aircraft fired at least 743 HARMs", and NATO confirmed the destruction of three of Serbia's approximately 25 mobile SA-6 batteries (Benjamin S. Lambeth, "Kosovo and the Continuing SEAD Challenge", *Aerospace Power Journal*). Three of 743 is 0.4% a missile, which at `ARM_PK` is 1.6% of hits. **A floor, not an estimate**: only SA-6 batteries are counted, against HARMs fired at every kind of emitter, only confirmed kills, and Serbia's operators were unusually disciplined about emissions. It is used as it stands rather than raised by a guess |
+| off the air after a shutdown | 10 min (`ARM_SHUTDOWN_TIME`) | **game-design choice**; no published figure found (Lambeth describes Serb operators emitting for 20 seconds and then going quiet, a firing tactic, not this). It outlasts the package behind the missiles: the paper track's 140 m/s crosses the largest envelope on the map, 50 km, in six |
+| ARM kill probability | 0.25, now the chance of a hit of either kind | unchanged placeholder (section 5) |
+
+**What it does, measured.** Offline Syria wars on seeds 0 to 49, nobody
+connected, every figure as shipped, on three engines: the sortie-rate model
+before this section (commit f6b873c), typed units and repair (da889fb), and
+two tiers. One script measured all three with the same definitions
+(`python tools/measure_wars.py --seeds 0-49 --root <checkout>`; its
+docstring defines every row). Not asserted anywhere. The first column
+reproduces section 6's "after".
+
+| | untyped (f6b873c) | typed (da889fb) | two tiers |
+|---|---|---|---|
+| war length, median (range) | 54 h (50-60) | 51 h (35-55) | 73 h (51-120) |
+| wins, blue / red | 13 / 37 | 24 / 26 | 11 / 39 |
+| airframes lost a war, median (range), blue | 6 (1-14) | 2 (0-10) | 20 (8-29) |
+| airframes lost a war, median (range), red | 6 (2-11) | 3 (1-8) | 16 (6-28) |
+| SEAD airframes lost, all fifty wars | 0 | 0 | 0 |
+| blue, lost per package: shallow / middle / deep | 0.00 / 0.02 / 0.15 | 0.00 / 0.03 / 0.07 | 0.00 / 0.07 / 0.41 |
+| red, lost per package: shallow / middle / deep | 0.00 / 0.05 / 0.12 | 0.00 / 0.02 / 0.08 | 0.00 / 0.10 / 0.32 |
+| blue, lost per package by quarter of the war | 0.08 / 0.11 / 0.18 / 0.07 | 0.06 / 0.06 / 0.03 / 0.06 | 0.17 / 0.27 / 0.46 / 0.50 |
+| red, lost per package by quarter of the war | 0.13 / 0.19 / 0.03 / 0.01 | 0.04 / 0.18 / 0.02 / 0.10 | 0.14 / 0.24 / 0.36 / 0.36 |
+| blue, lost per package: sent alone / escorted | 0.12 / 0.09 | 0.04 / 0.07 | 0.52 / 0.06 |
+| red, lost per package: sent alone / escorted | 0.10 / 0.09 | 0.06 / 0.05 | 0.41 / 0.07 |
+| packages escorted a war, mean, blue / red | 25.5 / 19.6 | 22.8 / 13.2 | 31.7 / 31.8 |
+| strike airframes left of 44, median (min), blue | 38 (30) | 42 (34) | 24 (15) |
+| strike airframes left of 44, median (min), red | 38 (33) | 41 (36) | 28 (16) |
+| own sites destroyed, median, blue / red | 5 of 5 / 6.5 of 7 | 0 of 5 / 5 of 7 | 0 of 5 / 0 of 7 |
+| own radars destroyed a war, median, blue / red | - | 10 / 20 | 0 / 0 |
+| shutdowns a war, median, of blue's sites / red's | - | - | 24.5 / 26 |
+| sites able to engage, mean share of the war, blue / red | 41% / 49% | 63% / 43% | 97% / 99% |
+
+**The war is a fight again, and what it costs is the price of a planner
+gap.** A war now costs each side a median of 16 to 20 airframes. The cost
+rises with depth, to 0.3 and 0.4 airframes a package against deep targets,
+and through the war, from about 0.15 a package in the first quarter to 0.4
+and 0.5 in the last. The air defences are still there at the end: no site
+is destroyed in a median war, and they can engage almost all of it. Wars
+run longer, a median of 73 hours, because strike airframes run down -- a
+median 24 and 28 of each side's 44 are left. Of the fifty, 20 are decided
+on their third day of flying, 26 on the fourth and 4 later, where every one
+was decided on the third before.
+
+But read the "sent alone / escorted" rows before anything else. An escorted
+package loses what it lost before, about 0.06 airframes. The whole of the
+new cost falls on packages sent through live batteries without SEAD, which
+now lose about half an airframe each, and about half of all packages go
+alone. That is section 6's seam: a strike whose base's SEAD squadron is
+busy, turning round or out of sorties goes in alone, where a planner would
+hold it. Before this section a destroyed radar stayed down for twelve hours,
+so a strike sent alone usually met nothing; now the battery is back in ten
+minutes. So the cost is what these rules produce, but it is the cost of the
+planner sending strikes it should hold, not of SEAD failing: SEAD still
+never loses an aircraft, and still protects the strikers behind it as well
+as it ever did. A planner that held a strike for its SEAD would remove most
+of it.
+
+*Repair is almost inert on paper.* At 0.4% a missile, fifty wars destroyed
+26 of blue's radars and 30 of red's, against about 1,250 shutdowns a side,
+and a median war destroyed none. Repair still matters for radars DCS's
+weapons destroy, and the test that flies a Syria war through repair now
+destroys on every hit (`tests/test_typed_sites.py`), the war it was written
+against. Were the destroy fraction raised -- the figure is a floor --
+repair would matter again, and the cost would fall with it.
+
+*Balance did not improve.* Red wins 39 of 50, as it won 37 before typing;
+typing alone had brought it to 26. Why red wins is still not established
+(section 6).
+
 ## Out of scope, deliberately
 
 Multi-package deconfliction, escort and CAP, tankers and AWACS, the ground
@@ -869,6 +1187,10 @@ between them, so its deep strikes still cost something (0.15 a package), and
 blue now wins more often. A Syria war is close to bloodless, as the slice
 became.
 
+Section 7 has since typed the sites' units and made them repairable, and,
+before section 6 was merged, measured the same fifty seeds again: the war
+got no bloodier. Red lost a median of none, blue 2.5.
+
 Two things this content cannot fix. First, *a war lasted about two days,
 not several*, because the engine's tempo was one package per side in the air
 at all times, around the clock: about 35 packages a side a day. The sortie-rate
@@ -881,4 +1203,5 @@ sortie (ARM Pk 0.25), while a site keeps firing at full Pk until its last
 unit goes. More sites were not tried; SEAD would meet them unhurt too. What
 would restore the cost arc is a SEAD-model change (weaker or partial suppression,
 sites that hide their radars, missiles that miss a shut-down emitter), not a
-theater one.
+theater one. Section 7 has since made two: typed units with repair, and
+radars that a hit mostly shuts down rather than destroys.
