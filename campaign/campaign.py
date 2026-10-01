@@ -70,7 +70,8 @@ from campaign.oob import (
     launch_range,
 )
 from campaign.resolver import (
-    ARM_PK,
+    ARM_SHUTDOWN_TIME,
+    resolve_arm,
     resolve_exposure,
     resolve_strike,
     suppressed_kill_probability,
@@ -139,7 +140,9 @@ from campaign.theater import (
 #: 8: threat sites are typed (`units_by_type`, in the theater and the tracker)
 #:    and carry repair progress; the theater carries its repair rates, and
 #:    the campaign the clock repair has run to (`repaired_to`).
-SAVE_VERSION = 8
+#: 9: a threat site carries how long its radar is off the air (`dark_until`;
+#:    docs/design.md, section 7).
+SAVE_VERSION = 9
 
 #: Default seed. Explicit, because an implicit one is an unseeded one.
 DEFAULT_SEED = 20240923
@@ -787,8 +790,13 @@ class Campaign:
                 target=target,
                 now=self.clock,
                 rng=self.rng,
-                threats=lambda base=base: self.theater.live_threats_along(
-                    enemy_of(coalition), base.pos, target.pos
+                # At the TOT: a battery whose radar is off the air then is no
+                # reason to send SEAD, and one that is off now but back by
+                # then is (docs/design.md, section 7).
+                threats=lambda base=base, t_tot=t_tot: (
+                    self.theater.live_threats_along(
+                        enemy_of(coalition), base.pos, target.pos, at=t_tot
+                    )
                 ),
                 # Drawn only for an element actually attached, after the
                 # strike's, so a package without one issues exactly the ids a
@@ -1090,7 +1098,7 @@ class Campaign:
         if base is None or target is None:
             return []
         return self.theater.live_threats_along(
-            enemy_of(package.coalition), base.pos, target.pos
+            enemy_of(package.coalition), base.pos, target.pos, at=self.clock
         )
 
     def _exposed_sites(self, package: Package, element: Element) -> list[ThreatSite]:
@@ -1221,10 +1229,11 @@ class Campaign:
         and at how many sites -- never on how the dice fall.
 
         An anti-radiation missile homes on an emitter (docs/design.md,
-        section 7): only a site with a radar left is fired at
-        (`_route_threats`), and a hit destroys the radar, never a launcher. A
-        missile that hits once the radar is gone has nothing to home on and
-        destroys nothing, though it is still rolled.
+        section 7): only a site with a radar on the air is fired at
+        (`_route_threats`). A hit seldom destroys the radar -- never a
+        launcher -- and mostly forces it off the air for a while
+        (`resolve_arm`, `_shut_down`); after either, the missiles behind it
+        have nothing to home on and do nothing, though each is still rolled.
         """
         if self.tracker.is_instantiated(sead.spawn_id) or rounds <= 0:
             return []
@@ -1245,23 +1254,40 @@ class Campaign:
             if share <= 0:
                 continue
             suppression[site.id] = shooters
-            outcome = resolve_strike(
-                rounds=share,
-                target_units_alive=site.radars_alive,
-                rng=self.rng,
-                weapon_pk=ARM_PK,
+            outcome = resolve_arm(
+                rounds=share, radars_alive=site.radars_alive, rng=self.rng
             )
             frames.extend(
                 self._apply_losses(
                     self.tracker.record_unobserved(
                         site.spawn_id,
-                        outcome.units_killed,
+                        outcome.radars_destroyed,
                         self.clock,
                         unit_type=site.radar_type,
                     )
                 )
             )
+            if outcome.shut_down:
+                frames.extend(self._shut_down(site))
         return frames
+
+    def _shut_down(self, site: ThreatSite) -> list[Downlink]:
+        """A missile forced the site's radar off the air (docs/design.md, section 7).
+
+        Nothing is lost and nothing is repaired: the radar is back on at
+        `dark_until`. A shutdown before an earlier one has ended moves the end
+        to the later of the two and never adds them, so two packages through
+        one envelope do not stack one blackout on another.
+        """
+        until = self.clock + ARM_SHUTDOWN_TIME
+        if site.dark_until is not None:
+            until = max(site.dark_until, until)
+        site.dark_until = until
+        return self._tell(
+            site.coalition,
+            f"{site.name} shut down its radar under anti-radiation attack; "
+            f"back on the air at {self.mission_time(site.dark_until):.0f}.",
+        )
 
     def _held_by_dcs(self, spawn_id: str) -> bool:
         """Is DCS holding this entity, or about to, or about to let it go?
@@ -1869,6 +1895,12 @@ class Campaign:
         composition = self.tracker.units_by_type(site.spawn_id) or {}
         if composition != site.front_built(units):
             tasking["composition"] = dict(sorted(composition.items()))
+        # A radar forced off the air on paper is still off when DCS builds
+        # the battery, until the same instant -- or the sim would have it
+        # engaging a flight the paper says it cannot see. Only then, so
+        # every other spawn is the frame it always was.
+        if site.dark_until is not None and site.dark_until > self.clock:
+            tasking["emission_off_until"] = self.mission_time(site.dark_until)
         seq = self._seq()
         self.pending[seq] = (_SPAWN, site.spawn_id)
         return Spawn(

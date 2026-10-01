@@ -1066,6 +1066,59 @@ local function unit_types_for(tmpl, frame, count)
 end
 
 
+--- When a ground spawn's radars must stay off the air: the mission time in
+--- `tasking.emission_off_until`, or nil when there is none; or false and why
+--- it is refused.
+---
+--- The engine sends it for a battery an anti-radiation missile forced off
+--- the air on paper, until the instant the paper has it back (protocol v4,
+--- docs/design.md, section 7). Absent or JSON null is none; anything else
+--- that is not a number is a malformed payload, not a battery left emitting
+--- -- which would engage a flight the paper says it cannot see.
+local function emission_off_until_of(frame)
+    local t = type(frame.tasking) == "table" and frame.tasking.emission_off_until or nil
+    if t == nil or json.isnull(t) then return nil end
+    if type(t) ~= "number" then
+        return false, "bad spawn payload: malformed emission_off_until: " .. tostring(t)
+    end
+    return t
+end
+
+--- Turn a group's radars off or on. Emission control is unverified DCS
+--- content -- validate_templates.lua's `emission.*` case settles it in the
+--- sim -- so it is guarded: a battery left emitting is a mismatch with the
+--- paper, logged, where a raised error would be a broken tick.
+local function set_emission(name, on)
+    local grp = try(Group.getByName, name)
+    if not grp then return false end
+    local ok, err = pcall(function() grp:enableEmission(on) end)
+    if not ok then
+        log_warn("enableEmission(" .. tostring(on) .. ") on " .. name .. ": " .. tostring(err))
+    end
+    return ok
+end
+
+--- Keep a just-built battery off the air until mission time `off_until`, then
+--- put it back on. The switch back is for this spawn only: a battery
+--- despawned and spawned again under the same name in the meantime has its
+--- own instruction, and an earlier one must not switch it on early.
+local function go_dark(sid, off_until)
+    local rec = S.spawns[sid]
+    if not rec or off_until <= now_t() then return end
+    set_emission(rec.name, false)
+    rec.dark_until = off_until
+    guard("schedule emission on for " .. rec.name, function()
+        timer.scheduleFunction(function()
+            if S.spawns[sid] == rec then
+                rec.dark_until = nil
+                set_emission(rec.name, true)
+            end
+            return nil
+        end, nil, off_until)
+    end)
+end
+
+
 local function build_group_data(spawn, tmpl, name, count, types)
     local units = {}
     local gx, gy, galt = pos_xy(spawn.position)
@@ -1168,6 +1221,7 @@ local function handle_spawn(frame)
 
     local name = group_name(sid)
     local names = {name}
+    local emission_until = nil
 
     if tmpl.static then
         -- Several objects under one spawn_id: DCS has no static group, so the
@@ -1235,6 +1289,12 @@ local function handle_spawn(frame)
                 send_ack(frame.ref, false, refused)
                 return
             end
+            emission_until, refused = emission_off_until_of(frame)
+            if emission_until == false then
+                log_err("spawn " .. sid .. ": " .. refused)
+                send_ack(frame.ref, false, refused)
+                return
+            end
         end
         local built, data = pcall(build_group_data, frame, tmpl, name, unit_count, types)
         if not built then
@@ -1287,6 +1347,7 @@ local function handle_spawn(frame)
         landed = {},
         ammo_initial = ammo_initial,
     }
+    if emission_until then go_dark(sid, emission_until) end
 
     log_info("spawned " .. name .. " from " .. tostring(frame.template)
              .. " (" .. unit_count .. " unit(s))")

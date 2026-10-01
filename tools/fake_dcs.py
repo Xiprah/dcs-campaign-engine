@@ -231,6 +231,9 @@ class SimGroup:
     #: built; as long as `units`. None for anything else, which the client
     #: reports no types for.
     types: list[str] | None = None
+    #: Mission time until which a ground group's radars are off the air, as
+    #: the client's emission control holds them (`emission_off_until`).
+    dark_until: float | None = None
 
     @property
     def name(self) -> str:
@@ -466,6 +469,11 @@ class FakeDCS:
             )
             if why is not None:
                 return why
+            dark = frame.tasking.get("emission_off_until")
+            if dark is not None and (isinstance(dark, bool) or not isinstance(dark, (int, float))):
+                # In the client's words: Lua's tostring spells booleans lower-case.
+                shown = str(dark).lower() if isinstance(dark, bool) else str(dark)
+                return f"bad spawn payload: malformed emission_off_until: {shown}"
         for wp in frame.route:
             if wp.airdrome_id is not None and not _whole(wp.airdrome_id):
                 return f"bad spawn payload: malformed airdrome_id: {wp.airdrome_id!r}"
@@ -509,6 +517,12 @@ class FakeDCS:
             types=(
                 _composition_types(frame.template, units, tasking.get("composition"))[0]
                 if frame.category == "ground"
+                else None
+            ),
+            dark_until=(
+                float(tasking["emission_off_until"])
+                if frame.category == "ground"
+                and tasking.get("emission_off_until") is not None
                 else None
             ),
         )
@@ -708,7 +722,10 @@ class FakeDCS:
                 "shot", initiator=flight.name, target=site.name, weapon=weapon
             )
             before = site.units
-            self._kill_emitters(site, max(0, self.cfg.sead_kills))
+            # A battery whose radars are off the air has nothing for the
+            # missiles to home on, exactly as in DCS under emission control.
+            dark = site.dark_until is not None and self.t < site.dark_until
+            self._kill_emitters(site, 0 if dark else max(0, self.cfg.sead_kills))
             site.alive = site.units > 0
             for _ in range(before - site.units):
                 await self._emit_event(

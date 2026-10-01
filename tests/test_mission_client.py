@@ -2527,6 +2527,68 @@ class TestSitesAreBuiltAndReportedByType(unittest.TestCase):
         for spawn_id in ("f16a", "70f1"):
             self.assertIsNone(self.next_snapshot(spawn_id).unit_types, spawn_id)
 
+    # -- emission control: a battery the paper has off the air ---------------
+
+    def despawn(self, spawn_id: str) -> None:
+        self.ref += 1
+        self.mission.engine.send([Despawn(seq=self.ref, t=self.mission.mock.time,
+                                          ref=self.ref, spawn_id=spawn_id)])
+        self.mission.step(3)
+
+    def test_a_battery_spawned_mid_shutdown_is_dark_until_the_paper_has_it_back(self):
+        back = self.mission.mock.time + 120.0
+        self.assertTrue(self.spawn("5a70", tasking={
+            "kind": "air_defence", "emission_off_until": back}).ok)
+        calls = self.mission.mock.emission("cmp_5a70")
+        self.assertEqual([on for on, _ in calls], [False])
+        self.mission.run_until(lambda m: len(m.mock.emission("cmp_5a70")) > 1,
+                               limit=back + 10.0)
+        calls = self.mission.mock.emission("cmp_5a70")
+        self.assertEqual([on for on, _ in calls], [False, True])
+        self.assertGreaterEqual(calls[1][1], back)
+        self.assertLess(calls[1][1], back + 2.0, "switched back on late")
+        self.mission.assert_lua_was_clean(self)
+
+    def test_a_battery_not_in_shutdown_is_never_touched(self):
+        self.assertTrue(self.spawn("5a71").ok)
+        self.mission.step(60)
+        self.assertEqual(self.mission.mock.emission("cmp_5a71"), [])
+
+    def test_a_malformed_shutdown_is_refused_as_the_harness_refuses_it(self):
+        harness = FakeDCS(Config())
+        for index, value in enumerate(["soon", True]):
+            with self.subTest(value=value):
+                tasking = {"kind": "air_defence", "emission_off_until": value}
+                frame = self.frame(f"c{index:03d}", tasking=tasking)
+                expected = harness._refusal(frame)
+                self.assertIsNotNone(expected, "the harness accepted it")
+                ack = self.spawn(f"c{index:03d}", tasking=tasking)
+                self.assertFalse(ack.ok, "the client built it")
+                self.assertEqual(ack.error, expected)
+
+    def test_emission_control_that_raises_costs_the_switch_and_nothing_else(self):
+        self.mission.mock.fail_emission()
+        back = self.mission.mock.time + 30.0
+        self.assertTrue(self.spawn("5a72", tasking={
+            "kind": "air_defence", "emission_off_until": back}).ok)
+        self.mission.step(60)
+        self.assertEqual(self.next_snapshot("5a72").units, 5)
+        self.assertEqual(self.mission.mock.scheduler_errors(), [])
+        self.assertTrue(any("enableEmission" in msg for msg in self.mission.mock.logs("warning")),
+                        self.mission.mock.logs())
+        self.assertTrue(self.mission.mock.status()["synced"])
+
+    def test_an_old_instruction_does_not_switch_a_respawned_battery_on_early(self):
+        start = self.mission.mock.time
+        self.assertTrue(self.spawn("5a73", tasking={
+            "kind": "air_defence", "emission_off_until": start + 60.0}).ok)
+        self.despawn("5a73")
+        self.assertTrue(self.spawn("5a73", tasking={
+            "kind": "air_defence", "emission_off_until": start + 300.0}).ok)
+        self.mission.step(120)
+        self.assertEqual([on for on, _ in self.mission.mock.emission("cmp_5a73")], [False])
+        self.mission.assert_lua_was_clean(self)
+
     def test_the_engine_harness_and_client_name_the_same_unit_types(self):
         templates = lua_to_py(self.mission.mock.lua.globals().CampaignClient.TEMPLATES)
         self.assertEqual(SITE_UNIT_TYPES, TEMPLATE_UNIT_TYPES)

@@ -71,8 +71,16 @@ DRAWN = (
 #: Seed 1 is the first, in order, at which blue wins (at 6525 s, one unit of
 #: the storage area standing), and seed 0 the first at which red wins (at
 #: 3945 s) and the depot survives.
+#:
+#: Re-pinned once more when a hit became, mostly, a shutdown rather than a
+#: kill (docs/design.md, section 7): a battery forced off the air is back
+#: ten minutes later, so later sorties meet it again and the dice after the
+#: first one move. At seed 0 red still wins, at 6435 s, but blue's airborne
+#: strike flattens the depot afterwards. Seed 1 is still a blue win; seed 2
+#: is the first, in order, at which red wins (at 3945 s) and the depot
+#: survives.
 SEED_BLUE_WINS = 1
-SEED_RED_WINS = 0
+SEED_RED_WINS = 2
 #: A day of war on the slice as shipped in which each side's strike element
 #: loses aircraft to the other's air defences and each side's bombs destroy
 #: part of the other's target. Found by flying seeds in order: at seed 20 red
@@ -459,6 +467,12 @@ class TestConservationOnBothSides(unittest.TestCase):
         loses anything, which is the triviality the forty units are here to
         prevent. `template` before `units_alive`, so the count re-types the
         battery for the template it now has.
+
+        Seed 4, not the default. Since a hit mostly forces a battery off the
+        air rather than killing a unit (section 7), the strikers behind it
+        are more often unexposed, and at the default seed blue's SEAD element
+        loses only two aircraft. Seed 4 is the first, in order, at which
+        every squadron loses at least four.
         """
         theater = slice_with(
             **{
@@ -472,7 +486,7 @@ class TestConservationOnBothSides(unittest.TestCase):
                           "engagement_radius": launch_range("Kh-58U")},
             }
         )
-        campaign = Campaign(theater=theater)
+        campaign = Campaign(theater=theater, seed=4)
         for _ in range(int(100_000 / PAPER_STEP)):
             campaign.advance(PAPER_STEP)
             conserved(self, campaign)

@@ -279,6 +279,11 @@ class ThreatSite:
     #: start the work over.
     radar_repair: float = 0.0
     launcher_repair: float = 0.0
+    #: Campaign time until which the battery's radar is off the air, forced
+    #: down by an anti-radiation missile on paper; None when it is not. A
+    #: paper state only: the radar is alive, so no snapshot can show it, and
+    #: a spawn carries it to DCS as emission control instead. Saved.
+    dark_until: float | None = None
 
     @property
     def radar_type(self) -> str:
@@ -319,6 +324,15 @@ class ThreatSite:
         nothing takes a launcher off a battery -- only DCS does.
         """
         return self.radars_alive > 0
+
+    def engages_at(self, t: float) -> bool:
+        """Can the site engage at campaign time `t`?
+
+        It needs a radar, and the radar on the air: one an anti-radiation
+        missile forced down is off until `dark_until`, and then simply back
+        (docs/design.md, section 7).
+        """
+        return self.can_engage and (self.dark_until is None or t >= self.dark_until)
 
     @property
     def destroyed(self) -> bool:
@@ -383,6 +397,7 @@ class ThreatSite:
             "spawn_id": self.spawn_id,
             "radar_repair": self.radar_repair,
             "launcher_repair": self.launcher_repair,
+            "dark_until": self.dark_until,
         }
 
     @classmethod
@@ -401,6 +416,7 @@ class ThreatSite:
             spawn_id=raw.get("spawn_id", ""),
             radar_repair=float(raw["radar_repair"]),
             launcher_repair=float(raw["launcher_repair"]),
+            dark_until=None if raw["dark_until"] is None else float(raw["dark_until"]),
         )
         site.units_by_type = {
             str(t): int(n) for t, n in sorted(raw["units_by_type"].items()) if int(n) > 0
@@ -500,13 +516,16 @@ class Theater:
         return [c for c in owners if not self.surviving_targets_of(c)]
 
     def live_threats_along(
-        self, coalition: Coalition, a: Vec3, b: Vec3
+        self, coalition: Coalition, a: Vec3, b: Vec3, at: float | None = None
     ) -> list[ThreatSite]:
         """`coalition`'s engaging sites whose envelope the leg `a`-`b` enters.
 
         A site with no radar left is not among them: it cannot engage
         (docs/design.md, section 7), so it exposes no route, gives a SEAD
-        element nothing to home on, and is no reason to send one.
+        element nothing to home on, and is no reason to send one. With `at`,
+        nor is one whose radar will still be off the air then -- the planner
+        asks at the package's TOT, the TOT at its own instant. Without it,
+        only the radars count: the map with no clock.
 
         Sorted by id, because the caller rolls dice in this order and a replay
         has to roll them in the same one.
@@ -517,7 +536,7 @@ class Theater:
                 for site in self.threats.values()
                 if site.coalition == coalition
                 and not site.destroyed
-                and site.can_engage
+                and (site.can_engage if at is None else site.engages_at(at))
                 and site.covers(a, b)
             ),
             key=lambda site: site.id,

@@ -1005,7 +1005,9 @@ class TestSpentThroughTheProtocol(unittest.TestCase):
     the TOT the element and the site are both on paper. Every missile hits
     and no site can kill, so what the SA-6 loses says how many missiles the
     paper fired -- the SA-6 rebuilt as `ALL_EMITTERS`, so that each hit is a
-    unit lost rather than the first one blinding it.
+    unit lost rather than the first one blinding it, and every hit destroys:
+    a hit that only forced the battery off the air would leave the missiles
+    behind it nothing to home on (docs/design.md, section 7).
     """
 
     def _war(self, *, early_contact: bool, loadouts=None, damages=()):
@@ -1014,7 +1016,7 @@ class TestSpentThroughTheProtocol(unittest.TestCase):
         )
         site = campaign.theater.threats[SA6]
         start = [(site.pos[0], 100.0, site.pos[2])] if early_contact else OBSERVER_FAR_AWAY
-        with mock.patch("campaign.campaign.ARM_PK", 1.0):
+        with mock.patch("campaign.resolver.ARM_PK", 1.0),                 mock.patch("campaign.resolver.ARM_DESTROY_FRACTION", 1.0):
             dcs = drive(campaign, observer_positions=start, damages=list(damages),
                         deliver_events=False, start=0, duration=1_200,
                         loadouts=loadouts)

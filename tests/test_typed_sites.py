@@ -32,6 +32,7 @@ import dataclasses
 import json
 import random
 import unittest
+from unittest import mock
 
 from campaign.api import PAPER_STEP
 from campaign.attrition import CAUSE_UNOBSERVED, KIND_THREAT
@@ -562,8 +563,17 @@ class TestTheSyriaWarRepairs(unittest.TestCase):
                                                   launcher_time=24 * 3600.0))
 
     def test_every_squadron_balances_through_a_war_that_repairs(self):
+        """Every hit destroys the radar here, so the war is one that repairs.
+
+        Since a hit mostly forces a battery off the air rather than destroying
+        its radar (docs/design.md, section 7), a Syria war at the shipped
+        figures may destroy no radar on the humans' side at all -- seeds 1 and
+        2 do not -- and then nothing is repaired and the books below are kept
+        through a war that never exercised repair. Destroying on every hit is
+        the war this test was written against, before shutdowns existed.
+        """
         for seed in (1, 2):
-            with self.subTest(seed=seed):
+            with self.subTest(seed=seed),                     mock.patch("campaign.resolver.ARM_DESTROY_FRACTION", 1.0):
                 campaign = new_syria(seed)
                 repaired = 0
                 for _ in range(int(3 * 86_400.0 / PAPER_STEP)):

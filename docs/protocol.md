@@ -304,6 +304,29 @@ repaired; one built short, a loss nobody caused. The engine leaves
 `composition` out whenever the front-first order already builds the right
 battery, so such a spawn is exactly what it was in v3.
 
+**A battery whose radars are off the air.** On paper an anti-radiation
+missile mostly forces a battery's radar off the air for a while rather than
+destroying it (docs/design.md, section 7). That is no loss -- the radar is
+alive -- so no snapshot can show it, and a battery DCS built emitting would
+engage flights the paper says it cannot see. An air-defence tasking spawned
+in that window carries `emission_off_until`, the mission time the paper has
+the radar back:
+
+```json
+{"kind":"air_defence","emission_off_until":1834.0}
+```
+
+The client turns the group's emitters off as it builds it
+(`Group:enableEmission(false)`) and back on at that mission time, for that
+spawn only: a battery despawned and spawned again in the meantime follows its
+own frame. A value that is neither null nor a number is a failed `ack`
+(`"bad spawn payload: malformed emission_off_until: ..."`). Emission control
+is unverified DCS content, so the client guards it: a call that raises is
+logged and the battery left emitting, never a failed spawn or a broken tick;
+mission/validate_templates.lua's `emission.*` case settles it in the sim.
+The engine sends the field only during a shutdown, so every other spawn is
+the frame it always was.
+
 A package's elements (docs/design.md, section 5) arrive as separate spawns,
 each with its own `spawn_id`, and the client never reasons about two at
 once. A SEAD element's tasking is
@@ -395,7 +418,8 @@ One breaking change, in two halves that only work together:
    exactly which units to build. A v3 client ignores it and builds the radar
    first, giving a battery the war blinded its radar back. The engine sends
    it only when the radar-first order would be wrong, so every other spawn
-   is unchanged.
+   is unchanged. Likewise `emission_off_until`, sent only for a battery whose
+   radar is off the air on paper; a v3 client would build it emitting.
 
 Neither side can serve the other, so each refuses the other's version up
 front, exactly as before: the engine closes on a v3 `hello` without writing

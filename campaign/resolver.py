@@ -26,13 +26,13 @@ The same rule runs the other way at the same instant. A strike flight DCS is
 not holding at its TOT is flown through the enemy's air defences on paper
 (:func:`resolve_exposure`) before it releases anything, so an unwatched sortie
 can be lost as well as won. A SEAD element flies first, and its missiles are
-rolled here too (:func:`resolve_strike` at :data:`ARM_PK`); what it buys the
+rolled here too (:func:`resolve_arm`); what it buys the
 strikers is a lower kill probability (:func:`suppressed_kill_probability`),
 never a different roll. A SEAD element whose missile out-ranges a site fires
 from outside its envelope and is never rolled against it: the caller leaves
 that site out of the list it passes :func:`resolve_exposure`, and so does a
-site whose radar is gone, which cannot engage at all (docs/design.md,
-section 7). When SEAD may act on paper at all is docs/design.md, section 5.
+site whose radar is gone or off the air, which cannot engage at all
+(docs/design.md, section 7). When SEAD may act on paper at all is docs/design.md, section 5.
 
 **Dice.** How many draws a resolution takes is decided by the situation --
 the geometry, the content, and what earlier steps left alive -- and never by
@@ -137,14 +137,88 @@ def resolve_exposure(
     )
 
 
-#: Probability that one anti-radiation missile destroys the radar of the site
-#: it is fired at. Lower than a bomb's: an ARM guides on an emitter rather than
-#: an aimpoint, and a radar that shuts down in time is not where it homes.
-#: Site units are typed (docs/design.md, section 7), so a kill is the radar,
-#: never a launcher: the caller rolls these against the radars a site has
-#: left and books the kill against its radar type, and a site without one
-#: cannot engage until it is repaired.
+#: Probability that one anti-radiation missile hits home on the radar of the
+#: site it is fired at -- destroying it, or, far more often, forcing it off
+#: the air (`ARM_DESTROY_FRACTION`). Lower than a bomb's: an ARM guides on an
+#: emitter rather than an aimpoint, and a radar that shuts down in time is
+#: not where it homes. Site units are typed (docs/design.md, section 7), so
+#: a kill is the radar, never a launcher. A flat placeholder.
 ARM_PK = 0.25
+
+#: Of the missiles that home on a radar, the fraction that destroy it rather
+#: than make it shut down (docs/design.md, section 7). Derived from the one
+#: published count of fired against destroyed found: in Allied Force "US and
+#: NATO aircraft fired at least 743 HARMs", and NATO could "confirm the
+#: destruction of only three of Serbia's approximately 25 known mobile SA-6
+#: batteries" (Benjamin S. Lambeth, "Kosovo and the Continuing SEAD
+#: Challenge", Aerospace Power Journal; mirrored at
+#: ausairpower.net/APJ-Lambeth-Mirror.html). Three destroyed of 743 fired is
+#: 0.4% a missile; at ARM_PK a hit, 1.6% of hits. Every bias in that count
+#: makes it low -- only SA-6 batteries counted, only confirmed kills, and
+#: Serbia's operators were unusually disciplined about emissions -- so it is
+#: a floor, not an estimate, and is used as it stands rather than raised by a
+#: guess.
+ARM_DESTROY_FRACTION = (3 / 743) / ARM_PK
+
+#: Seconds a radar stays off the air after an anti-radiation missile forced
+#: it down: ten minutes. A GAME-DESIGN CHOICE, not a researched figure: no
+#: published post-shutdown time was found (Lambeth describes Serb operators
+#: emitting for 20 seconds and then going quiet, a firing tactic, not this).
+#: Ten minutes outlasts the package behind the missiles: the paper track's
+#: 140 m/s crosses the largest envelope on the Syria map, 50 km, in six. The
+#: radar is then simply back on; nothing was broken, so nothing is repaired.
+ARM_SHUTDOWN_TIME = 600.0
+
+
+@dataclass(frozen=True)
+class ArmOutcome:
+    """What an unwatched SEAD element's missiles did to one site."""
+
+    radars_destroyed: int
+    shut_down: bool
+    rounds_rolled: int
+
+
+def resolve_arm(
+    *,
+    rounds: int,
+    radars_alive: int,
+    rng: random.Random,
+    pk: float | None = None,
+    destroy_fraction: float | None = None,
+) -> ArmOutcome:
+    """Roll anti-radiation missiles at one site, one die each.
+
+    A die below `pk * destroy_fraction` destroys a radar; below `pk`, it
+    forces the battery off the air; above, it misses. One die a missile
+    carries both the hit and the destroy-or-shutdown decision, so the draws
+    are exactly `rounds` whatever they say -- the same discipline as
+    :func:`resolve_strike`. A missile has to home on an emitter: once a hit
+    has shut the battery down, or every radar is gone, the missiles after it
+    find nothing and do nothing, though each is still rolled.
+    """
+    # Read here, not bound as defaults, so the module's figures are the ones
+    # in force when the missiles fly.
+    pk = ARM_PK if pk is None else pk
+    destroy_fraction = ARM_DESTROY_FRACTION if destroy_fraction is None else destroy_fraction
+    if rounds <= 0:
+        return ArmOutcome(radars_destroyed=0, shut_down=False, rounds_rolled=0)
+    destroyed = 0
+    dark = False
+    for _ in range(rounds):
+        die = rng.random()
+        if dark or destroyed >= radars_alive or die >= pk:
+            continue
+        if die < pk * destroy_fraction:
+            destroyed += 1
+        else:
+            dark = True
+    return ArmOutcome(
+        radars_destroyed=destroyed,
+        shut_down=dark and destroyed < radars_alive,
+        rounds_rolled=rounds,
+    )
+
 
 #: Fraction of a site's kill probability each surviving SEAD aircraft takes
 #: away from the strike element behind it. Suppression compounds per

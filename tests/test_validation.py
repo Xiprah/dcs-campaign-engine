@@ -94,6 +94,9 @@ EXPECTED_IDS = {
     # each SEAD missile, and the cross-check on the client's table of them.
     "ammo.F-16C_sead_harm",
     "ammo.Su-24M_sead_kh58",
+    # Emission control on a SAM group, which the client uses to keep a
+    # battery forced off the air on paper off the air in the sim.
+    "emission.SA-6_Kub_site",
     "drift.weapon_names",
 }
 
