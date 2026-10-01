@@ -95,6 +95,7 @@ from campaign.protocol import (
     Despawn,
     Downlink,
     Event,
+    GroupSnapshot,
     Hello,
     Message,
     ObserverReport,
@@ -122,7 +123,9 @@ from campaign.theater import (
 #:    by `war_result`, because the war can now be lost as well as won.
 #: 5: a package is a list of elements, each with its own spawn id,
 #:    reservation, schedule and state (docs/design.md, section 5).
-SAVE_VERSION = 5
+#: 6: an element carries what the sim spent of its munition (`sim_spent`,
+#:    `ammo_seen`) in place of `sim_contact`; protocol v3 reports it.
+SAVE_VERSION = 6
 
 #: Default seed. Explicit, because an implicit one is an unseeded one.
 DEFAULT_SEED = 20240923
@@ -369,9 +372,21 @@ class Campaign:
         return []
 
     def on_state(self, msg: StateReport) -> list[Downlink]:
-        """Ground truth. The only path by which the campaign may lose anything."""
+        """Ground truth. The only path by which the campaign may lose anything.
+
+        Also the only path by which the campaign learns what the sim fired:
+        ammunition is read here and nowhere else, so dropping every event
+        frame changes it no more than it changes a loss.
+        """
         self._advance(msg.t)
-        frames = self._apply_losses(self.tracker.ingest(self._rebase(msg)))
+        losses = self.tracker.ingest(self._rebase(msg))
+        # Read before the losses are applied, so that a snapshot in which an
+        # aircraft died and missiles left the sim is booked once, with the
+        # dead aircraft's share counted as lost (`_reconcile_rounds`).
+        spent = self._read_ammunition(msg)
+        frames = self._apply_losses(losses)
+        for package, element in spent:
+            self._reconcile_rounds(package, element, dead=0)
         frames.extend(self._close_out_dead_packages())
         frames.extend(self._pulse())
         return frames
@@ -385,7 +400,7 @@ class Campaign:
         if action == _SPAWN:
             if msg.ok:
                 self.tracker.mark_instantiated(spawn_id, self.clock)
-                self._note_sim_contact()
+                self._new_instantiation(spawn_id)
             else:
                 return self._spawn_rejected(spawn_id, msg.error or "")
         elif action == _DESPAWN and msg.ok:
@@ -718,8 +733,10 @@ class Campaign:
         loses units only to snapshots. The consequences for suppression are
         spelled out in `_suppress`.
 
-        Expenditure is the engine's own fact whoever holds what: each
-        element's survivors expend what they carried, here, once.
+        Expenditure is booked once per round. What the sim spent of a SEAD
+        element's missiles was booked as each snapshot showed it; here each
+        element's survivors expend what is left of their reservation, which
+        for a SEAD element is only what the sim has not already spent.
         """
         package.weapons_released = True
         frames: list[Downlink] = []
@@ -728,14 +745,16 @@ class Campaign:
         sead = package.element(ROLE_SEAD)
         if sead is not None and sead.is_open:
             frames.extend(self._expose(package, sead, {}))
-            survivors = self._release(package, sead)
+            survivors, rounds = self._release(package, sead)
             if survivors > 0:
-                frames.extend(self._suppress(package, sead, survivors, suppression))
+                frames.extend(
+                    self._suppress(package, sead, survivors, rounds, suppression)
+                )
                 frames.extend(self._off_target(package, sead, survivors))
         strike = package.element(ROLE_STRIKE)
         if strike is not None and strike.is_open:
             frames.extend(self._expose(package, strike, suppression))
-            survivors = self._release(package, strike)
+            survivors, _ = self._release(package, strike)
             if survivors > 0:
                 frames.extend(self._resolve_unobserved(package, strike, survivors))
                 frames.extend(self._off_target(package, strike, survivors))
@@ -744,24 +763,78 @@ class Campaign:
         # observed or not.
         return frames
 
-    def _release(self, package: Package, element: Element) -> int:
-        """Expend what the element's surviving aircraft carried; return them.
+    def _release(self, package: Package, element: Element) -> tuple[int, int]:
+        """Expend what is left of the element's reservation.
 
-        Expenditure comes off the paper track, not off a snapshot, because it
-        is the engine's own fact: the engine knows what it loaded and what
-        reached the target. What the ordnance *achieved* is another matter,
+        Returns the surviving aircraft and the rounds they released here.
+        For a strike element that is what its survivors carried, as it
+        always was. For a SEAD element it is what its survivors carried
+        less what the sim already spent (`_paper_rounds`), because those
+        were booked when a snapshot showed them gone and a round is
+        debited once.
+
+        Expenditure comes off the paper track and the snapshots, never off
+        events: the engine knows what it loaded, and the snapshot knows what
+        is still aboard. What the ordnance *achieved* is another matter,
         with exactly one authority (`_resolve_unobserved`, `_suppress`).
         """
-        element.weapons_released = True
         survivors = self.tracker.units_alive(element.spawn_id)
+        self._reconcile_rounds(package, element, dead=0)
+        released = 0
         squadron = self._squadron_for(package, element)
         if squadron is not None and element.reservation_id in squadron.open_reservations:
-            squadron.debit_munitions(
-                element.reservation_id,
-                survivors * element.rounds_per_aircraft,
-                lost=False,
+            released = squadron.debit_munitions(
+                element.reservation_id, self._paper_rounds(element), lost=False
             )
-        return survivors
+        element.weapons_released = True
+        return survivors, released
+
+    def _paper_rounds(self, element: Element) -> int:
+        """Rounds the element may still release on paper.
+
+        At most what its living aircraft carry, and at most what the engine
+        reserved less what the sim has spent: a missile gone from the sim,
+        fired or carried down with its aircraft, is never fired again here
+        (docs/design.md, section 5). For an element DCS never held, the
+        second bound is the reservation itself.
+        """
+        alive = self.tracker.units_alive(element.spawn_id)
+        carried = alive * element.rounds_per_aircraft
+        return max(0, min(carried, element.rounds - element.sim_spent))
+
+    def _reconcile_rounds(self, package: Package, element: Element, dead: int) -> None:
+        """Make the element's reservation hold exactly its `_paper_rounds`.
+
+        Called whenever either bound moves -- an aircraft lost, or a snapshot
+        showing rounds gone from the sim -- and only before release. The
+        reservation is the paper's licence to fire, so a round it no longer
+        covers is debited now, once, and can never be released at the TOT.
+
+        `dead` is how many of the element's aircraft this change killed. Up
+        to their share of the excess is booked lost, the rest expended. A
+        summed count cannot say whether rounds that left the sim in the same
+        interval an aircraft died were fired or went down with it; the dead
+        aircraft's share is called lost, which is exact whenever every jet
+        carried its full load. Either bucket conserves the round. For an
+        element the sim never armed this books exactly what the one-flight
+        package always did: the rounds per aircraft of each one lost.
+        """
+        if element.weapons_released:
+            return
+        squadron = self._squadron_for(package, element)
+        if squadron is None:
+            return
+        reservation = squadron.open_reservations.get(element.reservation_id)
+        if reservation is None:
+            return
+        excess = reservation.rounds - self._paper_rounds(element)
+        if excess <= 0:
+            return
+        lost = min(excess, max(0, dead) * element.rounds_per_aircraft)
+        if lost:
+            squadron.debit_munitions(element.reservation_id, lost, lost=True)
+        if excess > lost:
+            squadron.debit_munitions(element.reservation_id, excess - lost, lost=False)
 
     def _off_target(self, package: Package, element: Element, survivors: int) -> list[Downlink]:
         return self._tell(
@@ -872,6 +945,7 @@ class Campaign:
         package: Package,
         sead: Element,
         survivors: int,
+        rounds: int,
         suppression: dict[str, int],
     ) -> list[Downlink]:
         """What a SEAD element's survivors did to the sites, on paper.
@@ -879,7 +953,8 @@ class Campaign:
         The rule for mixed authority (docs/design.md, section 5): SEAD has a
         paper effect -- missiles rolled against a site, and suppression of
         that site for the strike element -- only when **both** the SEAD
-        element and the site are outside DCS at the TOT.
+        element and the site are outside DCS at the TOT, and only with the
+        `rounds` the sim has not already spent (`_paper_rounds`).
 
         * A SEAD element DCS is holding is the sim's. Whatever it did, the
           only trace a snapshot can carry is site units destroyed, and those
@@ -894,38 +969,42 @@ class Campaign:
           it buys no suppression against that site either.
         * A strike element DCS is holding is never rolled, so suppression has
           nothing to act on; the missiles against paper sites still land.
-        * A site DCS held at the same time as the SEAD element, at any moment
-          before this TOT, is excluded even though both are on paper now
-          (`_note_sim_contact`). The client tasks a SEAD element to engage
-          whatever air defence it meets, not at a waypoint, so sharing the sim
-          with the site was the sim's chance to fire those missiles, and what
-          they did arrived by snapshot. Rolling them again here would resolve
-          one element's missiles twice. A strike element has no such rule:
-          its attack is hung on the waypoint it reaches at its TOT, so the
-          sim resolves its bombs only if it holds the strike then.
+        * A SEAD element DCS held earlier in its sortie fires on paper only
+          what the snapshots say the sim did not spend. Whatever the sim
+          fired was resolved there, and its effect came back by snapshot.
+        * Suppression is bought by the aircraft that fire here: as many as
+          it takes to carry `rounds`, never more than survived. An aircraft
+          that spent everything in the sim suppresses nothing on paper. Its
+          shots were the sim's, and what they achieved is in the snapshots;
+          crediting a paper suppression for them as well would count one
+          missile's effect twice, which is why a held SEAD element buys none.
+          An element that carried nothing in the sim spent nothing there, so
+          it suppresses with every survivor, exactly as before.
 
         The missiles are shared out over the paper sites in id order, round
         robin, and every one is rolled even once its site has nothing left to
         lose (`resolve_strike`), so the draws depend on how many were fired
         and at how many sites -- never on how the dice fall.
         """
-        if self.tracker.is_instantiated(sead.spawn_id):
+        if self.tracker.is_instantiated(sead.spawn_id) or rounds <= 0:
             return []
         sites = [
             site
             for site in self._route_threats(package)
             if not self.tracker.is_instantiated(site.spawn_id)
-            and site.id not in sead.sim_contact
         ]
         if not sites:
             return []
-        rounds = survivors * sead.rounds_per_aircraft
+        per_aircraft = sead.rounds_per_aircraft
+        shooters = survivors
+        if per_aircraft > 0:
+            shooters = min(survivors, -(-rounds // per_aircraft))
         frames: list[Downlink] = []
         for index, site in enumerate(sites):
             share = rounds // len(sites) + (1 if index < rounds % len(sites) else 0)
             if share <= 0:
                 continue
-            suppression[site.id] = survivors
+            suppression[site.id] = shooters
             outcome = resolve_strike(
                 rounds=share,
                 target_units_alive=site.units_alive,
@@ -941,36 +1020,66 @@ class Campaign:
             )
         return frames
 
-    def _note_sim_contact(self) -> None:
-        """Record every enemy site DCS holds alongside an unreleased SEAD element.
+    def _new_instantiation(self, spawn_id: str) -> None:
+        """A flight DCS has just built starts its ammunition count afresh.
 
-        Called whenever the client acknowledges a spawn, because that is the
-        only moment two entities can begin to be held at once: `instantiated`
-        is set by an ack and by nothing else. Recording there catches every
-        stretch of shared sim time however short, with no sampling, and from
-        frames alone, so a replay of the same log records the same contact.
-        Events play no part.
+        The client builds every spawn with its template's loadout, so a
+        re-instantiated element is re-armed in the sim whatever it fired
+        last time. What it spent then is already in `sim_spent`; the next
+        snapshot's spawn-time reading is this instantiation's baseline.
         """
-        held = [
-            site
-            for site in sorted(self.theater.threats.values(), key=lambda s: s.id)
-            if site.spawn_id and self.tracker.is_instantiated(site.spawn_id)
-        ]
-        if not held:
-            return
-        for package in sorted(self.packages.values(), key=lambda p: p.id):
-            sead = package.element(ROLE_SEAD)
-            if (
-                sead is None
-                or not sead.is_open
-                or sead.weapons_released
-                or not self.tracker.is_instantiated(sead.spawn_id)
-            ):
+        found = self._find_element(spawn_id)
+        if found is not None:
+            found[1].ammo_seen = None
+
+    def _read_ammunition(self, msg: StateReport) -> list[tuple[Package, Element]]:
+        """Fold a snapshot's ammunition into each open SEAD element it reports.
+
+        Returns the elements whose `sim_spent` rose, in report order.
+
+        Read for any group the snapshot lists, held or not: the snapshot a
+        client sends just before it obeys a despawn is the last word on what
+        that instantiation fired, and it arrives after the engine stopped
+        holding the group. Only a SEAD element's is read, and only before
+        its TOT: a strike element's bombs are resolved by whoever holds it at
+        the TOT (docs/design.md, section 5), and after the TOT the paper has
+        nothing left to withhold.
+        """
+        touched: list[tuple[Package, Element]] = []
+        for snapshot in msg.groups:
+            found = self._find_element(snapshot.spawn_id)
+            if found is None:
                 continue
-            enemy = enemy_of(package.coalition)
-            contact = set(sead.sim_contact)
-            contact.update(site.id for site in held if site.coalition == enemy)
-            sead.sim_contact = sorted(contact)
+            element = found[1]
+            if element.role != ROLE_SEAD or not element.is_open or element.weapons_released:
+                continue
+            before = element.sim_spent
+            self._observe_ammunition(element, snapshot)
+            if element.sim_spent != before:
+                touched.append(found)
+        return touched
+
+    @staticmethod
+    def _observe_ammunition(element: Element, snapshot: GroupSnapshot) -> None:
+        """Count what left the sim since the last reading of this instantiation.
+
+        The baseline is the client's spawn-time reading, not an absolute
+        load: the pylons are empty in DCS today, and a jet that reports no
+        missiles from its first snapshot has fired none. A snapshot that
+        cannot vouch for the count -- either reading missing -- is taken as
+        everything spent. The cost is a SEAD element that does nothing more
+        on paper; the alternative is a missile the sim may have fired being
+        fired again.
+        """
+        if snapshot.ammo is None or snapshot.ammo_initial is None:
+            element.sim_spent = max(element.sim_spent, element.rounds)
+            return
+        now = snapshot.ammo.get(element.munition, 0)
+        if element.ammo_seen is None:
+            element.ammo_seen = snapshot.ammo_initial.get(element.munition, 0)
+        if now < element.ammo_seen:
+            element.sim_spent += element.ammo_seen - now
+        element.ammo_seen = now
 
     def _resolve_unobserved(
         self, package: Package, element: Element, survivors: int
@@ -1091,10 +1200,20 @@ class Campaign:
         """
         frames: list[Downlink] = []
         counts: dict[tuple[str, str], int] = {}
+        dead: dict[str, int] = {}
         for loss in losses:
             frames.extend(self._apply_loss(loss))
             key = (loss.entity_kind, loss.entity_id)
             counts[key] = counts.get(key, 0) + 1
+            if loss.entity_kind == KIND_FLIGHT:
+                dead[loss.spawn_id] = dead.get(loss.spawn_id, 0) + 1
+        # Once per element, after every airframe in the batch is off the
+        # books: the rounds the dead took with them are judged against what
+        # the survivors may still release, not one jet at a time.
+        for spawn_id, count in dead.items():
+            found = self._find_element(spawn_id)
+            if found is not None:
+                self._reconcile_rounds(*found, dead=count)
         for (kind, entity_id), count in counts.items():
             frames.extend(self._report_damage(kind, entity_id, count))
         return frames
@@ -1155,14 +1274,9 @@ class Campaign:
             return []
         if element.reservation_id not in squadron.open_reservations:
             return []
+        # Its ordnance is booked by `_apply_losses` once the whole batch is
+        # in, against what the survivors may still release.
         squadron.debit_airframes(element.reservation_id, 1)
-        if not element.weapons_released:
-            # The jet took its ordnance into the ground with it. Still
-            # conserved, just not the same fact about the war as bombs on a
-            # target or missiles on a radar.
-            squadron.debit_munitions(
-                element.reservation_id, element.rounds_per_aircraft, lost=True
-            )
         return []
 
     def _apply_target_loss(self, loss: LossRecord) -> list[Downlink]:

@@ -1,4 +1,4 @@
-# Campaign wire protocol v2
+# Campaign wire protocol v3
 
 The contract between the **engine** (out-of-process campaign brain) and the
 **mission client** (thin Lua layer running inside DCS).
@@ -63,7 +63,7 @@ First frame on every connection. The engine replies `sync`, or closes the
 connection without writing anything on a protocol mismatch.
 
 ```json
-{"type":"hello","seq":1,"t":0.0,"protocol":2,"theater":"Syria","dcs_version":"2.9.29","mission_start_epoch":1758499200}
+{"type":"hello","seq":1,"t":0.0,"protocol":3,"theater":"Syria","dcs_version":"2.9.29","mission_start_epoch":1758499200}
 ```
 
 ### `observer`
@@ -103,18 +103,70 @@ instantiated. Sent every `STATE_PERIOD` seconds (default 30) and always
 immediately before a `despawn` is acknowledged.
 
 ```json
-{"type":"state","seq":41,"t":830.0,"groups":[{"spawn_id":"a91f","alive":true,"units":2,"units_initial":4,"pos":[41000.0,3000.0,-88000.0]}]}
+{"type":"state","seq":41,"t":830.0,"groups":[
+ {"spawn_id":"a91f","alive":true,"units":2,"units_initial":4,"pos":[41000.0,3000.0,-88000.0],
+  "ammo":{"AGM-88C":3},"ammo_initial":{"AGM-88C":4}},
+ {"spawn_id":"7c02","alive":true,"units":4,"units_initial":4,"pos":[-3000.0,0.0,41000.0]}]}
 ```
 
 A `state` frame is a complete census: a group the engine instantiated that is
 missing from it is read as gone.
 
+| field           | type           | notes |
+|-----------------|----------------|-------|
+| `spawn_id`      | string         | the entity the snapshot is about |
+| `alive`         | bool           | |
+| `units`         | int            | units still existing; aircraft DCS deleted after landing count |
+| `units_initial` | int            | units the client built for this spawn |
+| `pos`           | vec3 or null   | optional; the first living unit's position |
+| `ammo`          | object or null | optional. Aircraft only: rounds aboard, per weapon, summed over the group's living units. See below. |
+| `ammo_initial`  | object or null | optional. Aircraft only: the same count, read when the client built the group. |
+
+**Ammunition.** For an aircraft group, `ammo` maps a weapon name to the
+number of rounds of it aboard the group's living units, summed over them, as
+`Unit.getAmmo()` reports it. `ammo_initial` is the same reading taken when the
+client built the group, before anything could have been fired, and is sent
+unchanged with every snapshot of that spawn. A weapon the engine has a name
+for (`AGM-88C`, `Kh-58U`, `GBU-38`, `FAB-500`) is reported under that name; any
+other is reported under DCS's own type name, so a weapon the client failed
+to recognise is visible rather than silently missing. The gun's shells are
+left out. A weapon none of the group carries is absent, so `{}` means
+nothing aboard — DCS's answer for an aircraft whose pylons are empty, which
+is every aircraft the client builds today.
+
+Why both, and why a sum: the engine needs to know how many of a SEAD
+element's missiles the sim fired, so that it never fires them again on paper
+(docs/design.md, section 5). An absolute count cannot say that, because the
+client's loadouts are content the engine does not control: today they are
+empty, and a jet reporting no missiles from its first snapshot has fired
+none. A count against the group's own spawn-time reading can. The baseline
+comes from the client rather than from the engine's first snapshot because a
+snapshot arrives up to a `state_period` after the spawn, and an element
+spawned within range of a site may fire in that window. A sum per group, not
+a list per unit, because the engine accounts for a flight, not for named
+airframes; what a sum cannot tell apart — a missile fired from one carried
+down with its aircraft in the same interval — the engine does not need to,
+since the paper may fire neither.
+
+Both are optional, and null means the same as absent. Statics and ground
+groups send neither. An aircraft group sends both, except that the client
+leaves out a count it could not read whole: if any living unit's `getAmmo`
+raises or answers something malformed it sends no `ammo` for that snapshot,
+and if that happened at spawn it sends no `ammo_initial` for that spawn. A
+partial sum would read as missiles fired that were not, or the reverse. The
+engine reads a missing count on a SEAD element as an unvouched one — as if
+everything had been fired — never as zero.
+
 **A malformed snapshot is a protocol error and closes the connection** — a
 `groups` that is not an array, a member that is not an object or lacks a
-field, or a `spawn_id` that is not a string. None of the event leniency
-applies here. A snapshot is ground truth, and a group reported under an id
-that matches nothing reads as absent from the census, which is a loss: a
-guessed snapshot writes off a flight that is still flying.
+field, a `spawn_id` that is not a string, or an `ammo` or `ammo_initial` that
+is neither null nor an object of non-empty weapon names to whole,
+non-negative counts (`3.0` is not a count; `3` is). None of the event
+leniency applies here. A snapshot is ground truth, and a group reported
+under an id that matches nothing reads as absent from the census, which is a
+loss: a guessed snapshot writes off a flight that is still flying. A guessed
+ammunition count is no better: it fires a missile twice, or disarms a SEAD
+element nobody disarmed.
 
 ### `ack`
 Response to a downlink frame that carried a `ref`.
@@ -131,7 +183,7 @@ Always the first frame on a connection, in response to `hello`. Tells the
 client the campaign clock and hands it its operating parameters.
 
 ```json
-{"type":"sync","seq":1,"t":0.0,"protocol":2,"campaign_time":417600,"state_period":30,"observer_period":5,"bubble_radius":75000}
+{"type":"sync","seq":1,"t":0.0,"protocol":3,"campaign_time":417600,"state_period":30,"observer_period":5,"bubble_radius":75000}
 ```
 
 ### `spawn`
@@ -248,9 +300,10 @@ campaign that is quietly wrong — which is worse than one that visibly breaks.
 
 So the engine treats the two streams differently:
 
-- **`state` is truth.** Entity liveness and unit counts come only from
-  snapshots. If a snapshot says a group is gone, it is gone, regardless of what
-  events did or did not arrive.
+- **`state` is truth.** Entity liveness, unit counts and ammunition come only
+  from snapshots. If a snapshot says a group is gone, it is gone, regardless
+  of what events did or did not arrive; if it says two missiles left a
+  flight, two were spent, whether or not a `shot` event said so.
 - **`event` is attribution.** Events answer *who* killed a thing and *with
   what*, which snapshots cannot. Attribution is best-effort and may be unknown.
 
@@ -270,12 +323,31 @@ owning all identity is what makes a campaign survivable across sim restarts.
 
 ## Versioning
 
-`protocol` is an integer, bumped on any breaking change; this is version 2.
+`protocol` is an integer, bumped on any breaking change; this is version 3.
 There is no negotiation. The engine closes the connection on a `hello` that
 carries any other version, without writing a frame. The client tears the
 connection down on a `sync` that carries any other version, and backs off to
 its longest reconnect delay rather than retry against an engine it cannot
 talk to.
+
+## Changes from v2
+
+One breaking change:
+
+1. **`state` snapshots carry ammunition** (`ammo`, `ammo_initial`; see
+   `state`). A v2 client never sends it, and a v3 engine would read every
+   SEAD element such a client held as having spent its whole load; a v2
+   engine refuses a snapshot member with fields it does not know, so it
+   would close the connection on the first v3 `state`. Neither can serve the
+   other, so each refuses the other's version up front, exactly as before:
+   the engine closes on a v2 `hello` without writing a frame, and the client
+   tears down on a v2 `sync`.
+
+The fields are optional on the wire because statics and ground groups have
+nothing to report and a client must be able to say it could not read a
+count; but a malformed one is a protocol error, like every other snapshot
+field. Nothing else changed: every v2 frame not mentioned here is
+unchanged in v3, field for field.
 
 ## Changes from v1
 

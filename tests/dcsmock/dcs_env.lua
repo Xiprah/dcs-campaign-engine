@@ -6,6 +6,12 @@
   by guessing at the DCS API: `env`, `timer`, `coalition`, `country`,
   `Group`, `StaticObject`, `Unit`, `world`, `trigger.action`.
 
+  Ammunition is modelled only as far as Unit:getAmmo goes: a unit answers
+  with what its type was given in `ammo_by_type` when it was built (nil, as
+  DCS answers for an empty jet, by default), `fire_weapon` takes rounds off
+  it, and `ammo_raises` makes one unit's getAmmo raise. Nothing here is a
+  weapons model; a test decides what was fired.
+
   Two things this models properly, because the client's correctness turns on
   them:
 
@@ -63,6 +69,15 @@ local M = {
     --- case the client's unwind exists for.
     fail_static_named = nil,
 
+    --- unit type -> list of {count, desc = {typeName, category}} each unit
+    --- of that type is built carrying. Absent means nil from getAmmo.
+    ammo_by_type = {},
+    --- unit name -> true: that unit's getAmmo raises.
+    ammo_raises = {},
+    --- Build units with no getAmmo at all, as an environment without the
+    --- call would.
+    no_get_ammo = false,
+
     --- What coalition.getAirbases lists. Kinds and sides are mixed and ids are
     --- out of order on purpose: a caller after an airdrome has to filter for
     --- one and choose deterministically, not take the first entry it sees.
@@ -93,6 +108,18 @@ end
 -- Objects
 -- ------------------------------------------------------------------
 
+local function copy_ammo(list)
+    if list == nil then return nil end
+    local out = {}
+    for i = 1, #list do
+        local e = list[i]
+        local desc = {}
+        for k, v in pairs(e.desc or {}) do desc[k] = v end
+        out[i] = {count = e.count, desc = desc}
+    end
+    return out
+end
+
 local function make_unit(group, udata, side)
     local u = {}
     u.__name = udata.name
@@ -103,6 +130,7 @@ local function make_unit(group, udata, side)
     u.__player = nil
     u.__pos = vec3(udata.x or 0, udata.alt or 0, udata.y or 0)
     u.__velocity = vec3(0, 0, 0)
+    u.__ammo = copy_ammo(M.ammo_by_type[udata.type])
 
     function u:getName() return self.__name end
     function u:getTypeName() return self.__type end
@@ -127,6 +155,16 @@ local function make_unit(group, udata, side)
         return vec3(self.__velocity.x, self.__velocity.y, self.__velocity.z)
     end
     function u:destroy() M.kill_unit(self.__name) end
+    if not M.no_get_ammo then
+        function u:getAmmo()
+            if not self.__exists then error("unit " .. self.__name .. " is gone", 0) end
+            if M.ammo_raises[self.__name] then
+                error("getAmmo: injected failure on " .. self.__name, 0)
+            end
+            -- A fresh table every call, as DCS hands one back.
+            return copy_ammo(self.__ammo)
+        end
+    end
 
     return u
 end
@@ -258,6 +296,24 @@ function M.add_player(unit_name, player_name, side, x, alt, z)
     u.__player = player_name
     M.units[unit_name] = u
     return u
+end
+
+--- Take `n` rounds of `type_name` off a unit, dropping the entry when it
+--- runs out, as DCS lists only what is aboard. Returns how many were taken.
+function M.fire_weapon(unit_name, type_name, n)
+    local u = M.units[unit_name]
+    if not u or not u.__ammo then return 0 end
+    for i = 1, #u.__ammo do
+        local e = u.__ammo[i]
+        if e.desc and e.desc.typeName == type_name then
+            local take = math.min(n, e.count)
+            e.count = e.count - take
+            if e.count == 0 then table.remove(u.__ammo, i) end
+            if #u.__ammo == 0 then u.__ammo = nil end
+            return take
+        end
+    end
+    return 0
 end
 
 function M.move_unit(unit_name, x, alt, z)

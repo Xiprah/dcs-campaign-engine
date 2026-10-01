@@ -17,8 +17,9 @@ What is pinned here:
     does not out-range, and on the slice as shipped both sides out-range;
   * a SEAD element shot down, on paper or in DCS, and the strike flying on;
   * a destroyed or suppressed site costing the strike less;
-  * every mixed-authority combination at the TOT, and none of them resolving
-    one aircraft, one site unit or one element's missiles twice;
+  * every mixed-authority combination at the TOT, with the sim having spent
+    none, some or all of the SEAD element's missiles before it, and none of
+    them resolving one aircraft, one site unit or one missile twice;
   * the players told their own package's composition and never the enemy's;
   * the books, missiles included, through a long war;
   * and the question the whole thing exists to answer: is SEAD worth flying,
@@ -190,7 +191,39 @@ def hold(campaign: Campaign, *spawn_ids: str) -> None:
     """DCS acknowledges these spawns: exactly what `on_ack` does with an ok."""
     for spawn_id in spawn_ids:
         campaign.tracker.mark_instantiated(spawn_id, campaign.clock)
-        campaign._note_sim_contact()
+        campaign._new_instantiation(spawn_id)
+
+
+#: What a two-ship of SEAD jets carries in the sim once its pylons are
+#: loaded: the two missiles an aircraft the engine reserves.
+FULL_LOAD = 4
+
+
+def share_the_sim(campaign: Campaign, package, site, spent: int) -> None:
+    """DCS holds the SEAD element and the site together, the element fires
+    `spent` missiles there and every one misses, and then DCS lets both go.
+
+    The only way the engine may learn what was fired: a snapshot, carrying
+    the spawn-time reading and what is aboard now.
+    """
+    hold(campaign, package.sead.spawn_id, site.spawn_id)
+    left = FULL_LOAD - spent
+    campaign.on_state(
+        StateReport(
+            seq=8,
+            t=campaign.clock,
+            groups=[
+                GroupSnapshot(
+                    spawn_id=package.sead.spawn_id, alive=True, units=2, units_initial=2,
+                    ammo={"AGM-88C": left} if left else {},
+                    ammo_initial={"AGM-88C": FULL_LOAD},
+                ),
+                GroupSnapshot(spawn_id=site.spawn_id, alive=True, units=5, units_initial=5),
+            ],
+        )
+    )
+    campaign.tracker.mark_removed(package.sead.spawn_id)
+    campaign.tracker.mark_removed(site.spawn_id)
 
 
 def _ledger_count(campaign: Campaign, entity_id: str) -> int:
@@ -775,20 +808,31 @@ class TestTheSeadElementCanBeShotDown(unittest.TestCase):
 
 
 class TestMixedAuthority(unittest.TestCase):
-    """Every combination of who holds what at blue's TOT.
+    """Every combination of who holds what at blue's TOT, and what the sim spent.
 
     The rule (docs/design.md, section 5): the SEAD element's paper effect on a
     site -- missiles rolled at it, and suppression of it for the strike -- is
     granted only when the SEAD element and the site are both outside DCS at
-    the TOT and DCS never held the two at once before it. An element DCS
-    holds is never flown through the sites on paper; a site DCS holds loses
-    units only to snapshots.
+    the TOT, and then only with what the sim has not already spent: the
+    missiles the engine reserved less those the snapshots showed leaving the
+    sim. The aircraft that fire them, and only those, suppress. An element
+    DCS holds is never flown through the sites on paper; a site DCS holds
+    loses units only to snapshots.
+
+    The table's rows, as each case below flies them:
+
+      SEAD paper, site paper, the sim spent nothing  -> all four, suppressed
+      SEAD paper, site paper, the sim spent some     -> the rest, suppressed
+      SEAD paper, site paper, the sim spent all four -> none, full Pk
+      SEAD paper, site held                          -> none, full Pk
+      SEAD held, site either                         -> none, full Pk
 
     The dice are scripted so that each question has a visible answer: the
     SEAD element always survives its exposure, every missile hits, and each
-    strike die kills an aircraft unless the site is suppressed. The script is
-    built from the rule and must be used up exactly, so a single die thrown
-    at the wrong entity -- or not thrown -- fails the case.
+    strike die kills an aircraft unless the site is suppressed -- by one
+    aircraft or two, either is enough. The script is built from the rule and
+    must be used up exactly, so a single die thrown at the wrong entity -- or
+    not thrown -- fails the case.
 
     Each combination is flown twice: against an SA-6 the HARM cannot
     out-range, where a paper SEAD element flies its exposure, and against the
@@ -804,18 +848,15 @@ class TestMixedAuthority(unittest.TestCase):
         sead_held: bool,
         strike_held: bool,
         site_held: bool,
-        contact: bool,
+        spent: int = 0,
         standoff: bool = False,
     ):
         campaign = Campaign(theater=build_slice_theater() if standoff else sa6_in_reach())
         to_the_brink(campaign)
         package = blue_package(campaign)
         site = campaign.theater.threats[SA6]
-        if contact:
-            # Earlier in the sortie DCS held the two together, then let both go.
-            hold(campaign, package.sead.spawn_id, site.spawn_id)
-            campaign.tracker.mark_removed(package.sead.spawn_id)
-            campaign.tracker.mark_removed(site.spawn_id)
+        if spent:
+            share_the_sim(campaign, package, site, spent)
         held = [
             sid for sid, yes in (
                 (package.sead.spawn_id, sead_held),
@@ -826,13 +867,14 @@ class TestMixedAuthority(unittest.TestCase):
         hold(campaign, *held)
 
         paper_sead = not sead_held
-        missiles = paper_sead and not site_held and not contact
+        paper_rounds = FULL_LOAD - spent if paper_sead and not site_held else 0
+        shooters = min(2, -(-paper_rounds // 2))
         paper_strike = not strike_held
         # A strike die of 0.1 kills unless the site was suppressed.
-        strikers = 2 if (strike_held or missiles) else 0
+        strikers = 2 if (strike_held or shooters) else 0
         script = (
             ([SURVIVES, SURVIVES] if paper_sead and not standoff else [])
-            + ([HITS] * 4 if missiles else [])
+            + [HITS] * paper_rounds
             + ([KILLS_UNLESS_SUPPRESSED] * 2 if paper_strike else [])
             + [SURVIVES] * (2 * strikers)
         )
@@ -843,10 +885,12 @@ class TestMixedAuthority(unittest.TestCase):
         self.assertEqual(losses_of(campaign, package.sead.spawn_id), [])
         self.assertEqual(len(losses_of(campaign, package.strike.spawn_id)), 2 - strikers)
         site_losses = [x for x in campaign.tracker.losses if x.entity_id == SA6]
-        self.assertEqual(len(site_losses), 4 if missiles else 0)
+        self.assertEqual(len(site_losses), paper_rounds)
         self.assertTrue(all(x.cause == CAUSE_UNOBSERVED for x in site_losses))
-        self.assertEqual(site.units_alive, 1 if missiles else 5)
-        # Expenditure is the engine's own fact whoever held what.
+        self.assertEqual(site.units_alive, 5 - paper_rounds)
+        self.assertEqual(package.sead.sim_spent, spent)
+        # Every missile is booked once: what the sim spent when a snapshot
+        # showed it gone, the rest at the TOT, whoever held what then.
         sead = campaign.inventories["blue"].squadron(SEAD_SQN)
         self.assertEqual(sead.munitions_expended, {"AGM-88C": 4})
 
@@ -872,75 +916,124 @@ class TestMixedAuthority(unittest.TestCase):
 
     def test_every_combination(self):
         for standoff in (False, True):
-            for sead_held in (False, True):
-                for strike_held in (False, True):
-                    for site_held in (False, True):
-                        with self.subTest(standoff=standoff, sead_held=sead_held,
-                                          strike_held=strike_held, site_held=site_held):
-                            self._run(sead_held=sead_held, strike_held=strike_held,
-                                      site_held=site_held, contact=False, standoff=standoff)
+            for spent in (0, 1, FULL_LOAD):
+                for sead_held in (False, True):
+                    for strike_held in (False, True):
+                        for site_held in (False, True):
+                            with self.subTest(standoff=standoff, spent=spent,
+                                              sead_held=sead_held,
+                                              strike_held=strike_held,
+                                              site_held=site_held):
+                                self._run(sead_held=sead_held, strike_held=strike_held,
+                                          site_held=site_held, spent=spent,
+                                          standoff=standoff)
 
-    def test_a_site_the_sim_shared_with_the_sead_element_is_never_hit_again_on_paper(self):
+    def test_what_the_sim_spent_is_withheld_and_the_rest_is_fired(self):
+        """Replaces the old all-or-nothing contact rule: sharing the sim with
+        the site costs the paper exactly what the sim fired, no more."""
         for standoff in (False, True):
             for strike_held in (False, True):
-                with self.subTest(standoff=standoff, strike_held=strike_held):
-                    campaign = self._run(sead_held=False, strike_held=strike_held,
-                                         site_held=False, contact=True, standoff=standoff)
-                    self.assertEqual(blue_package(campaign).sead.sim_contact, [SA6])
+                for spent in range(FULL_LOAD + 1):
+                    with self.subTest(standoff=standoff, strike_held=strike_held,
+                                      spent=spent):
+                        campaign = self._run(sead_held=False, strike_held=strike_held,
+                                             site_held=False, spent=spent,
+                                             standoff=standoff)
+                        site = campaign.theater.threats[SA6]
+                        self.assertEqual(site.units_alive, 1 + spent)
 
-    def test_contact_is_only_with_the_enemys_sites_and_only_before_the_tot(self):
-        # The script below counts the SEAD element's exposure, so the SA-6 is
-        # one the HARM cannot out-range.
+    def test_what_the_sim_spent_is_booked_when_the_snapshot_shows_it(self):
         campaign = Campaign(theater=sa6_in_reach())
         to_the_brink(campaign)
         package = blue_package(campaign)
-        patriot = campaign.theater.threats[PATRIOT]
-        hold(campaign, package.sead.spawn_id, patriot.spawn_id)
-        self.assertEqual(package.sead.sim_contact, [], "blue's own Patriot is not a target")
-        campaign.tracker.mark_removed(package.sead.spawn_id)
-        campaign.tracker.mark_removed(patriot.spawn_id)
-        # All on paper at the TOT, and the SA-6 never shared the sim with it:
-        # its exposure, four missiles, the strike's exposure, four bombs.
-        _, dice = resolve_blue_tot(campaign, [SURVIVES] * (2 + 4 + 2 + 4))
-        self.assertEqual(dice.script, [])
-        hold(campaign, package.sead.spawn_id, campaign.theater.threats[SA6].spawn_id)
-        self.assertEqual(package.sead.sim_contact, [], "contact recorded after the TOT")
+        sead = campaign.inventories["blue"].squadron(SEAD_SQN)
+        share_the_sim(campaign, package, campaign.theater.threats[SA6], 3)
+        self.assertEqual(sead.munitions_expended, {"AGM-88C": 3})
+        self.assertEqual(sead.open_reservations[package.sead.reservation_id].rounds, 1)
+        conserved_everywhere(self, campaign)
+
+    def test_ammunition_after_the_tot_changes_nothing(self):
+        """The paper has nothing left to withhold once the TOT is resolved."""
+        campaign = Campaign(theater=sa6_in_reach())
+        to_the_brink(campaign)
+        package = blue_package(campaign)
+        resolve_blue_tot(campaign, [SURVIVES] * (2 + 4 + 2 + 4))
+        sead = campaign.inventories["blue"].squadron(SEAD_SQN)
+        before = (dict(sead.munitions_expended), dict(sead.munitions_lost))
+        hold(campaign, package.sead.spawn_id)
+        campaign.on_state(StateReport(seq=9, t=campaign.clock, groups=[
+            GroupSnapshot(spawn_id=package.sead.spawn_id, alive=True, units=2,
+                          units_initial=2, ammo={}, ammo_initial={"AGM-88C": 4}),
+        ]))
+        self.assertEqual(package.sead.sim_spent, 0)
+        self.assertEqual((dict(sead.munitions_expended), dict(sead.munitions_lost)), before)
 
 
-class TestContactThroughTheProtocol(unittest.TestCase):
-    """The contact rule, driven by the real frames that create it."""
+class TestSpentThroughTheProtocol(unittest.TestCase):
+    """The ammunition rule, driven by the real frames that carry it.
 
-    def _war(self, *, early_contact: bool):
-        # Every missile hits and no site can kill, so the only thing deciding
-        # what the SA-6 loses is whether the paper may fire at it at all.
+    The SEAD element shares the sim with the SA-6 early in its sortie --
+    the observer sits on the battery -- and then the observer leaves, so at
+    the TOT the element and the site are both on paper. Every missile hits
+    and no site can kill, so what the SA-6 loses says how many missiles the
+    paper fired.
+    """
+
+    def _war(self, *, early_contact: bool, loadouts=None, damages=()):
         campaign = Campaign(theater=slice_with(**{SA6: {"kill_probability": 0.0}}))
         site = campaign.theater.threats[SA6]
         start = [(site.pos[0], 100.0, site.pos[2])] if early_contact else OBSERVER_FAR_AWAY
         with mock.patch("campaign.campaign.ARM_PK", 1.0):
-            dcs = drive(campaign, observer_positions=start, damages=[],
-                        deliver_events=False, start=0, duration=1_200)
+            dcs = drive(campaign, observer_positions=start, damages=list(damages),
+                        deliver_events=False, start=0, duration=1_200,
+                        loadouts=loadouts)
             drive(campaign, observer_positions=OBSERVER_FAR_AWAY, damages=[],
                   deliver_events=False, start=1_205, duration=400, dcs=dcs)
         return campaign
 
-    def test_the_sim_had_its_chance_so_the_paper_does_not_take_another(self):
+    def test_an_unarmed_element_that_shared_the_sim_early_fires_its_whole_load(self):
+        """The case that retired the contact rule.
+
+        In DCS today the pylons are empty, so the element spent nothing in
+        the sim; the old rule took its whole sortie off the paper because it
+        had been held near the battery once. Now it fires all four.
+        """
         watched = self._war(early_contact=True)
         package = blue_package(watched)
-        self.assertEqual(package.sead.sim_contact, [SA6])
         self.assertTrue(package.weapons_released)
         self.assertFalse(watched.tracker.is_instantiated(package.sead.spawn_id))
-        self.assertEqual(watched.theater.threats[SA6].units_alive, 5)
+        self.assertEqual(watched.tracker.losses_for(package.sead.spawn_id), [])
+        self.assertEqual(watched.theater.threats[SA6].units_alive, 1)
+        self.assertEqual(package.sead.sim_spent, 0)
 
         unwatched = self._war(early_contact=False)
         package = blue_package(unwatched)
-        self.assertEqual(package.sead.sim_contact, [])
         self.assertTrue(package.weapons_released)
         self.assertEqual(unwatched.theater.threats[SA6].units_alive, 1)
+        self.assertEqual(package.sead.sim_spent, 0)
 
-    def test_contact_survives_a_save(self):
-        watched = self._war(early_contact=True)
-        reloaded = Campaign.from_dict(watched.to_dict())
-        self.assertEqual(blue_package(reloaded).sead.sim_contact, [SA6])
+    def test_what_it_fired_in_the_sim_it_does_not_fire_again(self):
+        loaded = {"F-16C_sead_harm": {"AGM-88C": 2}}
+        fired = Damage(t=1_200, category="plane", kind="sead", coalition="blue",
+                       fire=1, munition="AGM-88C")
+        campaign = self._war(early_contact=True, loadouts=loaded, damages=[fired])
+        package = blue_package(campaign)
+        self.assertTrue(package.weapons_released)
+        # One fired in DCS and missed; the three left were fired on paper.
+        self.assertEqual(campaign.theater.threats[SA6].units_alive, 2)
+        self.assertEqual(package.sead.sim_spent, 1)
+        sead = campaign.inventories["blue"].squadron(SEAD_SQN)
+        self.assertEqual(sead.munitions_expended.get("AGM-88C", 0), 4)
+        conserved_everywhere(self, campaign)
+
+    def test_what_the_sim_spent_survives_a_save(self):
+        loaded = {"F-16C_sead_harm": {"AGM-88C": 2}}
+        fired = Damage(t=1_200, category="plane", kind="sead", coalition="blue",
+                       fire=3, munition="AGM-88C")
+        campaign = self._war(early_contact=True, loadouts=loaded, damages=[fired])
+        reloaded = Campaign.from_dict(campaign.to_dict())
+        self.assertEqual(blue_package(reloaded).sead.sim_spent, 3)
+        self.assertEqual(reloaded.to_dict(), campaign.to_dict())
 
 
 class TestAFlightHomeAfterItsTotIsNotTaskedAgain(unittest.TestCase):

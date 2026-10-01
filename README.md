@@ -181,15 +181,23 @@ strike. `cmp_0008` and `cmp_0007` are red's SEAD element and Su-24M raid out
 of Bassel al-Assad against the storage area; the player's side is never told
 of them, and they pass through the bubble only where the two routes cross.
 Both SEAD elements meet an enemy SAM in the bubble and engage it; the
-harness's scripted SEAD kills nothing unless `--sead-kills` says so, and
-whatever it kills comes back by snapshot. By red's time on target the
-observer is chasing VIPER near Latakia, so nobody is watching Incirlik, and
-the engine flies the raid on paper. Red's Kh-58Us out-range the Patriot, so
-its SEAD element fires from standoff and is not shot at; but DCS held it
-alongside the Patriot at t=1049, which was the sim's chance to fire those
-missiles, so the paper fires none again and buys no suppression
-(docs/design.md, section 5). The Patriot meets both Su-24Ms at its full kill
-probability and kills both, and the storage area is untouched. `cmp_0004`
+harness's scripted SEAD pass fires every missile the element carries
+(`--loadout`, two an aircraft, `--sead-shots` to fire fewer) and kills
+nothing unless `--sead-kills` says so. Whatever it kills comes back by
+snapshot, and so do the missiles: each snapshot carries the ammunition
+aboard (docs/protocol.md, `state`). By red's time on target the observer is
+chasing VIPER near Latakia, so nobody is watching Incirlik, and the engine
+flies the raid on paper. Red's Kh-58Us out-range the Patriot, so its SEAD
+element fires from standoff and is not shot at; but in DCS it fired all four
+at the Patriot at t=1049, the snapshots said so, and the paper has none left
+to fire and buys no suppression (docs/design.md, section 5). The Patriot
+meets both Su-24Ms at its full kill probability and kills both, and the
+storage area is untouched. Run the harness with `--loadout 0` — DCS as it
+ships today, the client's pylons empty — and nothing is fired in the sim at
+all: VIPER reaches the depot with no bombs and destroys nothing, and red's
+SEAD element, having spent nothing in DCS, fires its whole load on paper at
+its TOT, takes two Patriot launchers and suppresses what is left, and both
+Su-24Ms get through to hit the storage area. `cmp_0004`
 is the SA-6 covering the approach to Latakia; the observer brings it into
 the bubble, so here DCS,
 not the engine, decides what it shoots down, and the harness's scripted loss
@@ -341,9 +349,10 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   survivors release. Observed, the SEAD element is tasked in DCS
   (`EngageTargets` against air defences, `AttackGroup` on the named sites)
   and the sim decides. The mixed-authority rule — SEAD acts on paper only
-  when it and the site are both outside DCS at the TOT and never shared the
-  sim before it — is in section 5 and tested in every combination, with
-  scripted dice that account for every draw.
+  when it and the site are both outside DCS at the TOT, and then fires only
+  the missiles the sim has not already spent, as the ammunition in the
+  `state` snapshots counts them — is in section 5 and tested in every
+  combination, with scripted dice that account for every draw.
 - A package with only a strike element is the one-flight package exactly:
   eleven wars recorded from the engine before elements existed replay frame
   for frame and die for die (`tests/test_single_element.py`), apart from one
@@ -428,7 +437,10 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   wire template names to unit types with **empty pylons** — loadout CLSIDs are
   DCS-version specific and a wrong guess is a silently unarmed strike. Fill
   them from mission-editor exports before flying this for real; until then
-  the SEAD jets carry no missiles in DCS and suppress nothing there. The Patriot
+  the SEAD jets carry no missiles in DCS and suppress nothing there, and fire
+  their whole load on paper if their TOT falls outside the bubble. The DCS
+  weapon type names the client reports ammunition under (`WEAPON_NAMES`) are
+  guesses too; `validate_templates.lua` records the real ones. The Patriot
   battery is a radar and four launchers only: a DCS Patriot is normally also
   given an ECS and power, and a template carries one lead unit type, so
   whether this one engages anything in the sim is unverified.
