@@ -95,7 +95,18 @@ DEFAULT_GROUND_UNITS = 4
 #: would refuse the slice's SA-6 and Patriot batteries that the client builds,
 #: and the engine would block them for the rest of the run. (The red Su-24M
 #: two-ship and the blue storage area's four objects are the defaults.)
-TEMPLATE_CAPACITY: dict[str, int] = {"SA-6_Kub_site": 5, "Patriot_site": 5}
+TEMPLATE_CAPACITY: dict[str, int] = {
+    "SA-6_Kub_site": 5,
+    "Patriot_site": 5,
+    # The Syria theater's (campaign/theater.py, build_syria_theater). Its
+    # four-object command post is the default and needs no entry.
+    "SA-11_Buk_site": 5,
+    "SA-15_Tor_site": 3,
+    "Roland_site": 3,
+    "airbase_infrastructure_large": 24,
+    "munitions_storage_large": 24,
+    "fuel_depot_large": 24,
+}
 #: Who the harness's scripted defender is, by the coalition of the flight it
 #: shoots at. Attribution only -- the engine may never act on it -- but a red
 #: jet "killed by red_sa6_bassel" would make a misleading ledger to read.

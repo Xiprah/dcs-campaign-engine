@@ -432,3 +432,86 @@ Multi-package deconfliction, escort and CAP, tankers and AWACS, the ground
 war and front line, logistics and resupply, base capture, pilot records, and
 real unit-template fidelity. Each has a `TODO(seam)` where it attaches. None
 of them changes the decisions above.
+
+## Theater: the Syria map
+
+The slice has one target a side, so a war is decided in two or three sorties,
+and its coordinates are invented, so once distance decides exposure the
+outcomes are invented too. `theater.build_syria_theater` and
+`oob.build_syria_oob` are a real map sized for a war with an arc. They are
+what `python -m campaign` starts by default (`--theater syria`); the slice
+stays as `--theater slice`, and `Campaign()` still builds the slice, because
+every other test is written against it.
+
+**Where things are.** Airbases are the DCS Syria map's own, in DCS map
+coordinates, copied as numbers from pydcs's generated terrain data
+(`dcs/terrain/syria/airports.py`, LGPL-3.0). pydcs's `Point(x, y)` is
+northing and easting, which are the engine's Vec3 x and z, so it is placed at
+`(x, 0, y)`. The axes were checked by inverting the map's projection, and
+tests pin both the raw numbers and the directions (Incirlik is north-west of
+Bassel al-Assad), because distances alone cannot tell a swapped axis.
+Everything else is a game-design placement, not a real facility: each target
+and site is at a stated offset of at most about 7 km from a DCS airbase on the map
+and is named for it so a player can find it.
+
+**Bases follow from the planner.** A side now plans each target from its
+base nearest that target, falling back to the next nearest if that base
+cannot cover the strike (`Theater.airbases_nearest`). Bases used to be tried
+in id order, which flew everything from whichever sorted first until it ran
+dry, whatever the geography. A base therefore earns its place by being
+nearest some enemy target. Blue flies from Hatay (nearest five of red's seven
+targets) and Gaziantep (the eastern two). Incirlik is nearer none, so it is
+not a blue base here: it is blue's rear area instead, where its deepest
+targets are. Red flies from Bassel al-Assad (nearest Incirlik and Adana),
+Kuweires (nearest Gaziantep, Kahramanmaras and Sanliurfa) and a detachment
+at Abu al-Duhur (nearest the Hatay target).
+
+**The arc.** Each side has seven targets that the planner takes in priority
+order, and priority falls with depth. That ordering is a campaign plan that
+works inward from the border, not a judgement of what the targets are worth.
+The two nearest the border are small (4 units) and undefended. The next two
+(12 units) have one envelope over the route to them. The last three
+(24 units, about 150-210 km from the nearest enemy base) have two, except
+red's deepest, Shayrat, which has three: its route passes 4.5 km from the
+Hama target, so whatever defends Hama covers it too. Both sides get the same
+targets by size, and the same totals of airframes and ordnance spread over
+their fields by geography. Every new site
+type keeps the SA-6's placeholder kill probability, for the reason the
+Patriot does (section 3), so the types differ only in reach: SA-11 35 km,
+SA-15 and Roland 10 km (one shared point-defence radius), Patriot 40 km as
+before.
+
+**What a war looks like, before SEAD standoff.** Measured offline over 50
+seeds, with nobody connected. These are not asserted anywhere, and the
+coming SEAD standoff change will move them:
+
+| | blue | red |
+|---|---|---|
+| strike packages per war (median, range) | 66 (55-78) | 61 (50-72) |
+| of which SEAD-escorted (mean) | about 25 | about 25 |
+| enemy targets destroyed (median) | 7 | 6 |
+| airframes lost (median, range) | 27 (10-45) | 14 (5-40) |
+| bombs left of 360 (median, min) | 96, 48 | 116, 72 |
+| airframes lost per package: shallow / middle / deep | 0.00 / 0.22 / 0.51 | 0.00 / 0.24 / 0.34 |
+| sortie length: shallow / middle / deep | 30 / 33 / 44 min | 31 / 43 / 45 min |
+
+Every war ended in a victory: blue 27, red 23, no draws. The median war
+lasted 44 hours (36-52). No side ever ran out of anything it needed, though
+in the longest wars a single field did and its targets passed to the next
+nearest. The arc is there: the first targets fall in the first hours for
+nothing, and the deep ones cost one airframe in two or three packages and
+take longer to reach.
+
+Two things this content cannot fix. First, *a war lasts about two days, not
+several*, because the engine's tempo is one package per side in the air at
+all times, around the clock: about 35 packages a side a day. The war's
+length is then set by the target units, and two days already needs 24-object
+statics. Several days needs a sortie-rate model (turnaround, crew rest,
+night), which is engine work. Second, *on paper, defences erode*. A SEAD
+two-ship's four missiles take about one unit off the sites on its route per
+sortie (ARM Pk 0.25), and a site keeps firing at full Pk until its last unit
+goes.
+So by its last targets a side has often destroyed most of the other's sites:
+blue kills a median of 5 of red's 7 and red 4 of blue's 5. Red's
+losses per package fall in the second half of its war. Both effects are
+SEAD-model questions, not theater ones.

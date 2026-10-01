@@ -269,6 +269,19 @@ class Theater:
     def airbases_of(self, coalition: Coalition) -> list[Airbase]:
         return [b for b in self.airbases.values() if b.coalition == coalition]
 
+    def airbases_nearest(self, coalition: Coalition, pos: Vec3) -> list[Airbase]:
+        """`coalition`'s airbases, nearest `pos` first, ties broken on id.
+
+        The order a side tries its bases in when it plans against a target.
+        Nearest first because the shortest leg is the shortest sortie and the
+        least time in the enemy's envelopes; a dry base is passed over for the
+        next nearest. The tie-break keeps the order a pure function of the map.
+        """
+        return sorted(
+            self.airbases_of(coalition),
+            key=lambda b: (ground_distance(b.pos, pos), b.id),
+        )
+
     def targets_of(self, coalition: Coalition) -> list[Target]:
         return [t for t in self.targets.values() if t.coalition == coalition]
 
@@ -443,4 +456,247 @@ def build_slice_theater() -> Theater:
         airbases={incirlik.id: incirlik, bassel.id: bassel},
         targets={depot.id: depot, storage.id: storage},
         threats={sa6.id: sa6, patriot.id: patriot},
+    )
+
+
+# --------------------------------------------------------------------------
+# The Syria theater
+# --------------------------------------------------------------------------
+#
+# A real map, sized so a war has an arc: several airbases a side, seven
+# strategic targets a side at increasing depth, and air defences layered so
+# that the deeper a target lies, the more envelopes a strike on it crosses.
+#
+# **Airbases** are the DCS Syria map's own, in DCS map coordinates, copied as
+# facts from the pydcs library's generated terrain data
+# (dcs/terrain/syria/airports.py, LGPL-3.0; numbers only, none of its code),
+# each from its class's `mapping.Point(x, y)`. pydcs's x is northing and its
+# y easting, which are this engine's Vec3 x and z (y is altitude here), so a
+# pydcs Point(x, y) is placed at (x, 0.0, y). Checked by inverting the map's
+# transverse Mercator projection: Incirlik comes out at 37.00 N 35.43 E with
+# that mapping, and at 34.7 N 38.3 E -- the Syrian desert -- with the axes
+# swapped.
+#
+# **Everything else is a game-design placement, not a real facility.** Each
+# target and air-defence site is put at a stated offset from a DCS airbase on
+# the map and named for that airbase only so a player can find it; none is a
+# surveyed or researched installation. Priorities are game-design numbers
+# too. They encode a campaign plan that works inward from the border, so each
+# side's first sorties are short and lightly opposed and its last ones long
+# and through layered defences. That ordering, not a judgement of what the
+# targets are worth, is what gives the war its arc.
+
+
+def _dcs_point(x: float, y: float) -> Vec3:
+    """A pydcs map Point(x, y) as an engine Vec3: x north, y east, on the ground."""
+    return (x, 0.0, y)
+
+
+def _offset(anchor: Vec3, north: float, east: float) -> Vec3:
+    """A game-design placement `north` and `east` metres from a map position."""
+    return (anchor[0] + north, 0.0, anchor[2] + east)
+
+
+# DCS airbase positions, each from the pydcs Syria class named beside it. The
+# class's `id` is the DCS airdrome id, noted for when Airbase carries one (see
+# the TODO(seam) on ramp starts in campaign.py) and unused until then.
+SYRIA_INCIRLIK = _dcs_point(221207.773438, -35240.347656)  # Incirlik, id 16
+SYRIA_HATAY = _dcs_point(147687.484375, 39418.742188)  # Hatay, id 15
+SYRIA_GAZIANTEP = _dcs_point(210333.625365, 147313.672429)  # Gaziantep, id 11
+SYRIA_ADANA = _dcs_point(219474.219224, -48324.287805)  # Adana_Sakirpasa, id 2
+SYRIA_KAHRAMANMARAS = _dcs_point(276714.765625, 101896.460938)  # Kahramanmaras, id 75
+SYRIA_SANLIURFA = _dcs_point(264719.125, 273812.4375)  # Sanliurfa, id 58
+SYRIA_BASSEL = _dcs_point(42236.566406, 5836.231689)  # Bassel_Al_Assad, id 21
+SYRIA_ABU_AL_DUHUR = _dcs_point(76048.957031, 111344.925781)  # Abu_al_Duhur, id 1
+SYRIA_KUWEIRES = _dcs_point(125810.890625, 155253.8125)  # Kuweires, id 31
+SYRIA_ALEPPO = _dcs_point(125576.863281, 123125.304688)  # Aleppo, id 27
+SYRIA_HAMA = _dcs_point(8662.594238, 74333.1875)  # Hama, id 14
+SYRIA_SHAYRAT = _dcs_point(-61368.212891, 90675.136719)  # Shayrat, id 36
+SYRIA_TABQA = _dcs_point(76964.6875, 243605.210938)  # Tabqa, id 37
+
+#: Placeholder envelope for an SA-11 battery, red's area air defence on the
+#: Syria map, as one ground radius: a round number between the SA-6's and the
+#: Patriot's, as the system's reach is. Uncalibrated like both. See ThreatSite.
+SA11_ENGAGEMENT_RADIUS = 35_000.0
+
+#: Placeholder envelope shared by both sides' point defences on the Syria map,
+#: red's SA-15 and blue's Roland. One number for both, as the kill
+#: probabilities below are one number for every type: a better guess for one
+#: side than the other would decide the war by content nobody has measured.
+POINT_DEFENCE_ENGAGEMENT_RADIUS = 10_000.0
+SA15_ENGAGEMENT_RADIUS = POINT_DEFENCE_ENGAGEMENT_RADIUS
+ROLAND_ENGAGEMENT_RADIUS = POINT_DEFENCE_ENGAGEMENT_RADIUS
+
+#: The SA-6's placeholder, for the reason PATRIOT_KILL_PROBABILITY is. What
+#: tells the types apart is reach, not lethality, until TODO(threat-model).
+SA11_KILL_PROBABILITY = SA6_KILL_PROBABILITY
+SA15_KILL_PROBABILITY = SA6_KILL_PROBABILITY
+ROLAND_KILL_PROBABILITY = SA6_KILL_PROBABILITY
+
+
+#: Red's strategic targets, which blue strikes, then blue's, which red
+#: strikes: (id, name, owner, position, priority, client template, units).
+#: Every position is a game-design placement -- an offset in metres (north,
+#: east) from the DCS airbase the target is named for -- not a real facility.
+#: Each side's run shallowest and highest priority first: two small,
+#: undefended targets near the border; two middle ones of 12 units under one
+#: envelope; three deep ones of 24 units under two or more (SYRIA_SITES).
+#: Size, like depth, is what makes the end of a war slower and dearer than
+#: its start.
+SYRIA_TARGETS: tuple[tuple[str, str, Coalition, Vec3, int, str, int], ...] = (
+    ("kuweires_fuel_storage", "Kuweires Fuel Storage", "red",
+     _offset(SYRIA_KUWEIRES, -2_500.0, 3_000.0), 100, "fuel_depot_medium", 4),
+    ("aleppo_command_post", "Aleppo Command Post", "red",
+     _offset(SYRIA_ALEPPO, -3_000.0, -2_500.0), 95, "command_post_medium", 4),
+    ("abu_al_duhur_airbase_infrastructure", "Abu al-Duhur Airbase Infrastructure",
+     "red", _offset(SYRIA_ABU_AL_DUHUR, 1_500.0, -2_000.0), 80,
+     "airbase_infrastructure_large", 12),
+    ("bassel_al_assad_munitions_storage", "Bassel al-Assad Munitions Storage",
+     "red", _offset(SYRIA_BASSEL, -4_000.0, 3_500.0), 75,
+     "munitions_storage_large", 12),
+    ("hama_fuel_storage", "Hama Fuel Storage", "red",
+     _offset(SYRIA_HAMA, -3_500.0, 3_000.0), 60, "fuel_depot_large", 24),
+    ("tabqa_airbase_infrastructure", "Tabqa Airbase Infrastructure", "red",
+     _offset(SYRIA_TABQA, 2_000.0, -1_500.0), 50, "airbase_infrastructure_large", 24),
+    ("shayrat_munitions_storage", "Shayrat Munitions Storage", "red",
+     _offset(SYRIA_SHAYRAT, 2_500.0, -3_000.0), 35, "munitions_storage_large", 24),
+    ("gaziantep_fuel_storage", "Gaziantep Fuel Storage", "blue",
+     _offset(SYRIA_GAZIANTEP, 3_000.0, -2_500.0), 100, "fuel_depot_medium", 4),
+    ("hatay_command_post", "Hatay Command Post", "blue",
+     _offset(SYRIA_HATAY, 2_500.0, 3_000.0), 90, "command_post_medium", 4),
+    ("kahramanmaras_airbase_infrastructure", "Kahramanmaras Airbase Infrastructure",
+     "blue", _offset(SYRIA_KAHRAMANMARAS, -1_500.0, 2_000.0), 80,
+     "airbase_infrastructure_large", 12),
+    ("sanliurfa_fuel_storage", "Sanliurfa Fuel Storage", "blue",
+     _offset(SYRIA_SANLIURFA, 3_000.0, -3_000.0), 70, "fuel_depot_large", 12),
+    ("incirlik_munitions_storage", "Incirlik Munitions Storage", "blue",
+     _offset(SYRIA_INCIRLIK, -4_000.0, 4_500.0), 60, "munitions_storage_large", 24),
+    ("adana_fuel_storage", "Adana Fuel Storage", "blue",
+     _offset(SYRIA_ADANA, 3_000.0, -3_000.0), 45, "fuel_depot_large", 24),
+    ("incirlik_airbase_infrastructure", "Incirlik Airbase Infrastructure", "blue",
+     _offset(SYRIA_INCIRLIK, 1_500.0, -2_500.0), 35, "airbase_infrastructure_large", 24),
+)
+
+#: Air-defence sites: (id, name, owner, position, client template, units,
+#: engagement radius, kill probability). Game-design placements like the
+#: targets. The layers mirror each other in what a strike meets, not in
+#: site count, because the two sides' deep targets lie differently: one
+#: envelope over each middle target, two over each deep one, counting the
+#: envelopes the strike route from the nearest enemy base enters. Red's
+#: deepest, Shayrat, has three: the Hama target lies 4.5 km off the route to
+#: it, so nothing that defends Hama can stay off that route.
+SYRIA_SITES: tuple[tuple[str, str, Coalition, Vec3, str, int, float, float], ...] = (
+    # Red's deep targets are spread 70-210 km apart, so they take two area
+    # sites: Hama's sits on the Hama target and across the route to Shayrat,
+    # Tabqa's on the Tabqa target. A point-defence site on each deep target
+    # makes the second envelope.
+    ("hama_sa11", "Hama SA-11", "red", _offset(SYRIA_HAMA, -6_000.0, 2_000.0),
+     "SA-11_Buk_site", 5, SA11_ENGAGEMENT_RADIUS, SA11_KILL_PROBABILITY),
+    ("tabqa_sa11", "Tabqa SA-11", "red", _offset(SYRIA_TABQA, 6_000.0, -4_000.0),
+     "SA-11_Buk_site", 5, SA11_ENGAGEMENT_RADIUS, SA11_KILL_PROBABILITY),
+    ("abu_al_duhur_sa15", "Abu al-Duhur SA-15", "red",
+     _offset(SYRIA_ABU_AL_DUHUR, 3_000.0, 1_000.0),
+     "SA-15_Tor_site", 3, SA15_ENGAGEMENT_RADIUS, SA15_KILL_PROBABILITY),
+    ("bassel_al_assad_sa15", "Bassel al-Assad SA-15", "red",
+     _offset(SYRIA_BASSEL, -1_000.0, 5_000.0),
+     "SA-15_Tor_site", 3, SA15_ENGAGEMENT_RADIUS, SA15_KILL_PROBABILITY),
+    ("hama_sa15", "Hama SA-15", "red", _offset(SYRIA_HAMA, -2_000.0, 1_500.0),
+     "SA-15_Tor_site", 3, SA15_ENGAGEMENT_RADIUS, SA15_KILL_PROBABILITY),
+    ("tabqa_sa15", "Tabqa SA-15", "red", _offset(SYRIA_TABQA, 1_000.0, -1_000.0),
+     "SA-15_Tor_site", 3, SA15_ENGAGEMENT_RADIUS, SA15_KILL_PROBABILITY),
+    ("shayrat_sa15", "Shayrat SA-15", "red", _offset(SYRIA_SHAYRAT, 1_000.0, -1_000.0),
+     "SA-15_Tor_site", 3, SA15_ENGAGEMENT_RADIUS, SA15_KILL_PROBABILITY),
+    # Blue's three deep targets are within 13 km of each other around
+    # Incirlik and Adana, so one Patriot covers them all. The second is the
+    # one envelope over the Kahramanmaras target, a middle one, as an SA-15
+    # is over each of red's.
+    ("incirlik_patriot", "Incirlik Patriot", "blue",
+     _offset(SYRIA_INCIRLIK, -5_000.0, -5_000.0),
+     "Patriot_site", 5, PATRIOT_ENGAGEMENT_RADIUS, PATRIOT_KILL_PROBABILITY),
+    ("kahramanmaras_patriot", "Kahramanmaras Patriot", "blue",
+     _offset(SYRIA_KAHRAMANMARAS, 5_000.0, 0.0),
+     "Patriot_site", 5, PATRIOT_ENGAGEMENT_RADIUS, PATRIOT_KILL_PROBABILITY),
+    ("sanliurfa_roland", "Sanliurfa Roland", "blue",
+     _offset(SYRIA_SANLIURFA, 1_500.0, -1_000.0),
+     "Roland_site", 3, ROLAND_ENGAGEMENT_RADIUS, ROLAND_KILL_PROBABILITY),
+    ("incirlik_roland", "Incirlik Roland", "blue",
+     _offset(SYRIA_INCIRLIK, -1_000.0, 1_000.0),
+     "Roland_site", 3, ROLAND_ENGAGEMENT_RADIUS, ROLAND_KILL_PROBABILITY),
+    ("adana_roland", "Adana Roland", "blue", _offset(SYRIA_ADANA, 1_000.0, -1_000.0),
+     "Roland_site", 3, ROLAND_ENGAGEMENT_RADIUS, ROLAND_KILL_PROBABILITY),
+)
+
+
+def build_syria_theater() -> Theater:
+    """The DCS Syria map: seven strategic targets a side, layered defences.
+
+    Blue flies from the Turkish side of the map, red from the Syrian side. A
+    side plans each target from its airbase nearest that target
+    (`Theater.airbases_nearest`), so the bases are chosen for which targets
+    they are nearest, and a base nearest none would never fly:
+
+    * Blue: **Hatay**, the nearest Turkish field to five of red's seven
+      targets, so blue's main strike base; **Gaziantep**, the nearest to the
+      eastern two, around Kuweires and Tabqa. Incirlik is not a blue base
+      here, because one of those two is nearer every red target: it is
+      blue's rear area instead, where its deepest targets are.
+    * Red: **Bassel al-Assad**, on the coast and the nearest red field to
+      Incirlik and Adana; **Kuweires**, east of Aleppo and the nearest to
+      Gaziantep, Kahramanmaras and Sanliurfa; **Abu al-Duhur**, central and
+      the nearest to the Hatay target, so a small detachment.
+
+    A dry base hands its targets to the side's next nearest.
+    """
+    airbases = [
+        Airbase(id="hatay", name="Hatay", coalition="blue", pos=SYRIA_HATAY),
+        Airbase(id="gaziantep", name="Gaziantep", coalition="blue", pos=SYRIA_GAZIANTEP),
+        Airbase(
+            id="bassel_al_assad",
+            name="Bassel al-Assad",
+            coalition="red",
+            pos=SYRIA_BASSEL,
+        ),
+        Airbase(id="kuweires", name="Kuweires", coalition="red", pos=SYRIA_KUWEIRES),
+        Airbase(
+            id="abu_al_duhur",
+            name="Abu al-Duhur",
+            coalition="red",
+            pos=SYRIA_ABU_AL_DUHUR,
+        ),
+    ]
+    targets = [
+        Target(
+            id=target_id,
+            name=name,
+            coalition=owner,
+            pos=pos,
+            priority=priority,
+            template=template,
+            category="structure",
+            units_initial=units,
+            units_alive=units,
+        )
+        for target_id, name, owner, pos, priority, template, units in SYRIA_TARGETS
+    ]
+    threats = [
+        ThreatSite(
+            id=site_id,
+            name=name,
+            coalition=owner,
+            pos=pos,
+            template=template,
+            category="ground",
+            units_initial=units,
+            units_alive=units,
+            engagement_radius=radius,
+            kill_probability=kill_probability,
+        )
+        for site_id, name, owner, pos, template, units, radius, kill_probability
+        in SYRIA_SITES
+    ]
+    return Theater(
+        name="Syria",
+        airbases={b.id: b for b in airbases},
+        targets={t.id: t for t in targets},
+        threats={s.id: s for s in threats},
     )
