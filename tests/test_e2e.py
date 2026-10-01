@@ -244,7 +244,7 @@ class TestTheLoopCloses(unittest.TestCase):
             path = Path(self.enterContext(_tempdir())) / "campaign.json"
             self.campaign.save(path)
             raw = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(raw["save_version"], 6)
+            self.assertEqual(raw["save_version"], 7)
         reloaded = Campaign.load(path)
         self.assertEqual(reloaded.to_dict(), self.campaign.to_dict())
         # And it is an engine rather than a deserialised blob. `tick` cannot
@@ -835,7 +835,7 @@ class TestAnOlderClientIsRefused(unittest.TestCase):
         self.assertTrue(closed, "the engine left a v1 client connected")
         self.assertFalse(campaign.connected)
         self.assertTrue(
-            any("client protocol 1 != engine 3" in line for line in output),
+            any("client protocol 1 != engine 4" in line for line in output),
             output,
         )
 
@@ -847,7 +847,20 @@ class TestAnOlderClientIsRefused(unittest.TestCase):
         self.assertTrue(closed, "the engine left a v2 client connected")
         self.assertFalse(campaign.connected)
         self.assertTrue(
-            any("client protocol 2 != engine 3" in line for line in output),
+            any("client protocol 2 != engine 4" in line for line in output),
+            output,
+        )
+
+    def test_a_version_3_client_is_refused_the_same_way(self):
+        """A v3 client reports a site's surviving units as a bare count, and
+        the engine could not tell a radar the sim destroyed from a launcher;
+        it builds a battery without a radar back with one."""
+        campaign, received, closed, output = self._refused(3)
+        self.assertEqual(received, b"", "the engine answered a v3 client")
+        self.assertTrue(closed, "the engine left a v3 client connected")
+        self.assertFalse(campaign.connected)
+        self.assertTrue(
+            any("client protocol 3 != engine 4" in line for line in output),
             output,
         )
 

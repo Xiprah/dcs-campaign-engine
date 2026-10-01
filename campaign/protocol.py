@@ -13,7 +13,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 #: Hard cap on a single frame. Longer frames indicate a bug, not a big payload.
 MAX_FRAME_BYTES = 64 * 1024
@@ -80,6 +80,11 @@ class GroupSnapshot:
     #: The same count as the client read it when it built the group, before
     #: anything could have been fired. The engine's baseline.
     ammo_initial: dict[str, int] | None = None
+    #: Living units per DCS unit type; for ground groups only. None when the
+    #: client could not read every living unit's type -- never guessed. How
+    #: the engine tells a dead radar from a dead launcher. See
+    #: docs/protocol.md.
+    unit_types: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -304,7 +309,46 @@ def _check_state(report: StateReport) -> StateReport:
             )
         for name in ("ammo", "ammo_initial"):
             _check_ammo(group.spawn_id, name, getattr(group, name))
+        _check_unit_types(group)
     return report
+
+
+def _check_unit_types(group: GroupSnapshot) -> None:
+    """Unit types are a map of DCS type name to whole counts summing to `units`.
+
+    Refused rather than repaired, like the rest of a snapshot: the engine
+    reads which of a site's units DCS destroyed from it, and a guessed map
+    either kills a radar the sim did not kill or keeps one it did. A map
+    that does not add up to the group's own count is the client
+    contradicting itself, and neither half can be believed.
+    """
+    types = group.unit_types
+    if types is None:
+        return
+    _check_counts(group.spawn_id, "unit_types", types, "unit type")
+    if isinstance(group.units, int) and sum(types.values()) != group.units:
+        raise ProtocolError(
+            f"malformed GroupSnapshot {group.spawn_id}: unit_types sum to "
+            f"{sum(types.values())}, not units {group.units}"
+        )
+
+
+def _check_counts(spawn_id: str, name: str, counts: Any, what: str) -> None:
+    if not isinstance(counts, dict):
+        raise ProtocolError(
+            f"malformed GroupSnapshot {spawn_id}: {name} is {type(counts).__name__}, "
+            f"not an object"
+        )
+    for key, count in counts.items():
+        if not isinstance(key, str) or not key:
+            raise ProtocolError(
+                f"malformed GroupSnapshot {spawn_id}: {name} has {what} name {key!r}"
+            )
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ProtocolError(
+                f"malformed GroupSnapshot {spawn_id}: {name}[{key!r}] is {count!r}, "
+                f"not a whole non-negative count"
+            )
 
 
 def _check_ammo(spawn_id: str, name: str, ammo: Any) -> None:
@@ -319,21 +363,7 @@ def _check_ammo(spawn_id: str, name: str, ammo: Any) -> None:
     """
     if ammo is None:
         return
-    if not isinstance(ammo, dict):
-        raise ProtocolError(
-            f"malformed GroupSnapshot {spawn_id}: {name} is {type(ammo).__name__}, "
-            f"not an object"
-        )
-    for weapon, count in ammo.items():
-        if not isinstance(weapon, str) or not weapon:
-            raise ProtocolError(
-                f"malformed GroupSnapshot {spawn_id}: {name} has weapon name {weapon!r}"
-            )
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise ProtocolError(
-                f"malformed GroupSnapshot {spawn_id}: {name}[{weapon!r}] is {count!r}, "
-                f"not a whole non-negative count"
-            )
+    _check_counts(spawn_id, name, ammo, "weapon")
 
 
 def decode_uplink(raw: bytes | str) -> Uplink:

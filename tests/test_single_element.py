@@ -23,8 +23,8 @@ leaking into the old case.
 Two differences are deliberate, and are applied to the recording rather
 than hidden from the comparison: a flight spawned after its TOT is now sent
 home with no attack task (`with_the_egress_fix` says why), and the `sync`
-frame names wire protocol 3 (`with_protocol_v3`). Nothing else moved: not one
-die, spawn id, loss, message or other frame field.
+frame names the current wire protocol (`with_the_current_protocol`). Nothing
+else moved: not one die, spawn id, loss, message or other frame field.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from pathlib import Path
 from campaign.api import PAPER_STEP
 from campaign.campaign import Campaign
 from campaign.oob import ANTI_RADIATION_MUNITIONS, SideInventory, build_slice_oob
+from campaign.protocol import PROTOCOL_VERSION
 from tests.test_domain import OBSERVER_AT_TARGET, SCENARIO, drive
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "pre_sead_wars.json"
@@ -200,20 +201,24 @@ def with_the_egress_fix(recorded: dict) -> tuple[dict, int]:
     return adjusted, touched
 
 
-def with_protocol_v3(recorded: dict) -> tuple[dict, int]:
+def with_the_current_protocol(recorded: dict) -> tuple[dict, int]:
     """The recording, with the wire version it was made under brought up to date.
 
-    Protocol v3 (docs/protocol.md, "Changes from v2") adds ammunition to the
-    uplink snapshot; the engine's `sync` says which version it speaks, so
-    that one integer in that one frame is the only thing the bump can change
-    in a downlink recording. Returns the adjusted recording and how many
-    frames it touched.
+    The recording was made under protocol 2. Protocol v3 (docs/protocol.md,
+    "Changes from v2") adds ammunition to the uplink snapshot, and v4
+    ("Changes from v3") the surviving units of a ground group by type. v4
+    also lets an air-defence spawn carry a `composition`, but only for a
+    battery the client's radar-first build would get wrong -- one that has
+    lost its radar -- and in these strike-only wars no site loses anything.
+    So the engine's `sync`, which says which version it speaks, is the only
+    thing either bump can change in a downlink recording: one integer in one
+    frame. Returns the adjusted recording and how many frames it touched.
     """
     adjusted = json.loads(json.dumps(recorded))
     touched = 0
     for frame in adjusted["frames"]:
         if frame["type"] == "sync" and frame["protocol"] == 2:
-            frame["protocol"] = 3
+            frame["protocol"] = PROTOCOL_VERSION
             touched += 1
     return adjusted, touched
 
@@ -260,7 +265,7 @@ class TestAStrikeOnlyPackageIsTheOneFlightPackage(unittest.TestCase):
         the protocol version the sync frame names."""
         for seed, recorded in sorted(self.recorded["watched"].items()):
             with self.subTest(seed=seed):
-                current, synced = with_protocol_v3(recorded)
+                current, synced = with_the_current_protocol(recorded)
                 self.assertEqual(synced, 1, "one sync per watched war")
                 expected, touched = with_the_egress_fix(current)
                 self.assertGreater(touched, 0, "no post-TOT spawn; the fix is untested")
@@ -286,7 +291,7 @@ class TestAStrikeOnlyPackageIsTheOneFlightPackage(unittest.TestCase):
     def test_the_version_bump_changes_nothing_but_the_sync_protocol(self):
         """Nor can the other adjustment: one integer, in the one sync frame."""
         for seed, recorded in sorted(self.recorded["watched"].items()):
-            expected, _ = with_protocol_v3(recorded)
+            expected, _ = with_the_current_protocol(recorded)
             self.assertEqual(expected["state"], recorded["state"])
             self.assertEqual(len(expected["frames"]), len(recorded["frames"]))
             changed = [
@@ -297,7 +302,7 @@ class TestAStrikeOnlyPackageIsTheOneFlightPackage(unittest.TestCase):
             self.assertEqual(len(changed), 1, seed)
             new, old = changed[0]
             self.assertEqual(old["type"], "sync")
-            self.assertEqual((old["protocol"], new["protocol"]), (2, 3))
+            self.assertEqual((old["protocol"], new["protocol"]), (2, 4))
             self.assertEqual(
                 {k: v for k, v in new.items() if k != "protocol"},
                 {k: v for k, v in old.items() if k != "protocol"},

@@ -1,4 +1,4 @@
-# Campaign wire protocol v3
+# Campaign wire protocol v4
 
 The contract between the **engine** (out-of-process campaign brain) and the
 **mission client** (thin Lua layer running inside DCS).
@@ -63,7 +63,7 @@ First frame on every connection. The engine replies `sync`, or closes the
 connection without writing anything on a protocol mismatch.
 
 ```json
-{"type":"hello","seq":1,"t":0.0,"protocol":3,"theater":"Syria","dcs_version":"2.9.29","mission_start_epoch":1758499200}
+{"type":"hello","seq":1,"t":0.0,"protocol":4,"theater":"Syria","dcs_version":"2.9.29","mission_start_epoch":1758499200}
 ```
 
 ### `observer`
@@ -106,7 +106,9 @@ immediately before a `despawn` is acknowledged.
 {"type":"state","seq":41,"t":830.0,"groups":[
  {"spawn_id":"a91f","alive":true,"units":2,"units_initial":4,"pos":[41000.0,3000.0,-88000.0],
   "ammo":{"AGM-88C":3},"ammo_initial":{"AGM-88C":4}},
- {"spawn_id":"7c02","alive":true,"units":4,"units_initial":4,"pos":[-3000.0,0.0,41000.0]}]}
+ {"spawn_id":"7c02","alive":true,"units":4,"units_initial":4,"pos":[-3000.0,0.0,41000.0]},
+ {"spawn_id":"0004","alive":true,"units":4,"units_initial":5,"pos":[16000.0,0.0,25000.0],
+  "unit_types":{"Kub 2P25 ln":4}}]}
 ```
 
 A `state` frame is a complete census: a group the engine instantiated that is
@@ -121,6 +123,7 @@ missing from it is read as gone.
 | `pos`           | vec3 or null   | optional; the first living unit's position |
 | `ammo`          | object or null | optional. Aircraft only: rounds aboard, per weapon, summed over the group's living units. See below. |
 | `ammo_initial`  | object or null | optional. Aircraft only: the same count, read when the client built the group. |
+| `unit_types`    | object or null | optional. Ground groups only: living units per DCS unit type. See below. |
 
 **Ammunition.** For an aircraft group, `ammo` maps a weapon name to the
 number of rounds of it aboard the group's living units, summed over them, as
@@ -157,11 +160,33 @@ partial sum would read as missiles fired that were not, or the reverse. The
 engine reads a missing count on a SEAD element as an unvouched one — as if
 everything had been fired — never as zero.
 
+**Unit types.** For a ground group, `unit_types` maps a DCS unit type name
+(`Unit.getTypeName()`, e.g. `"Kub 1S91 str"`) to the number of the group's
+living units of that type, so it sums to `units`. A dead or vanished group
+sends `{}`. Aircraft, ships and statics send none.
+
+Why: an air-defence site's units are not interchangeable. Its radar is what
+an anti-radiation missile homes on and what the battery cannot engage
+without (docs/design.md, section 6), so the engine needs to know whether the
+sim destroyed the radar or a launcher, and a bare count cannot say. The
+engine may not guess it from its own paper track either: for a site DCS
+holds the snapshot is the only authority (docs/design.md, section 1).
+
+Like the ammunition, it is all or nothing: if any living unit's
+`getTypeName` raises or answers something that is not a non-empty string,
+the client leaves `unit_types` out for that snapshot. The engine reads a
+ground group's snapshot without it as no census of that group's units: it
+books no loss from it and keeps its belief until a snapshot that can say
+arrives. A guess would kill a radar the sim did not kill, or keep one it
+did. (A group reported `alive: false` needs no types: every unit is gone.)
+
 **A malformed snapshot is a protocol error and closes the connection** — a
 `groups` that is not an array, a member that is not an object or lacks a
-field, a `spawn_id` that is not a string, or an `ammo` or `ammo_initial` that
+field, a `spawn_id` that is not a string, an `ammo` or `ammo_initial` that
 is neither null nor an object of non-empty weapon names to whole,
-non-negative counts (`3.0` is not a count; `3` is). None of the event
+non-negative counts (`3.0` is not a count; `3` is), or a `unit_types` that is
+neither null nor an object of non-empty type names to whole, non-negative
+counts summing to `units`. None of the event
 leniency applies here. A snapshot is ground truth, and a group reported
 under an id that matches nothing reads as absent from the census, which is a
 loss: a guessed snapshot writes off a flight that is still flying. A guessed
@@ -183,7 +208,7 @@ Always the first frame on a connection, in response to `hello`. Tells the
 client the campaign clock and hands it its operating parameters.
 
 ```json
-{"type":"sync","seq":1,"t":0.0,"protocol":3,"campaign_time":417600,"state_period":30,"observer_period":5,"bubble_radius":75000}
+{"type":"sync","seq":1,"t":0.0,"protocol":4,"campaign_time":417600,"state_period":30,"observer_period":5,"bubble_radius":75000}
 ```
 
 ### `spawn`
@@ -254,6 +279,31 @@ is `{"kind":"air_defence"}`: it has no route and no target, and the sim's own
 AI decides what it shoots at. A `kind` the client does not recognise carries
 no task, so adding one is not a protocol change.
 
+**Which units a ground group is built from.** Without a `composition` the
+client builds `units` units from the template, its lead type (the radar)
+first and then its unit type (launchers): a battery re-issued with fewer
+units keeps its radar and loses launchers. An air-defence tasking carries a
+`composition` when that order would build the wrong battery -- when the war
+has destroyed the radar, so the survivors are all launchers:
+
+```json
+{"kind":"air_defence","composition":{"Kub 2P25 ln":4}}
+```
+
+It maps a DCS unit type to how many of it to build. The client builds
+exactly that, lead type first, and refuses with a failed `ack` -- never
+trims -- a composition that is not an object
+(`"bad composition: not an object"`), names a type the template does not
+declare (`"bad composition: SA-6_Kub_site has no unit type ..."`), has a
+count that is not a whole number, asks for more of a type than the template
+holds (`"bad composition: 2 Kub 1S91 str exceeds template SA-6_Kub_site
+capacity of 1"`), or does not add up to `units`
+(`"bad composition: 3 unit(s), spawn says 4"`). A battery built with a radar
+the engine believes destroyed would hand the war back a radar nobody
+repaired; one built short, a loss nobody caused. The engine leaves
+`composition` out whenever the front-first order already builds the right
+battery, so such a spawn is exactly what it was in v3.
+
 A package's elements (docs/design.md, section 5) arrive as separate spawns,
 each with its own `spawn_id`, and the client never reasons about two at
 once. A SEAD element's tasking is
@@ -300,8 +350,8 @@ campaign that is quietly wrong — which is worse than one that visibly breaks.
 
 So the engine treats the two streams differently:
 
-- **`state` is truth.** Entity liveness, unit counts and ammunition come only
-  from snapshots. If a snapshot says a group is gone, it is gone, regardless
+- **`state` is truth.** Entity liveness, unit counts, which units survive and
+  ammunition come only from snapshots. If a snapshot says a group is gone, it is gone, regardless
   of what events did or did not arrive; if it says two missiles left a
   flight, two were spent, whether or not a `shot` event said so.
 - **`event` is attribution.** Events answer *who* killed a thing and *with
@@ -323,12 +373,37 @@ owning all identity is what makes a campaign survivable across sim restarts.
 
 ## Versioning
 
-`protocol` is an integer, bumped on any breaking change; this is version 3.
+`protocol` is an integer, bumped on any breaking change; this is version 4.
 There is no negotiation. The engine closes the connection on a `hello` that
 carries any other version, without writing a frame. The client tears the
 connection down on a `sync` that carries any other version, and backs off to
 its longest reconnect delay rather than retry against an engine it cannot
 talk to.
+
+## Changes from v3
+
+One breaking change, in two halves that only work together:
+
+1. **`state` snapshots carry a ground group's units by type** (`unit_types`;
+   see `state`). The engine needs it to know whether the sim destroyed an
+   air-defence site's radar or one of its launchers, which decides whether
+   the site can engage (docs/design.md, section 6). A v3 client never sends
+   it, and a v4 engine would book none of a site's losses in the sim; a v3
+   engine refuses a snapshot member with a field it does not know, so it
+   would close the connection on the first v4 `state` that held a site.
+2. **An air-defence spawn may carry a `composition`** (see `spawn`), naming
+   exactly which units to build. A v3 client ignores it and builds the radar
+   first, giving a battery the war blinded its radar back. The engine sends
+   it only when the radar-first order would be wrong, so every other spawn
+   is unchanged.
+
+Neither side can serve the other, so each refuses the other's version up
+front, exactly as before: the engine closes on a v3 `hello` without writing
+a frame, and the client tears down on a v3 `sync`. The field is optional on
+the wire because only ground groups have it and a client must be able to say
+it could not read a type; a malformed one is a protocol error, like every
+other snapshot field. Nothing else changed: every v3 frame not mentioned here
+is unchanged in v4, field for field.
 
 ## Changes from v2
 

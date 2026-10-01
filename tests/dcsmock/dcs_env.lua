@@ -77,6 +77,8 @@ local M = {
     --- Build units with no getAmmo at all, as an environment without the
     --- call would.
     no_get_ammo = false,
+    --- unit name -> true: that unit's getTypeName raises.
+    type_name_raises = {},
 
     --- What coalition.getAirbases lists. Kinds and sides are mixed and ids are
     --- out of order on purpose: a caller after an airdrome has to filter for
@@ -133,7 +135,12 @@ local function make_unit(group, udata, side)
     u.__ammo = copy_ammo(M.ammo_by_type[udata.type])
 
     function u:getName() return self.__name end
-    function u:getTypeName() return self.__type end
+    function u:getTypeName()
+        if M.type_name_raises[self.__name] then
+            error("getTypeName: injected failure on " .. self.__name, 0)
+        end
+        return self.__type
+    end
     function u:isExist() return self.__exists end
     function u:getCoalition() return self.__side end
     function u:getPlayerName() return self.__player end

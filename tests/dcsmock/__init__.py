@@ -453,6 +453,10 @@ class DCSMock:
         """Make one unit's getAmmo raise, as a stale or broken handle does."""
         self.env.ammo_raises[unit_name] = True if fail else None
 
+    def fail_get_type_name(self, unit_name: str, fail: bool = True) -> None:
+        """Make one unit's getTypeName raise, as a stale or broken handle does."""
+        self.env.type_name_raises[unit_name] = True if fail else None
+
     def without_get_ammo(self) -> None:
         """Build units from now on with no getAmmo at all."""
         self.env.no_get_ammo = True

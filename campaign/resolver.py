@@ -30,8 +30,9 @@ rolled here too (:func:`resolve_strike` at :data:`ARM_PK`); what it buys the
 strikers is a lower kill probability (:func:`suppressed_kill_probability`),
 never a different roll. A SEAD element whose missile out-ranges a site fires
 from outside its envelope and is never rolled against it: the caller leaves
-that site out of the list it passes :func:`resolve_exposure`. When SEAD may
-act on paper at all is docs/design.md, section 5.
+that site out of the list it passes :func:`resolve_exposure`, and so does a
+site whose radar is gone, which cannot engage at all (docs/design.md,
+section 6). When SEAD may act on paper at all is docs/design.md, section 5.
 
 **Dice.** How many draws a resolution takes is decided by the situation --
 the geometry, the content, and what earlier steps left alive -- and never by
@@ -136,12 +137,13 @@ def resolve_exposure(
     )
 
 
-#: Probability that one anti-radiation missile removes one unit of the site it
-#: is fired at. Lower than a bomb's: an ARM guides on an emitter rather than an
-#: aimpoint, and a radar that shuts down in time is not where it homes.
-# TODO(threat-model): a real model kills the radar in particular, and a site
-# without one stops shooting. Units here are counted, not typed, so an ARM
-# kill costs the site whichever unit a respawn would drop -- a launcher.
+#: Probability that one anti-radiation missile destroys the radar of the site
+#: it is fired at. Lower than a bomb's: an ARM guides on an emitter rather than
+#: an aimpoint, and a radar that shuts down in time is not where it homes.
+#: Site units are typed (docs/design.md, section 6), so a kill is the radar,
+#: never a launcher: the caller rolls these against the radars a site has
+#: left and books the kill against its radar type, and a site without one
+#: cannot engage until it is repaired.
 ARM_PK = 0.25
 
 #: Fraction of a site's kill probability each surviving SEAD aircraft takes

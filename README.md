@@ -196,8 +196,10 @@ storage area is untouched. Run the harness with `--loadout 0` — DCS as it
 ships today, the client's pylons empty — and nothing is fired in the sim at
 all: VIPER reaches the depot with no bombs and destroys nothing, and red's
 SEAD element, having spent nothing in DCS, fires its whole load on paper at
-its TOT, takes two Patriot launchers and suppresses what is left, and both
-Su-24Ms get through to hit the storage area. `cmp_0004`
+its TOT. (That run was recorded before site units were typed, when a hit
+took a Patriot launcher; since docs/design.md, section 6, a hit takes the
+battery's radar, and a blind Patriot fires at nobody. The run has not been
+repeated since.) `cmp_0004`
 is the SA-6 covering the approach to Latakia; the observer brings it into
 the bubble, so here DCS,
 not the engine, decides what it shoots down, and the harness's scripted loss
@@ -235,16 +237,17 @@ simulated 17280 paper step(s) of 5s; campaign clock 0s -> 86400s
 ```
 
 Run against a fresh save, that day is over in a little more than an hour of
-it, and blue wins it. Every package on both sides flies escorted, and every
+it, and red wins it. Both sides' first packages fly escorted, and every
 SEAD element fires from standoff, so no SEAD jet is shot at. Red's first
-raid's Kh-58Us destroy two Patriot launchers, and both Su-24Ms get through
-and destroy two of the storage area's four units. Blue's first sortie's
-HARMs destroy one SA-6 launcher, and its strikers one of the depot's four
-units. Red's second raid takes a third launcher and misses the storage
-area. Blue's second takes a second SA-6 launcher and finishes the depot at
-4000 s. Nobody loses an aircraft. Other seeds lose it, and bleed: at seed 20
-each side's strike element loses a jet and red finishes the storage area at
-3945 s. That is the point of sections 3 and 4 of docs/design.md: an
+raid's Kh-58Us take the Patriot's radar, and both Su-24Ms get through and
+destroy three of the storage area's four units. Blue's first sortie's HARMs
+take the SA-6's radar, and its strikers destroy three of the depot's four
+units. A battery without its radar cannot engage, and the slice repairs
+nothing, so both second packages fly alone, unopposed: red's finishes the
+storage area at 3945 s, and blue's, already airborne, flattens the depot 55
+s after the war is over. Nobody loses an aircraft. Other seeds bleed: at
+seed 2140 each side's strike element loses a jet before the battery it
+crosses is blinded, and blue wins at 6525 s. That is the point of sections 3 and 4 of docs/design.md: an
 unwatched war can be lost as well as won, and the enemy is fighting it
 too.
 
@@ -326,6 +329,14 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
 
 **What works, and has been run end to end offline:**
 
+- Air defences that come back. A site's units are a radar and launchers; an
+  anti-radiation missile takes the radar and a site without one cannot
+  engage, and the Syria map repairs what DCS is not holding. Since protocol
+  v4 the `state` snapshot names a ground group's surviving units by type, so
+  which of a site's units the sim destroyed is ground truth, and a site
+  respawns with exactly the units the war left it (docs/design.md, section
+  6). Measured over fifty Syria wars this did not make the war bloodier: red
+  loses a median of no airframes a war, blue 2.5 (section 6 has the table).
 - Both sides plan. Every coalition with a squadron and an airbase frags one
   package at a time against the other's highest-priority strategic target,
   in coalition-name order, under the same inventory, attrition, threat and
@@ -343,8 +354,8 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
 - SEAD on paper, in order at the TOT: the SEAD element flies its exposure
   to any site its missile does not out-range (one it out-ranges, it engages
   from standoff and is not shot at by), its survivors' missiles are rolled
-  against the sites (and may destroy
-  units), each surviving SEAD aircraft halves each engaged site's kill
+  against the sites with a radar left (a hit takes the radar, and a site
+  without one cannot engage), each surviving SEAD aircraft halves each engaged site's kill
   probability for the strike element, the strike flies its exposure, and its
   survivors release. Observed, the SEAD element is tasked in DCS
   (`EngageTargets` against air defences, `AttackGroup` on the named sites)
@@ -402,11 +413,17 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   package whose strike is lost stays open, blocking the next, until its SEAD
   element is home. Seams: `Campaign._plan_for`, `planner.build_package`,
   `planner`'s module docstring.
-- **Nothing plans to destroy a threat site.** SEAD missiles take units off a
-  site only on the way to a strike's target, and a site keeps its full kill
-  probability until its last unit goes: units are counted, not typed, so a
-  battery down to its radar fires as hard as a whole one. Seams:
-  `resolver.ARM_PK`, `theater.ThreatSite`.
+- **Nothing plans to destroy a threat site.** SEAD missiles take a site's
+  radar only on the way to a strike's target. Site units are typed -- a
+  radar and launchers (docs/design.md, section 6) -- and a battery without
+  its radar cannot engage, but one with a radar fires at its full kill
+  probability however many launchers it has left, and each battery has one
+  emitter, so an SA-11 or Roland whose fire units carry radars of their own
+  is easier to blind than the real one. While DCS is not holding a site the
+  engine repairs it, on the Syria map at placeholder rates (radar 12 h,
+  launcher 24 h, no published figure behind either) and for free: there is
+  no logistics model. A site with nothing left is not rebuilt. Seams:
+  `resolver.ARM_PK`, `theater.ThreatSite`, `theater.SiteRepair`.
 - **No ground war**, front line, base capture or logistics network. Seams:
   `theater.Airbase`, `theater.Theater`, `oob.SideInventory`.
 - **Strike and SEAD only, on both sides.** Each side has one strike
@@ -423,8 +440,9 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   paper only by a site its missile does not out-range, and the launch ranges
   and engagement radii are published maxima (AGM-88C 148 km, Kh-58U 250 km,
   SA-6 24 km, Patriot 160 km), so on this map both sides' SEAD fires from
-  standoff. At these numbers SEAD cuts the strike element's losses from 0.27
-  to 0.08 aircraft on a first sortie (over 400 seeds) and costs no SEAD
+  standoff. At these numbers, before site units were typed, SEAD cut the
+  strike element's losses from 0.27 to 0.08 aircraft on a first sortie (over
+  400 seeds; since a hit takes the radar it cuts them further) and costs no SEAD
   aircraft on paper, so an escorted package loses fewer aircraft in total
   than one sent alone. Before standoff it cost more than it saved: the SEAD
   element flew into the unsuppressed site first. Red's standoff rests on the

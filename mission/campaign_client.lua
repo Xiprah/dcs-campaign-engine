@@ -99,7 +99,7 @@ if type(_G.CAMPAIGN_CLIENT_CONFIG) == "table" then
     for k, v in pairs(_G.CAMPAIGN_CLIENT_CONFIG) do CONFIG[k] = v end
 end
 
-local PROTOCOL_VERSION = 3
+local PROTOCOL_VERSION = 4
 local MAX_FRAME_BYTES = 64 * 1024
 local MAX_FRAMES_PER_TICK = CONFIG.max_frames_per_tick
 local OWNED_PREFIX = "cmp_"
@@ -518,7 +518,10 @@ local TEMPLATES = {
     --
     -- `lead_type` is unit 1: the 1S91 "Straight Flush" radar that the 2P25
     -- launchers need to engage at all. A battery re-issued with fewer units
-    -- is built from the front, so it keeps its radar and loses launchers.
+    -- is built from the front, so it keeps its radar and loses launchers --
+    -- unless its spawn carries a `composition` (protocol v4), which names
+    -- exactly which units survive: a battery whose radar is gone comes back
+    -- without it. See unit_types_for.
     ["SA-6_Kub_site"] = {
         lead_type = "Kub 1S91 str",
         unit_type = "Kub 2P25 ln",
@@ -730,6 +733,26 @@ local function read_ammo(units)
         end
     end
     return total
+end
+
+--- Living `units` per DCS unit type, as a JSON object (docs/protocol.md,
+--- `unit_types`, protocol v4).
+---
+--- This is how the engine tells a dead radar from a dead launcher, and a
+--- battery without its radar cannot engage, so the count is all or nothing,
+--- exactly as the ammunition is: nil -- reported as nothing at all, which the
+--- engine reads as no census of this group's units -- when any unit's
+--- getTypeName raises or answers something that is not a non-empty string.
+--- A guess would kill a radar the sim did not kill, or keep one it did.
+local function read_unit_types(units)
+    local counts = json.object({})
+    for i = 1, #units do
+        local u = units[i]
+        local ok, name = pcall(function() return u:getTypeName() end)
+        if not ok or type(name) ~= "string" or name == "" then return nil end
+        counts[name] = (counts[name] or 0) + 1
+    end
+    return counts
 end
 
 -- ------------------------------------------------------------------
@@ -982,7 +1005,68 @@ local function unit_count_for(tmpl, frame)
 end
 
 
-local function build_group_data(spawn, tmpl, name, count)
+--- The DCS unit type of each unit a ground spawn builds, in order; or nil
+--- and why it is refused.
+---
+--- With no `tasking.composition`, the template's lead type first and then its
+--- unit type, as every version of this client has built a battery. With one
+--- (docs/protocol.md, protocol v4), exactly the units it names, lead type
+--- first: a battery whose radar the war destroyed comes back without it, and
+--- one repaired on paper comes back with what was repaired. A composition
+--- the template cannot build is refused, never trimmed: a battery built with
+--- a radar the engine believes destroyed would be booked as repaired by
+--- nobody, and one built short as a loss nobody caused.
+--- tools/fake_dcs.py refuses the same things with the same words.
+local function unit_types_for(tmpl, frame, count)
+    local lead = tmpl.lead_type or tmpl.unit_type
+    local unit = tmpl.unit_type
+    local comp = type(frame.tasking) == "table" and frame.tasking.composition or nil
+    if comp == nil or json.isnull(comp) then
+        local types = {}
+        for i = 1, count do types[i] = (i == 1) and lead or unit end
+        return types
+    end
+    if type(comp) ~= "table" then return nil, "bad composition: not an object" end
+    local capacity = tmpl.count or 1
+    local limits = {}
+    if lead == unit then
+        limits[lead] = capacity
+    else
+        limits[lead] = 1
+        limits[unit] = capacity - 1
+    end
+    local keys = {}
+    for k in pairs(comp) do keys[#keys + 1] = tostring(k) end
+    table.sort(keys)
+    local total = 0
+    for _, k in ipairs(keys) do
+        local n = comp[k]
+        if limits[k] == nil then
+            return nil, "bad composition: " .. tostring(frame.template)
+                        .. " has no unit type " .. k
+        end
+        if type(n) ~= "number" or n ~= math.floor(n) or n < 0 then
+            return nil, "bad composition: " .. k .. " count is not a whole number"
+        end
+        if n > limits[k] then
+            return nil, "bad composition: " .. n .. " " .. k .. " exceeds template "
+                        .. tostring(frame.template) .. " capacity of " .. limits[k]
+        end
+        total = total + n
+    end
+    if total ~= count then
+        return nil, "bad composition: " .. total .. " unit(s), spawn says " .. count
+    end
+    local types = {}
+    for _ = 1, (comp[lead] or 0) do types[#types + 1] = lead end
+    if unit ~= lead then
+        for _ = 1, (comp[unit] or 0) do types[#types + 1] = unit end
+    end
+    return types
+end
+
+
+local function build_group_data(spawn, tmpl, name, count, types)
     local units = {}
     local gx, gy, galt = pos_xy(spawn.position)
     local heading = tonumber(spawn.heading) or 0
@@ -995,7 +1079,7 @@ local function build_group_data(spawn, tmpl, name, count)
             -- an event is still recognisably ours even though the engine
             -- resolves entities by group name.
             name = name .. "_" .. i,
-            type = (i == 1 and tmpl.lead_type) or tmpl.unit_type,
+            type = (types and types[i]) or (i == 1 and tmpl.lead_type) or tmpl.unit_type,
             -- 50 m lateral stagger: a formation stacked on one point is a
             -- mid-air the moment it spawns.
             x = gx + (i - 1) * 50,
@@ -1142,7 +1226,17 @@ local function handle_spawn(frame)
             send_ack(frame.ref, false, "unknown category: " .. tostring(frame.category))
             return
         end
-        local built, data = pcall(build_group_data, frame, tmpl, name, unit_count)
+        local types = nil
+        if frame.category == "ground" then
+            local refused
+            types, refused = unit_types_for(tmpl, frame, unit_count)
+            if not types then
+                log_err("spawn " .. sid .. ": " .. refused)
+                send_ack(frame.ref, false, refused)
+                return
+            end
+        end
+        local built, data = pcall(build_group_data, frame, tmpl, name, unit_count, types)
         if not built then
             send_ack(frame.ref, false, "bad spawn payload: " .. tostring(data))
             return
@@ -1271,6 +1365,9 @@ local function snapshot_of(sid, rec)
         -- Nobody left to read, and a jet DCS deleted after landing cannot
         -- say what it brought home.
         if airborne and snap.units == 0 then snap.ammo = json.object({}) end
+        if rec.category == "ground" and snap.units == 0 then
+            snap.unit_types = json.object({})
+        end
         return snap
     end
 
@@ -1307,6 +1404,9 @@ local function snapshot_of(sid, rec)
     snap.alive = snap.units > 0
     if first then snap.pos = json.array({first.x, first.y, first.z}) end
     if airborne and deleted == 0 then snap.ammo = read_ammo(living) end
+    if rec.category == "ground" and snap.units == alive then
+        snap.unit_types = read_unit_types(living)
+    end
     return snap
 end
 

@@ -125,7 +125,10 @@ from campaign.theater import (
 #:    reservation, schedule and state (docs/design.md, section 5).
 #: 6: an element carries what the sim spent of its munition (`sim_spent`,
 #:    `ammo_seen`) in place of `sim_contact`; protocol v3 reports it.
-SAVE_VERSION = 6
+#: 7: threat sites are typed (`units_by_type`, in the theater and the tracker)
+#:    and carry repair progress; the theater carries its repair rates, and
+#:    the campaign the clock repair has run to (`repaired_to`).
+SAVE_VERSION = 7
 
 #: Default seed. Explicit, because an implicit one is an unseeded one.
 DEFAULT_SEED = 20240923
@@ -206,6 +209,10 @@ class Campaign:
         #: Coalitions already told there is nothing to strike. Not persisted,
         #: for the same reason.
         self._no_targets_announced: set[str] = set()
+        #: Campaign time up to which air-defence repair has been accrued
+        #: (`_repair`). Persisted: a reload must neither repeat repair work
+        #: nor skip it.
+        self.repaired_to: float = 0.0
 
         self._ensure_targets_tracked()
 
@@ -472,8 +479,11 @@ class Campaign:
         return frames
 
     def _pulse(self) -> list[Downlink]:
-        """Walk packages forward, task new ones, reconcile the bubble."""
+        """Repair, walk packages forward, task new ones, reconcile the bubble."""
         frames: list[Downlink] = []
+        # First, so a radar back in action by now is back for a TOT resolved
+        # at this same instant.
+        frames.extend(self._repair())
         frames.extend(self._advance_packages())
         # A flight can now die on paper at its TOT as well as in a snapshot,
         # and it has to close out before the planner looks for an open
@@ -843,7 +853,13 @@ class Campaign:
         )
 
     def _route_threats(self, package: Package) -> list[ThreatSite]:
-        """The enemy's live sites whose envelopes the package's route enters.
+        """The enemy's engaging sites whose envelopes the package's route enters.
+
+        A site whose radar is gone is not among them (docs/design.md, section
+        6): it cannot engage, throws no dice at anyone, and an anti-radiation
+        missile has nothing on it to home on. Which sites can engage is read
+        afresh at each step of the TOT, so a battery the SEAD element's
+        missiles blinded throws nothing at the strikers behind it.
 
         The route is the paper track's single leg, base to target, shared by
         every element; egress retraces it, so one pass through each envelope
@@ -896,7 +912,7 @@ class Campaign:
         not anyone suppressed anything.
 
         A SEAD element meets only the sites it cannot out-range
-        (`_exposed_sites`).
+        (`_exposed_sites`), and nobody meets a site whose radar is gone.
         """
         if self.tracker.is_instantiated(element.spawn_id):
             return []  # DCS has it; the snapshot is the authority.
@@ -985,6 +1001,12 @@ class Campaign:
         robin, and every one is rolled even once its site has nothing left to
         lose (`resolve_strike`), so the draws depend on how many were fired
         and at how many sites -- never on how the dice fall.
+
+        An anti-radiation missile homes on an emitter (docs/design.md,
+        section 6): only a site with a radar left is fired at
+        (`_route_threats`), and a hit destroys the radar, never a launcher. A
+        missile that hits once the radar is gone has nothing to home on and
+        destroys nothing, though it is still rolled.
         """
         if self.tracker.is_instantiated(sead.spawn_id) or rounds <= 0:
             return []
@@ -1007,15 +1029,71 @@ class Campaign:
             suppression[site.id] = shooters
             outcome = resolve_strike(
                 rounds=share,
-                target_units_alive=site.units_alive,
+                target_units_alive=site.radars_alive,
                 rng=self.rng,
                 weapon_pk=ARM_PK,
             )
             frames.extend(
                 self._apply_losses(
                     self.tracker.record_unobserved(
-                        site.spawn_id, outcome.units_killed, self.clock
+                        site.spawn_id,
+                        outcome.units_killed,
+                        self.clock,
+                        unit_type=site.radar_type,
                     )
+                )
+            )
+        return frames
+
+    def _held_by_dcs(self, spawn_id: str) -> bool:
+        """Is DCS holding this entity, or about to, or about to let it go?
+
+        Wider than `tracker.is_instantiated`, on purpose, for repair. A spawn
+        sent and not yet acknowledged will be built with the units its frame
+        named; a despawn not yet acknowledged still has its last census to
+        come. Repair in either window and that census reads the repaired unit
+        as one DCS destroyed.
+
+        With no client connected nothing is held: no census can arrive, and
+        the spawns and despawns written meanwhile go to no one -- `pending`
+        keeps them until the next hello clears it, and must not hold a site
+        through a whole offline war.
+        """
+        if not self.connected:
+            return False
+        if spawn_id in self.live or self.tracker.is_instantiated(spawn_id):
+            return True
+        return any(held == spawn_id for _, held in self.pending.values())
+
+    def _repair(self) -> list[Downlink]:
+        """Repair air defences DCS is not holding (docs/design.md, section 6).
+
+        Logistics, not combat, so it is the engine's authority, and only where
+        DCS is not: a site DCS holds changes only by snapshot, and accrues no
+        repair work while held. A site with nothing left is not rebuilt. Sites
+        in id order; no dice. A theater with no repair rates runs this and
+        changes nothing.
+        """
+        dt = self.clock - self.repaired_to
+        if dt <= 0:
+            return []
+        self.repaired_to = self.clock
+        frames: list[Downlink] = []
+        for site in sorted(self.theater.threats.values(), key=lambda s: s.id):
+            if site.destroyed or not site.spawn_id or self._held_by_dcs(site.spawn_id):
+                continue
+            was_blind = not site.can_engage
+            restored = site.repair(dt, self.theater.repair)
+            for unit_type in restored:
+                self.tracker.record_repair(site.spawn_id, unit_type)
+            if not restored:
+                continue
+            back = " Radar back in action." if was_blind and site.can_engage else ""
+            frames.extend(
+                self._tell(
+                    site.coalition,
+                    f"{site.name} repaired: {len(restored)} unit(s) restored, "
+                    f"{site.units_alive} of {site.units_initial}.{back}",
                 )
             )
         return frames
@@ -1245,10 +1323,15 @@ class Campaign:
                 {entity.coalition, enemy_of(entity.coalition)},
                 f"{entity.name} destroyed.",
             )
+        blind = (
+            " Its radar is out: it cannot engage."
+            if isinstance(entity, ThreatSite) and not entity.can_engage
+            else ""
+        )
         return self._tell(
             entity.coalition,
             f"{entity.name} hit: {count} unit(s) destroyed, "
-            f"{entity.units_alive} of {entity.units_initial} remaining.",
+            f"{entity.units_alive} of {entity.units_initial} remaining.{blind}",
         )
 
     def _apply_loss(self, loss: LossRecord) -> list[Downlink]:
@@ -1291,10 +1374,20 @@ class Campaign:
         return frames
 
     def _apply_threat_loss(self, loss: LossRecord) -> list[Downlink]:
+        """Bring the site's typed units into line with the tracker's.
+
+        The tracker decided which units died -- from a snapshot's types, or
+        the type a paper weapon kills -- so the site copies its belief rather
+        than counting a unit down: a loss record does not say which unit it
+        was. Every record in a batch copies the same final state, so applying
+        several is the same as applying one.
+        """
         site = self.theater.threats.get(loss.entity_id)
         if site is None:
             return []
-        site.units_alive = max(0, site.units_alive - 1)
+        typed = self.tracker.units_by_type(site.spawn_id)
+        if typed is not None:
+            site.units_by_type = typed
         if not site.destroyed:
             return []
         frames = self._retire(site.spawn_id, "destroyed")
@@ -1539,6 +1632,16 @@ class Campaign:
         )
 
     def _threat_spawn_frame(self, site: ThreatSite) -> Spawn:
+        units = self.tracker.units_alive(site.spawn_id)
+        tasking: dict[str, Any] = {"kind": "air_defence"}
+        # The client builds a bare count radar first. A battery whose radar is
+        # gone, or that has more radars than that order gives it, has to be
+        # spelled out, or DCS would get back a radar the war destroyed. Only
+        # then: a battery the count describes goes on the wire exactly as it
+        # always did (docs/protocol.md, "Changes from v3").
+        composition = self.tracker.units_by_type(site.spawn_id) or {}
+        if composition != site.front_built(units):
+            tasking["composition"] = dict(sorted(composition.items()))
         seq = self._seq()
         self.pending[seq] = (_SPAWN, site.spawn_id)
         return Spawn(
@@ -1549,13 +1652,14 @@ class Campaign:
             coalition=site.coalition,
             category=site.category,
             template=site.template,
-            # As for a target: a battery that lost launchers comes back without
-            # them, or it would have to be suppressed twice.
-            units=self.tracker.units_alive(site.spawn_id),
+            # As for a target: a battery that lost units comes back without
+            # them, or it would have to be suppressed twice -- and one repaired
+            # on paper comes back with what was repaired.
+            units=units,
             position=site.pos,
             heading=0.0,
             route=[],
-            tasking={"kind": "air_defence"},
+            tasking=tasking,
         )
 
     def _ensure_targets_tracked(self) -> None:
@@ -1585,6 +1689,11 @@ class Campaign:
                     coalition=entity.coalition,
                     units_initial=entity.units_initial,
                     units_alive=entity.units_alive,
+                    units_by_type=(
+                        dict(entity.units_by_type)
+                        if isinstance(entity, ThreatSite)
+                        else None
+                    ),
                 )
 
     # ------------------------------------------------------------------
@@ -1613,6 +1722,7 @@ class Campaign:
             "blocked": sorted(self.blocked),
             "pending": {str(k): list(v) for k, v in sorted(self.pending.items())},
             "war_result": self.war_result,
+            "repaired_to": self.repaired_to,
             "theater": self.theater.to_dict(),
             "inventories": {k: v.to_dict() for k, v in self.inventories.items()},
             "packages": {k: v.to_dict() for k, v in sorted(self.packages.items())},
@@ -1658,6 +1768,7 @@ class Campaign:
             if result is None
             else {"t": float(result["t"]), "defeated": list(result["defeated"])}
         )
+        campaign.repaired_to = float(raw["repaired_to"])
         campaign.packages = {
             k: Package.from_dict(v) for k, v in raw["packages"].items()
         }

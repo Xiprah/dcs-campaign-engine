@@ -62,8 +62,17 @@ DRAWN = (
 #: win at 6435 s, but blue's third package, already airborne, flattens the
 #: depot 90 s later; seed 6 is the first, in order, at which red wins and the
 #: depot survives. The default seed is now a blue win, at 4000 s.
-SEED_BLUE_WINS = 3
-SEED_RED_WINS = 6
+#:
+#: Re-pinned again when site units became typed (docs/design.md, section
+#: 6): a missile that hits now takes the battery's radar, and a blind
+#: battery throws no dice at the strikers, so every TOT after the first hit
+#: draws fewer. Seed 3 is now a red win at 3945 s, and at seed 6 red still
+#: wins at 3945 s but blue's airborne strike flattens the depot afterwards.
+#: Seed 1 is the first, in order, at which blue wins (at 6525 s, one unit of
+#: the storage area standing), and seed 0 the first at which red wins (at
+#: 3945 s) and the depot survives.
+SEED_BLUE_WINS = 1
+SEED_RED_WINS = 0
 #: A day of war on the slice as shipped in which each side's strike element
 #: loses aircraft to the other's air defences and each side's bombs destroy
 #: part of the other's target. Found by flying seeds in order: at seed 20 red
@@ -72,7 +81,16 @@ SEED_RED_WINS = 6
 #: strike element now loses anything. With neither SEAD element exposed and
 #: both sites suppressed, a strike element that loses a jet is rarer than it
 #: was, and seed 20 is the first at which both sides' do.
-SEED_BOTH_BLEED = 20
+#:
+#: Re-pinned from 20 when site units became typed (docs/design.md, section
+#: 6): the first missile to hit a battery now takes its radar, and the
+#: slice never repairs one, so a strike element can lose a jet only on the
+#: sorties before its enemy's SEAD has hit anything. At 20 both batteries
+#: are blinded before either strike element loses a jet, and red wins at
+#: 3945 s. Both sides bleeding is rare now; seed 2140 is the first, in
+#: order: each strike element loses one jet before the battery it crosses
+#: is blinded, and blue wins at 6525 s.
+SEED_BOTH_BLEED = 2140
 
 
 # ---------------------------------------------------------------------------
@@ -432,14 +450,25 @@ class TestConservationOnBothSides(unittest.TestCase):
         its site is never shot at on paper, and the SEAD squadrons' books
         would balance trivially too. Every squadron and every reservation is
         checked after every paper step.
+
+        Both sites are batteries of forty units that are each their own
+        radar, as a Tor's are (`theater.SITE_UNIT_TYPES`). Since units are
+        typed (docs/design.md, section 6) an anti-radiation missile destroys
+        only a radar, so a battery with one radar is blind after one hit and,
+        on the slice, which repairs nothing, stays blind: after that nobody
+        loses anything, which is the triviality the forty units are here to
+        prevent. `template` before `units_alive`, so the count re-types the
+        battery for the template it now has.
         """
         theater = slice_with(
             **{
                 DEPOT: {"units_initial": 40, "units_alive": 40},
                 STORAGE: {"units_initial": 40, "units_alive": 40},
-                SA6: {"kill_probability": 0.3, "units_initial": 40, "units_alive": 40,
+                SA6: {"template": "SA-15_Tor_site", "kill_probability": 0.3,
+                      "units_initial": 40, "units_alive": 40,
                       "engagement_radius": launch_range("AGM-88C")},
-                PATRIOT: {"kill_probability": 0.3, "units_initial": 40, "units_alive": 40,
+                PATRIOT: {"template": "SA-15_Tor_site", "kill_probability": 0.3,
+                          "units_initial": 40, "units_alive": 40,
                           "engagement_radius": launch_range("Kh-58U")},
             }
         )

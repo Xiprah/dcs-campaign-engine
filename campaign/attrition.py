@@ -169,6 +169,12 @@ class TrackedGroup:
     expect_from: float | None = None
     ever_seen: bool = False
     resolved: bool = False
+    #: Surviving units by DCS unit type, for a group whose units are not
+    #: interchangeable -- an air-defence site's radar and launchers. None for
+    #: every other group, which is counted, not typed. When set, its total is
+    #: `units_alive`, and it is what a snapshot's `unit_types` is reconciled
+    #: against (docs/design.md, section 6).
+    units_by_type: dict[str, int] | None = None
 
     @property
     def expects_snapshot(self) -> bool:
@@ -186,6 +192,11 @@ class TrackedGroup:
             "expect_from": self.expect_from,
             "ever_seen": self.ever_seen,
             "resolved": self.resolved,
+            "units_by_type": (
+                None
+                if self.units_by_type is None
+                else dict(sorted(self.units_by_type.items()))
+            ),
         }
 
     @classmethod
@@ -203,6 +214,11 @@ class TrackedGroup:
             ),
             ever_seen=bool(raw["ever_seen"]),
             resolved=bool(raw["resolved"]),
+            units_by_type=(
+                None
+                if raw["units_by_type"] is None
+                else {str(k): int(v) for k, v in sorted(raw["units_by_type"].items())}
+            ),
         )
 
 
@@ -235,7 +251,12 @@ class AttritionTracker:
         coalition: str,
         units_initial: int,
         units_alive: int | None = None,
+        units_by_type: dict[str, int] | None = None,
     ) -> TrackedGroup:
+        """Start tracking an entity. `units_by_type` makes it a typed group."""
+        if units_by_type is not None:
+            units_by_type = {t: n for t, n in sorted(units_by_type.items()) if n > 0}
+            units_alive = sum(units_by_type.values())
         group = TrackedGroup(
             spawn_id=spawn_id,
             entity_id=entity_id,
@@ -243,6 +264,7 @@ class AttritionTracker:
             coalition=coalition,
             units_initial=units_initial,
             units_alive=units_initial if units_alive is None else units_alive,
+            units_by_type=units_by_type,
         )
         self.groups[spawn_id] = group
         return group
@@ -279,6 +301,13 @@ class AttritionTracker:
     def units_alive(self, spawn_id: str) -> int:
         group = self.groups.get(spawn_id)
         return 0 if group is None else group.units_alive
+
+    def units_by_type(self, spawn_id: str) -> dict[str, int] | None:
+        """A typed group's surviving units by type; None if it is not typed."""
+        group = self.groups.get(spawn_id)
+        if group is None or group.units_by_type is None:
+            return None
+        return dict(group.units_by_type)
 
     def is_instantiated(self, spawn_id: str) -> bool:
         """Is DCS currently holding this entity?
@@ -373,8 +402,26 @@ class AttritionTracker:
             # engine itself removed, and the next report would indict it.
             # Only an ack says a group is live.
 
+            observed_types: dict[str, int] | None = None
             if not snapshot.alive:
                 observed = 0
+                if group.units_by_type is not None:
+                    observed_types = {}
+            elif group.units_by_type is not None:
+                if snapshot.unit_types is None:
+                    # The client could not say which units are left, so this
+                    # snapshot is no census of them. Guessing which one died
+                    # kills a radar DCS did not kill, or keeps one it did;
+                    # the belief stands until a snapshot can say.
+                    continue
+                # Per type, clamped as the count is below: a type the engine
+                # never issued, or more of one than it holds, is a client bug,
+                # and believing it would build a radar out of nothing.
+                observed_types = {
+                    unit_type: max(0, min(snapshot.unit_types.get(unit_type, 0), held))
+                    for unit_type, held in sorted(group.units_by_type.items())
+                }
+                observed = sum(observed_types.values())
             else:
                 # Clamp upward reports. A snapshot claiming more units than the
                 # engine issued is a client bug; believing it would manufacture
@@ -386,6 +433,8 @@ class AttritionTracker:
                 cause = CAUSE_DESTROYED if observed == 0 else CAUSE_ATTRITED
                 revealed.extend(self._record(group, lost, report.t, cause))
             group.units_alive = observed
+            if observed_types is not None:
+                group.units_by_type = {t: n for t, n in observed_types.items() if n > 0}
             if observed == 0:
                 self._resolve(group)
 
@@ -402,13 +451,17 @@ class AttritionTracker:
                     self._record(group, group.units_alive, report.t, CAUSE_VANISHED)
                 )
             group.units_alive = 0
+            if group.units_by_type is not None:
+                group.units_by_type = {}
             self._resolve(group)
 
         return revealed
 
     # -- resolution (paper) -----------------------------------------------
 
-    def record_unobserved(self, spawn_id: str, count: int, t: float) -> list[LossRecord]:
+    def record_unobserved(
+        self, spawn_id: str, count: int, t: float, unit_type: str | None = None
+    ) -> list[LossRecord]:
         """Book `count` units lost where nobody was watching.
 
         The paper counterpart of :meth:`ingest`, and the only other way into
@@ -420,11 +473,20 @@ class AttritionTracker:
         Refuses, recording nothing, for a group DCS is holding: that group's
         losses come only from snapshots (docs/design.md, section 1), and a
         loss booked here as well would be the same unit dying twice.
+
+        A typed group loses units of `unit_type` and no other, at most as many
+        as it has of that type: the caller says which unit its weapon kills
+        (an anti-radiation missile, the radar), and nothing here picks one.
         """
         group = self.groups.get(spawn_id)
         if group is None or group.resolved or group.instantiated:
             return []
-        lost = min(max(0, count), group.units_alive)
+        available = group.units_alive
+        if group.units_by_type is not None:
+            if unit_type is None:
+                raise ValueError(f"{spawn_id} is typed; say which unit type it loses")
+            available = group.units_by_type.get(unit_type, 0)
+        lost = min(max(0, count), available)
         if lost == 0:
             return []
         records = [
@@ -441,9 +503,39 @@ class AttritionTracker:
         ]
         self.losses.extend(records)
         group.units_alive -= lost
+        if group.units_by_type is not None and unit_type is not None:
+            left = group.units_by_type.get(unit_type, 0) - lost
+            group.units_by_type = {
+                t: n
+                for t, n in sorted({**group.units_by_type, unit_type: left}.items())
+                if n > 0
+            }
         if group.units_alive == 0:
             self._resolve(group)
         return records
+
+    def record_repair(self, spawn_id: str, unit_type: str) -> bool:
+        """One unit of `unit_type` put back on a typed group outside DCS.
+
+        Repair is logistics, not combat, so it is not a loss and never enters
+        the ledger. It is refused, changing nothing, for a group DCS is
+        holding -- that group changes only by snapshot -- and for one already
+        written off. Returns whether the unit was put back.
+        """
+        group = self.groups.get(spawn_id)
+        if (
+            group is None
+            or group.resolved
+            or group.instantiated
+            or group.units_by_type is None
+        ):
+            return False
+        group.units_by_type = dict(
+            sorted({**group.units_by_type,
+                    unit_type: group.units_by_type.get(unit_type, 0) + 1}.items())
+        )
+        group.units_alive += 1
+        return True
 
     def _record(
         self, group: TrackedGroup, count: int, t: float, cause: str
