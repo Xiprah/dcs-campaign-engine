@@ -25,6 +25,13 @@ from campaign.server import (
 
 DEFAULT_SAVE = Path("saves/campaign.json")
 
+#: Maps a new campaign can be started on. `syria` is the real one; `slice` is
+#: the two-base test slice the unit tests are written against, kept for
+#: debugging. A save carries its own theater, so this only matters when there
+#: is no save yet.
+THEATERS = ("syria", "slice")
+DEFAULT_THEATER = "syria"
+
 
 # ---------------------------------------------------------------------------
 # INTEGRATION SEAM
@@ -33,11 +40,26 @@ DEFAULT_SAVE = Path("saves/campaign.json")
 # only place in the process that names the concrete implementation. Replace the
 # body; keep the signature. Anything satisfying campaign.api.CampaignEngine
 # works, which is also how tests and tools/fake_dcs.py stay honest.
-def build_engine(save: Path) -> CampaignEngine:
-    """Load the campaign from `save`, or start a new one if it is absent."""
+def build_engine(save: Path, theater: str = DEFAULT_THEATER) -> CampaignEngine:
+    """Load the campaign from `save`, or start a new one on `theater`."""
     from campaign.campaign import Campaign  # INTEGRATION SEAM: the real brain
 
-    return Campaign.load(save) if save.exists() else Campaign()
+    if save.exists():
+        return Campaign.load(save)
+    if theater == "slice":
+        # Campaign()'s own default, so the slice started here is the one the
+        # tests build.
+        return Campaign()
+    if theater == "syria":
+        from campaign.oob import build_syria_oob
+        from campaign.theater import build_syria_theater
+
+        blue, red = build_syria_oob()
+        return Campaign(
+            theater=build_syria_theater(),
+            inventories={blue.coalition: blue, red.coalition: red},
+        )
+    raise ValueError(f"unknown theater {theater!r}; want one of {', '.join(THEATERS)}")
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +148,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--save", type=Path, default=DEFAULT_SAVE, help="campaign save file (JSON)"
     )
     parser.add_argument(
+        "--theater",
+        choices=THEATERS,
+        default=None,
+        help=f"map to start a new campaign on (default {DEFAULT_THEATER}); "
+        "ignored when the save already exists, since a save carries its own",
+    )
+    parser.add_argument(
         "--tick-period",
         type=float,
         default=DEFAULT_TICK_PERIOD,
@@ -212,9 +241,17 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    if args.theater is not None and args.save.exists() and not args.engine:
+        logging.getLogger("campaign").warning(
+            "--theater %s ignored: continuing the war in %s, which carries its own",
+            args.theater,
+            args.save,
+        )
     try:
         engine = (
-            _load_engine_factory(args.engine) if args.engine else build_engine(args.save)
+            _load_engine_factory(args.engine)
+            if args.engine
+            else build_engine(args.save, args.theater or DEFAULT_THEATER)
         )
     except ImportError as exc:
         print(

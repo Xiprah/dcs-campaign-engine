@@ -495,3 +495,106 @@ Multi-package deconfliction, escort and CAP, tankers and AWACS, the ground
 war and front line, logistics and resupply, base capture, pilot records, and
 real unit-template fidelity. Each has a `TODO(seam)` where it attaches. None
 of them changes the decisions above.
+
+## Theater: the Syria map
+
+The slice has one target a side, so a war is decided in two or three sorties,
+and its coordinates are invented, so once distance decides exposure the
+outcomes are invented too. `theater.build_syria_theater` and
+`oob.build_syria_oob` are a real map sized for a war with an arc. They are
+what `python -m campaign` starts by default (`--theater syria`); the slice
+stays as `--theater slice`, and `Campaign()` still builds the slice, because
+every other test is written against it.
+
+**Where things are.** Airbases are the DCS Syria map's own, in DCS map
+coordinates, copied as numbers from pydcs's generated terrain data
+(`dcs/terrain/syria/airports.py`, LGPL-3.0). pydcs's `Point(x, y)` is
+northing and easting, which are the engine's Vec3 x and z, so it is placed at
+`(x, 0, y)`. The axes were checked by inverting the map's projection, and
+tests pin both the raw numbers and the directions (Incirlik is north-west of
+Bassel al-Assad), because distances alone cannot tell a swapped axis.
+Everything else is a game-design placement, not a real facility: each target
+and site is at a stated offset of at most about 7 km from a DCS airbase on the map
+and is named for it so a player can find it.
+
+**Bases follow from the planner.** A side now plans each target from its
+base nearest that target, falling back to the next nearest if that base
+cannot cover the strike (`Theater.airbases_nearest`). Bases used to be tried
+in id order, which flew everything from whichever sorted first until it ran
+dry, whatever the geography. A base therefore earns its place by being
+nearest some enemy target. Blue flies from Hatay (nearest five of red's seven
+targets) and Gaziantep (the eastern two). Incirlik is nearer none, so it is
+not a blue base here: it is blue's rear area instead, where its deepest
+targets are. Red flies from Bassel al-Assad (nearest Incirlik and Adana),
+Kuweires (nearest Gaziantep, Kahramanmaras and Sanliurfa) and a detachment
+at Abu al-Duhur (nearest the Hatay target).
+
+**The arc.** Each side has seven targets that the planner takes in priority
+order, and priority falls with depth. That ordering is a campaign plan that
+works inward from the border, not a judgement of what the targets are worth.
+The two nearest the border are small (4 units) and undefended. The next two
+(12 units) have one envelope over the route to them. The last three
+(24 units, about 150-210 km from the nearest enemy base) have two, except
+red's deepest, Shayrat, which has three: its route passes 4.5 km from the
+Hama target, so whatever defends Hama covers it too. Both sides get the same
+targets by size, and the same totals of airframes and ordnance spread over
+their fields by geography.
+
+**Radii are published maxima, so blue's area sites are Hawks.** Every site
+type keeps the SA-6's placeholder kill probability, for the reason the
+Patriot does (section 3), so the types differ only in reach, and each reach
+is the system's published maximum, for section 3's reason: SA-11 35 km,
+SA-15 12 km, Roland 8 km, Hawk 50 km (`theater.py` names each source). Blue's
+area sites are MIM-23 Hawks, which Turkey operates, not Patriots. At the
+Patriot's published 160 km, one battery over Incirlik or Kahramanmaras covers
+blue's whole side of the border, shallow targets included, and the war loses
+the depth that gives it its arc; a test fails if it does. The Patriot's
+radius stays its published figure. The slice and the standoff tests depend on
+it, and the trade is the map's content, not a different physics.
+
+**What a war looks like.** Measured offline over 50 seeds, with nobody
+connected, with SEAD standoff and the Hawks. Not asserted anywhere. Each
+"was" is the same batch measured before standoff, when blue's area sites
+were 40 km Patriots and the point defences a shared 10 km:
+
+| | blue | red |
+|---|---|---|
+| war length, median (range) | 41 h (34-50); was 44 h (36-52) | (the same wars) |
+| wins | 31; was 27 | 19; was 23 |
+| strike packages per war, median (range) | 62.5 (53-75); was 66 | 57.5 (47-69); was 61 |
+| SEAD-escorted packages per war, mean | about 22; was 25 | about 22; was 25 |
+| enemy targets destroyed, median | 7 | 6 |
+| enemy sites destroyed, median | 6 of 7; was 5 | 5 of 5; was 4 |
+| airframes lost, median (range) | 5.5 (0-24); was 27 (10-45) | 1.5 (0-7); was 14 (5-40) |
+| bombs left of 360, median (min) | 110 (60); was 96 (48) | 130 (84); was 116 (72) |
+| airframes lost per package: shallow / middle / deep | 0.00 / 0.03 / 0.15; was 0.00 / 0.22 / 0.51 | 0.00 / 0.03 / 0.03; was 0.00 / 0.24 / 0.34 |
+| sortie length: shallow / middle / deep | 30 / 33 / 43 min | 31 / 43 / 45 min |
+
+Every war ended in a victory, with no draws, and no side ever ran out of
+anything it needed; in the longest wars a single field did and its targets
+passed to the next nearest. The arc in *time* survives: shallow targets fall
+in the first hours, and deep ones are larger and further away. The arc in
+*cost* has mostly gone. Standoff makes SEAD free: both anti-radiation
+missiles out-range every site on this map, AGM-88C 148 km and Kh-58U 250 km
+against at most 50 km. A two-ship's suppression then cuts each site's Pk to
+a quarter for the strike behind it. Red's SEAD also destroys all five of
+blue's sites in a median war, so after the middle targets red strikes blue
+for almost nothing: 0.03 airframes a package on the deep targets, and a
+median of 1.5 lost in a whole war. Blue meets seven sites with more units
+between them, so its deep strikes still cost something (0.15 a package), and
+blue now wins more often. A Syria war is close to bloodless, as the slice
+became.
+
+Two things this content cannot fix. First, *a war lasts about two days, not
+several*, because the engine's tempo is one package per side in the air at
+all times, around the clock: about 35 packages a side a day. The war's
+length is then set by the target units, and two days already needs 24-object
+statics. Several days needs a sortie-rate model (turnaround, crew rest,
+night), which is engine work. Second, *defences on paper are cheap to beat
+and erode*. Standoff SEAD flies unhurt, its suppression is strong, and a
+two-ship's four missiles take about one unit off the sites on its route per
+sortie (ARM Pk 0.25), while a site keeps firing at full Pk until its last
+unit goes. More sites were not tried; SEAD would meet them unhurt too. What
+would restore the cost arc is a SEAD-model change (weaker or partial suppression,
+sites that hide their radars, missiles that miss a shut-down emitter), not a
+theater one.

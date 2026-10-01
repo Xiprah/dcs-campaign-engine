@@ -123,8 +123,14 @@ Python 3.14, standard library only. No dependencies, nothing to install.
 In one shell, start the engine:
 
 ```
-python -m campaign --port 7777 --save saves/campaign.json
+python -m campaign --port 7777 --save saves/campaign.json --theater slice
 ```
+
+`--theater` picks the map a *new* campaign starts on: `syria`, the default,
+is the real Syria map (docs/design.md, "Theater: the Syria map"); `slice` is
+the two-base test slice the unit tests are written against, and the one this
+walkthrough and the harness's scripted observer describe. A save carries its
+own theater, so the flag is ignored once the save exists.
 
 In another, run the DCS stand-in. It speaks the mission-client half of the
 protocol over a real socket, flies a scripted observer out of Incirlik, obeys
@@ -426,8 +432,10 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
   battery is a radar and four launchers only: a DCS Patriot is normally also
   given an ECS and power, and a template carries one lead unit type, so
   whether this one engages anything in the sim is unverified.
-- **Invented coordinates.** The Syria positions in `theater.py` are plausible,
-  not surveyed. Swapping in extracted map coordinates is a content change.
+- **Invented coordinates, in the slice.** The slice's positions in
+  `theater.py` are plausible, not surveyed. The Syria theater's airbases are
+  the DCS map's own, from pydcs's terrain data; its targets and sites are
+  game-design placements at stated offsets from them, not real facilities.
 - **The Lua client has not been run against a real DCS** in producing this
   slice — there is no DCS on the machine that built it. It is written against
   the documented scripting API and its interfaces are reconciled against the

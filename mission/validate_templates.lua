@@ -224,13 +224,85 @@ local SPEC = {
             probe_category = "plane",
             probe_country = "RUSSIA",
         },
+        -- The Syria theater's air defences (campaign/theater.py,
+        -- build_syria_theater), each probed for the side that fields it.
+        ["SA-11_Buk_site"] = {
+            lead_type = "SA-11 Buk SR 9S18M1",
+            unit_type = "SA-11 Buk LN 9A310M1",
+            count = 5,
+            task = "Ground Nothing",
+            skill = "High",
+            probe_category = "ground",
+            probe_country = "RUSSIA",
+        },
+        ["SA-15_Tor_site"] = {
+            unit_type = "Tor 9A331",
+            count = 3,
+            task = "Ground Nothing",
+            skill = "High",
+            probe_category = "ground",
+            probe_country = "RUSSIA",
+        },
+        ["Hawk_site"] = {
+            lead_type = "Hawk tr",
+            unit_type = "Hawk ln",
+            count = 5,
+            task = "Ground Nothing",
+            skill = "High",
+            probe_category = "ground",
+            probe_country = "USA",
+        },
+        ["Roland_site"] = {
+            lead_type = "Roland Radar",
+            unit_type = "Roland ADS",
+            count = 3,
+            task = "Ground Nothing",
+            skill = "High",
+            probe_category = "ground",
+            probe_country = "USA",
+        },
+        -- The Syria theater's strategic-target statics. Both sides own
+        -- targets built from each, so the country is only the one probed.
+        ["command_post_medium"] = {
+            static = true,
+            unit_type = ".Command Center",
+            static_category = "Fortifications",
+            count = 4,
+            spread = 80,
+        },
+        ["airbase_infrastructure_large"] = {
+            static = true,
+            unit_type = "Shelter",
+            static_category = "Fortifications",
+            count = 24,
+            spread = 250,
+        },
+        ["munitions_storage_large"] = {
+            static = true,
+            unit_type = "Warehouse",
+            static_category = "Warehouses",
+            count = 24,
+            spread = 250,
+            probe_country = "USA",
+        },
+        ["fuel_depot_large"] = {
+            static = true,
+            unit_type = "Tank",
+            static_category = "Fortifications",
+            count = 24,
+            spread = 200,
+        },
     },
 
     --- Iterated in this order so a run is reproducible.
     template_order = {"F-16C_strike_jdam", "F-16C_cap", "fuel_depot_medium",
                       "SA-6_Kub_site", "Su-24M_strike_fab",
                       "munitions_storage_medium", "Patriot_site",
-                      "F-16C_sead_harm", "Su-24M_sead_kh58"},
+                      "F-16C_sead_harm", "Su-24M_sead_kh58",
+                      "SA-11_Buk_site", "SA-15_Tor_site", "Hawk_site",
+                      "Roland_site",
+                      "command_post_medium", "airbase_infrastructure_large",
+                      "munitions_storage_large", "fuel_depot_large"},
 
     --- campaign_client.lua: dcs_maps().country
     country = {

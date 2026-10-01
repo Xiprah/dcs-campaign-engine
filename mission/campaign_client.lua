@@ -580,6 +580,83 @@ local TEMPLATES = {
         task = "Ground Nothing",
         skill = "High",
     },
+    -- The Syria theater's content (campaign/theater.py,
+    -- build_syria_theater). Every name below is as unverified as the rest of
+    -- this table until mission/validate_templates.lua has run in the sim.
+    --
+    -- Red's area air defence: the 9S18M1 search radar first, then launchers.
+    -- A 9A310M1 carries its own fire-control radar, so a battery re-issued
+    -- without its search radar can in principle still engage; whether DCS
+    -- agrees is the validator's question.
+    ["SA-11_Buk_site"] = {
+        lead_type = "SA-11 Buk SR 9S18M1",
+        unit_type = "SA-11 Buk LN 9A310M1",
+        count = 5,
+        task = "Ground Nothing",
+        skill = "High",
+    },
+    -- Red's point defence. A Tor vehicle is its own radar and launcher, so
+    -- there is no lead type: every unit lost is one fewer engagement.
+    ["SA-15_Tor_site"] = {
+        unit_type = "Tor 9A331",
+        count = 3,
+        task = "Ground Nothing",
+        skill = "High",
+    },
+    -- Blue's area air defence: the AN/MPQ-46 high-power illuminator first,
+    -- because it is what guides the missiles, then M192 launchers. A DCS
+    -- Hawk site is usually also given its search radar and command post;
+    -- this table has room for one lead type, so whether illuminator and
+    -- launchers alone engage anything is, as for the Patriot, the in-sim
+    -- validator's question. The type names are unverified like the rest.
+    ["Hawk_site"] = {
+        lead_type = "Hawk tr",
+        unit_type = "Hawk ln",
+        count = 5,
+        task = "Ground Nothing",
+        skill = "High",
+    },
+    -- Blue's point defence: a search radar first, as the other batteries
+    -- lead with theirs, then fire units that carry their own.
+    ["Roland_site"] = {
+        lead_type = "Roland Radar",
+        unit_type = "Roland ADS",
+        count = 3,
+        task = "Ground Nothing",
+        skill = "High",
+    },
+    -- Strategic targets. `count` is the most units any target built from
+    -- the template holds: the engine sends fewer for a smaller target, and
+    -- the client refuses more. A ring of 24 at the default 60 m spread
+    -- would overlap, so the large templates spread wider.
+    ["command_post_medium"] = {
+        static = true,
+        unit_type = ".Command Center",
+        static_category = "Fortifications",
+        count = 4,
+        spread = 80,
+    },
+    ["airbase_infrastructure_large"] = {
+        static = true,
+        unit_type = "Shelter",
+        static_category = "Fortifications",
+        count = 24,
+        spread = 250,
+    },
+    ["munitions_storage_large"] = {
+        static = true,
+        unit_type = "Warehouse",
+        static_category = "Warehouses",
+        count = 24,
+        spread = 250,
+    },
+    ["fuel_depot_large"] = {
+        static = true,
+        unit_type = "Tank",
+        static_category = "Fortifications",
+        count = 24,
+        spread = 200,
+    },
 }
 
 --- Categories that fly. Only these carry a payload: a weapons table on a

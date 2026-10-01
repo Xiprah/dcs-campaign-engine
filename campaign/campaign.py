@@ -539,7 +539,11 @@ class Campaign:
         if target is None:
             return self._announce_no_targets(coalition)
         inventory = self.inventories[coalition]
-        bases = sorted(self.theater.airbases_of(coalition), key=lambda b: b.id)
+        # Nearest base first, so a side with several flies each target from
+        # the field closest to it and falls back to the next when that one is
+        # dry. Id order instead flew everything from whichever base sorted
+        # first until it ran out, whatever the geography.
+        bases = self.theater.airbases_nearest(coalition, target.pos)
         for base in bases:
             package_id = self._next_package_id()
             spawn_id = self._next_spawn_id()
