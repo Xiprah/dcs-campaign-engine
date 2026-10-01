@@ -225,7 +225,7 @@ class TestAMissileAndAnAircraftGoneTogether(unittest.TestCase):
     The SA-6 is `ALL_EMITTERS`, so the one paper missile that hits takes a
     unit and leaves a battery that still fires at the strike, as before
     units were typed; against the real SA-6 it takes the radar and the strike
-    throws no exposure dice (docs/design.md, section 6).
+    throws no exposure dice (docs/design.md, section 7).
     """
 
     def setUp(self) -> None:
@@ -354,10 +354,12 @@ class _Ledger:
             (ledger.lost if lost else ledger.expended)[reservation_id] += taken
             return taken
 
-        def spy_release(squadron, reservation_id):
+        def spy_release(squadron, reservation_id, **kwargs):
+            # `landed_at` and anything else release takes are passed through:
+            # what is returned to stock does not depend on them.
             held = squadron.open_reservations.get(reservation_id)
             ledger.returned[reservation_id] += 0 if held is None else held.rounds
-            return release(squadron, reservation_id)
+            return release(squadron, reservation_id, **kwargs)
 
         self.patches = [
             mock.patch.object(Squadron, "debit_munitions", spy_debit),

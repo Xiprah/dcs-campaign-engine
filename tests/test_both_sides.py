@@ -64,7 +64,7 @@ DRAWN = (
 #: depot survives. The default seed is now a blue win, at 4000 s.
 #:
 #: Re-pinned again when site units became typed (docs/design.md, section
-#: 6): a missile that hits now takes the battery's radar, and a blind
+#: 7): a missile that hits now takes the battery's radar, and a blind
 #: battery throws no dice at the strikers, so every TOT after the first hit
 #: draws fewer. Seed 3 is now a red win at 3945 s, and at seed 6 red still
 #: wins at 3945 s but blue's airborne strike flattens the depot afterwards.
@@ -83,7 +83,7 @@ SEED_RED_WINS = 0
 #: was, and seed 20 is the first at which both sides' do.
 #:
 #: Re-pinned from 20 when site units became typed (docs/design.md, section
-#: 6): the first missile to hit a battery now takes its radar, and the
+#: 7): the first missile to hit a battery now takes its radar, and the
 #: slice never repairs one, so a strike element can lose a jet only on the
 #: sorties before its enemy's SEAD has hit anything. At 20 both batteries
 #: are blinded before either strike element loses a jet, and red wins at
@@ -453,7 +453,7 @@ class TestConservationOnBothSides(unittest.TestCase):
 
         Both sites are batteries of forty units that are each their own
         radar, as a Tor's are (`theater.SITE_UNIT_TYPES`). Since units are
-        typed (docs/design.md, section 6) an anti-radiation missile destroys
+        typed (docs/design.md, section 7) an anti-radiation missile destroys
         only a radar, so a battery with one radar is blind after one hit and,
         on the slice, which repairs nothing, stays blind: after that nobody
         loses anything, which is the triviality the forty units are here to

@@ -2394,7 +2394,7 @@ class TestSitesAreBuiltAndReportedByType(unittest.TestCase):
 
     The client counts a ground group's living units by Unit:getTypeName, so
     the engine can tell a dead radar from a dead launcher (docs/design.md,
-    section 6), and builds exactly the units a spawn's `composition` names.
+    section 7), and builds exactly the units a spawn's `composition` names.
     A getTypeName that raises costs that group its type count, never the
     snapshot and never the sim thread; a composition the template cannot
     build is refused in the words tools/fake_dcs.py uses.

@@ -1,6 +1,6 @@
 """Air defences: typed units, blinded sites, and repair.
 
-docs/design.md, section 6. A site's units are a radar and launchers. An
+docs/design.md, section 7. A site's units are a radar and launchers. An
 anti-radiation missile homes on the radar, so a paper ARM kill removes it,
 and a site whose radar is gone cannot engage until it is repaired. While DCS
 is not holding a site the engine repairs it at its theater's rates; while
@@ -580,8 +580,11 @@ class TestTheSyriaWarRepairs(unittest.TestCase):
                 for inventory in campaign.inventories.values():
                     for squadron in inventory.squadrons.values():
                         self.assertEqual(squadron.open_reservations, {}, squadron.id)
+                        # Jets home within the turnaround are neither
+                        # available nor lost (docs/design.md, section 6).
                         self.assertEqual(
-                            squadron.airframes_available + squadron.airframes_lost,
+                            squadron.airframes_available + squadron.airframes_turning
+                            + squadron.airframes_lost,
                             squadron.airframes_total, squadron.id,
                         )
                 # Sites and tracker agree on every surviving battery.

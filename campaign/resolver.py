@@ -32,7 +32,7 @@ never a different roll. A SEAD element whose missile out-ranges a site fires
 from outside its envelope and is never rolled against it: the caller leaves
 that site out of the list it passes :func:`resolve_exposure`, and so does a
 site whose radar is gone, which cannot engage at all (docs/design.md,
-section 6). When SEAD may act on paper at all is docs/design.md, section 5.
+section 7). When SEAD may act on paper at all is docs/design.md, section 5.
 
 **Dice.** How many draws a resolution takes is decided by the situation --
 the geometry, the content, and what earlier steps left alive -- and never by
@@ -140,7 +140,7 @@ def resolve_exposure(
 #: Probability that one anti-radiation missile destroys the radar of the site
 #: it is fired at. Lower than a bomb's: an ARM guides on an emitter rather than
 #: an aimpoint, and a radar that shuts down in time is not where it homes.
-#: Site units are typed (docs/design.md, section 6), so a kill is the radar,
+#: Site units are typed (docs/design.md, section 7), so a kill is the radar,
 #: never a launcher: the caller rolls these against the radars a site has
 #: left and books the kill against its radar type, and a site without one
 #: cannot engage until it is repaired.

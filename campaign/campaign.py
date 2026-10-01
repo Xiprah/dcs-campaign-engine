@@ -44,12 +44,16 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
+import math
 import random
 from collections.abc import Iterable
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from campaign.api import PAPER_STEP
+from campaign.sun import DAY, is_daylight
 from campaign.attrition import (
     KIND_FLIGHT,
     KIND_TARGET,
@@ -76,16 +80,20 @@ from campaign.planner import (
     COMPLETE,
     DESTROYED,
     ENROUTE,
+    FLIGHT_SIZE,
     PLANNED,
     ROLE_SEAD,
     ROLE_STRIKE,
     Element,
     Package,
     build_package,
+    can_strike_from,
     element_heading,
     element_position,
     element_route,
-    select_target,
+    package_schedule,
+    strike_squadron,
+    targets_by_priority,
 )
 from campaign.protocol import (
     DEFAULT_OBSERVER_PERIOD,
@@ -125,13 +133,39 @@ from campaign.theater import (
 #:    reservation, schedule and state (docs/design.md, section 5).
 #: 6: an element carries what the sim spent of its munition (`sim_spent`,
 #:    `ammo_seen`) in place of `sim_contact`; protocol v3 reports it.
-#: 7: threat sites are typed (`units_by_type`, in the theater and the tracker)
+#: 7: the campaign has a local start date and time, the theater a place on
+#:    Earth, and each squadron a sortie rate, airframes in turnaround and a
+#:    count of sorties by day (docs/design.md, section 6).
+#: 8: threat sites are typed (`units_by_type`, in the theater and the tracker)
 #:    and carry repair progress; the theater carries its repair rates, and
 #:    the campaign the clock repair has run to (`repaired_to`).
-SAVE_VERSION = 7
+SAVE_VERSION = 8
 
 #: Default seed. Explicit, because an implicit one is an unseeded one.
 DEFAULT_SEED = 20240923
+
+#: When a new war starts, in the theater's local time: 06:00 on the September
+#: equinox. The equinox because its twelve-hour day is the year's mean, so
+#: the default neither lengthens the flying day as summer would nor shortens
+#: it as winter would; 06:00 because a campaign opens at first light, and on
+#: that date the sun rises over the Syria map about twenty minutes later.
+#: Settable for a new war (`Campaign(start=...)`, `--start`); a save keeps
+#: its own.
+DEFAULT_START = datetime(2025, 9, 22, 6, 0, 0)
+
+#: How far apart the mission's clock and the campaign's may be at `hello`
+#: before it is worth a warning. Coarser than any rounding a mission
+#: generator would apply to an editor start time, and far finer than the
+#: sun's effect on a strike.
+TIME_OF_DAY_TOLERANCE = 60.0
+
+_EPOCH = datetime(1970, 1, 1)
+
+logger = logging.getLogger(__name__)
+
+
+def _format_local(local_epoch: float) -> str:
+    return (_EPOCH + timedelta(seconds=local_epoch)).isoformat(sep=" ", timespec="seconds")
 
 #: Bubble radii. The despawn radius is strictly larger so that an observer
 #: loitering on the boundary cannot thrash the client.
@@ -156,6 +190,7 @@ class Campaign:
         despawn_radius: float = DEFAULT_DESPAWN_RADIUS,
         state_period: float = DEFAULT_STATE_PERIOD,
         observer_period: float = DEFAULT_OBSERVER_PERIOD,
+        start: datetime = DEFAULT_START,
     ) -> None:
         if inventories is None:
             blue, red = build_slice_oob()
@@ -168,6 +203,12 @@ class Campaign:
         self.state_period = state_period
         self.observer_period = observer_period
 
+        if start.tzinfo is not None:
+            raise ValueError("start is local time on the theater's clock, not an aware datetime")
+        #: Local date and time at campaign second zero. Naive on purpose: it
+        #: is the theater's own clock, as a mission's editor time is, and the
+        #: theater's `utc_offset` is the only conversion the engine needs.
+        self.start: datetime = start
         self.seed = seed
         self.rng = random.Random(seed)
         self.tracker = AttritionTracker(vanish_grace=state_period)
@@ -213,6 +254,10 @@ class Campaign:
         #: (`_repair`). Persisted: a reload must neither repeat repair work
         #: nor skip it.
         self.repaired_to: float = 0.0
+        #: Squadron ids held, for one side's planning in one pulse, for a
+        #: target waiting for the sun (`_frag`). Rebuilt every time a side
+        #: plans, so nothing about it outlives the pulse or needs saving.
+        self._held_for_daylight: set[str] = set()
 
         self._ensure_targets_tracked()
 
@@ -247,6 +292,28 @@ class Campaign:
         """
         clock = self.clock if campaign_t is None else campaign_t
         return clock - self.mission_epoch
+
+    def local_epoch(self, campaign_t: float | None = None) -> float:
+        """Local seconds since 1970-01-01 00:00 at a campaign time.
+
+        The theater's clock, in the convention `hello.mission_start_epoch`
+        uses, so a campaign instant and a mission instant compare directly.
+        """
+        clock = self.clock if campaign_t is None else campaign_t
+        return (self.start - _EPOCH).total_seconds() + clock
+
+    def local_day(self, campaign_t: float) -> int:
+        """The local calendar day a campaign time falls on, as days since 1970."""
+        return math.floor(self.local_epoch(campaign_t) / DAY)
+
+    def in_daylight(self, campaign_t: float) -> bool:
+        """Is the sun up over the theater at `campaign_t` (`campaign.sun`)?"""
+        return is_daylight(
+            self.local_epoch(campaign_t),
+            self.theater.latitude,
+            self.theater.longitude,
+            self.theater.utc_offset,
+        )
 
     def _advance(self, mission_t: float) -> None:
         self.clock = max(self.clock, self.campaign_time(mission_t))
@@ -301,6 +368,7 @@ class Campaign:
         # neither jumps forward nor stalls while a restarted mission catches up.
         self.mission_epoch = self.clock - msg.t
         self._advance(msg.t)
+        self._check_mission_clock(msg)
         self.connected = True
         # New connection, new frame stream: seq restarts and any ref still
         # outstanding on the old socket will never be acknowledged.
@@ -329,6 +397,49 @@ class Campaign:
             frames.append(frame)
         frames.extend(self._brief_open_packages())
         return frames
+
+    def _check_mission_clock(self, msg: Hello) -> float | None:
+        """Warn when the mission's local time is not the campaign's.
+
+        A DCS mission always starts at its editor date and time; a persistent
+        campaign is wherever the war has got to. So a mission started at
+        08:00 joins a war at 17:30 with the sun in the wrong place: the
+        players fly in morning light while the engine plans for dusk, and
+        what the daylight rule forbids the engine still sees the sim show.
+        Returns the difference, mission minus campaign, in seconds, or None
+        when the mission did not say when it started.
+
+        Logged, not corrected. The engine cannot move DCS's clock: the
+        protocol has no frame for it, and the mission's time is fixed when
+        the server loads it.
+        TODO(seam): a mission generator or server-side restart that starts
+        each mission at the campaign's local time fixes this at the source.
+        Nothing sent or saved depends on it, so a replay is unaffected.
+        """
+        if not msg.mission_start_epoch:
+            logger.info(
+                "mission did not report its start date and time; cannot "
+                "compare its time of day with the campaign's"
+            )
+            return None
+        mission_now = msg.mission_start_epoch + msg.t
+        campaign_now = self.local_epoch()
+        difference = mission_now - campaign_now
+        if abs(difference) > TIME_OF_DAY_TOLERANCE:
+            # The date matters as well as the hour -- the sun rises at another
+            # time in another season -- but the hour is what a player sees.
+            time_of_day = (difference + DAY / 2) % DAY - DAY / 2
+            logger.warning(
+                "the mission's clock is not the campaign's: mission local time "
+                "%s, campaign local time %s (%+.0f s, %+.0f s in time of day). "
+                "The sun in DCS is not where the engine plans by; start the "
+                "mission at the campaign's time to fix it",
+                _format_local(mission_now),
+                _format_local(campaign_now),
+                difference,
+                time_of_day,
+            )
+        return difference
 
     def _brief_open_packages(self) -> list[Downlink]:
         """Tell a client that has just arrived what is already in the air.
@@ -530,15 +641,23 @@ class Campaign:
         )
 
     def _plan(self) -> list[Downlink]:
-        """Let each side commit at most one package.
+        """Let each side commit every package its ready squadrons can fly.
 
         docs/design.md, section 4: every side plans, under the same rules, and
-        which side humans fly has no say in it.
+        which side humans fly has no say in it. "Sortie rate" in the same
+        document says what bounds how many: readiness, not a count.
 
-        TODO(seam): multi-package deconfliction -- several packages in the air
-        at once, sequenced on time and route -- replaces this "one at a time"
-        rule. Out of scope for the slice.
+        Turnarounds are settled first, on both sides and whether or not the
+        war is over, so the books always say what is ready now.
+
+        TODO(seam): multi-package deconfliction -- packages sequenced against
+        each other on time and route, sharing envelopes and support -- is not
+        built. Until it is, two rules stand in for it: no two open packages
+        against one target, and no squadron in two open packages.
         """
+        for coalition in sorted(self.inventories):
+            for squadron in self.inventories[coalition].squadrons.values():
+                squadron.mature(self.clock)
         if self.war_result is not None:
             return []
         frames: list[Downlink] = []
@@ -546,30 +665,118 @@ class Campaign:
             frames.extend(self._plan_for(coalition))
         return frames
 
+    def _squadron_ready(
+        self, squadron: Squadron, airframes: int, t_takeoff: float, t_tot: float
+    ) -> bool:
+        """May `squadron` fly `airframes` aircraft on an element fragged now?
+
+        Its stock is already known to cover them; this is everything else
+        (docs/design.md, "Sortie rate"): `_squadron_free`, and for a day-only
+        squadron a package time on target in daylight. Airframes still in
+        turnaround are not in `available`, so they never got this far.
+        """
+        return self._squadron_free(
+            squadron, airframes, t_takeoff
+        ) and not self._dark_for(squadron, t_tot)
+
+    def _squadron_free(self, squadron: Squadron, airframes: int, t_takeoff: float) -> bool:
+        """Readiness that does not depend on the hour of the TOT.
+
+        Not while the squadron is in another open package: with nothing to
+        deconflict two packages, one squadron's jets belong to one. Not while
+        it is held, this pulse, for a more important target waiting for the
+        sun (`_frag`). Not past its daily limit on the day the element takes
+        off.
+        """
+        if squadron.open_reservations or squadron.id in self._held_for_daylight:
+            return False
+        left = squadron.sorties_left(self.local_day(t_takeoff))
+        return left is None or left >= airframes
+
+    def _dark_for(self, squadron: Squadron, t_tot: float) -> bool:
+        """Would a time on target at `t_tot` break this squadron's daylight rule?"""
+        return squadron.sortie_rate.day_only and not self.in_daylight(t_tot)
+
     def _plan_for(self, coalition: str) -> list[Downlink]:
-        """Commit one package for `coalition`, unless it has one open.
+        """Commit a package against each target `coalition` is ready to strike.
+
+        Targets in priority order, each from its nearest base whose squadrons
+        are ready, falling back to the next nearest; a target that already
+        has an open package against it is skipped, and the side moves on down
+        its list. So a side flies as many packages at once as it has ready
+        squadrons for.
 
         The planner is shown the enemy sites whose envelopes the strike route
         enters, and attaches a SEAD element when there are any and the base
-        has anti-radiation missiles (docs/design.md, section 5). The sites are
-        the enemy of the planning side, never of `player_coalition`, so red
-        escorts its raids by exactly the rule blue does.
+        has anti-radiation missiles ready (docs/design.md, section 5). The
+        sites are the enemy of the planning side, never of `player_coalition`,
+        so red escorts its raids by exactly the rule blue does.
         """
-        if any(
-            pkg.is_open and pkg.coalition == coalition
-            for pkg in self.packages.values()
-        ):
-            return []
-        target = select_target(self.theater, enemy_of(coalition))
-        if target is None:
+        ranked = targets_by_priority(self.theater, enemy_of(coalition))
+        if not ranked:
             return self._announce_no_targets(coalition)
+        # A set, and only ever asked about membership, so dict order cannot
+        # reach the plan.
+        engaged = {
+            pkg.target_id
+            for pkg in self.packages.values()
+            if pkg.is_open and pkg.coalition == coalition
+        }
+        had_open = bool(engaged)
+        frames: list[Downlink] = []
+        fragged = False
+        self._held_for_daylight = set()
+        for target in ranked:
+            if target.id in engaged:
+                continue
+            committed = self._frag(coalition, target)
+            if committed is not None:
+                frames.extend(committed)
+                fragged = True
+        if fragged or had_open:
+            return frames
+        # Nothing in the air and nothing could be sent. Said only if no base
+        # has the stock for a strike at all: a side whose jets are merely
+        # turning round, out of sorties for the day or waiting for the sun is
+        # keeping the tempo of a war, not running dry.
+        bases = self.theater.airbases_nearest(coalition, ranked[0].pos)
         inventory = self.inventories[coalition]
-        # Nearest base first, so a side with several flies each target from
-        # the field closest to it and falls back to the next when that one is
-        # dry. Id order instead flew everything from whichever base sorted
-        # first until it ran out, whatever the geography.
+        if any(can_strike_from(inventory, base) for base in bases):
+            return frames
+        return self._announce_dry(coalition, bases)
+
+    def _frag(self, coalition: str, target: Target) -> list[Downlink] | None:
+        """Commit one package against `target`, or None if no base is ready.
+
+        Nearest base first, so a side with several flies each target from
+        the field closest to it and falls back to the next when that one
+        cannot send it. Id order instead flew everything from whichever base
+        sorted first until it ran out, whatever the geography.
+
+        Darkness is waited out, not routed around. A base with a squadron
+        free to go, whose TOT would fall in the dark, keeps the target, and
+        that squadron is held for it for the rest of the pulse. Otherwise a
+        farther field's longer leg lands its TOT after sunrise and wins the
+        target, or a less important target with a longer leg takes the
+        squadron first, and every dawn the strikes fly from the wrong fields
+        in the wrong order to beat the sun by a minute. Busy, out of sorties
+        or turning round is a fact about the squadron, and another base's
+        squadron may go instead. At dusk the hold costs a held squadron the
+        last minutes of the day, which no other target could have used from
+        a farther field either.
+        """
+        inventory = self.inventories[coalition]
         bases = self.theater.airbases_nearest(coalition, target.pos)
         for base in bases:
+            t_takeoff, t_tot, _ = package_schedule(base, target, self.clock)
+            waiting = strike_squadron(
+                inventory,
+                base,
+                lambda s: self._squadron_free(s, FLIGHT_SIZE, t_takeoff),
+            )
+            if waiting is not None and self._dark_for(waiting, t_tot):
+                self._held_for_daylight.add(waiting.id)
+                return None
             package_id = self._next_package_id()
             spawn_id = self._next_spawn_id()
             package = build_package(
@@ -580,13 +787,14 @@ class Campaign:
                 target=target,
                 now=self.clock,
                 rng=self.rng,
-                threats=self.theater.live_threats_along(
+                threats=lambda base=base: self.theater.live_threats_along(
                     enemy_of(coalition), base.pos, target.pos
                 ),
                 # Drawn only for an element actually attached, after the
                 # strike's, so a package without one issues exactly the ids a
                 # one-flight package did.
                 next_spawn_id=self._next_spawn_id,
+                ready=self._squadron_ready,
             )
             if package is None:
                 # Nothing was issued, so give the ids back rather than leaving
@@ -596,6 +804,16 @@ class Campaign:
                 continue
             self.packages[package.id] = package
             self._dry_announced.discard(coalition)
+            # Charged when fragged, to the day each element takes off on, so
+            # the next package planned this pulse already sees the count. An
+            # element stood down at the end of the war keeps its charge; by
+            # then nobody plans against it.
+            for element in package.elements:
+                squadron = self._squadron_for(package, element)
+                if squadron is not None:
+                    squadron.count_sorties(
+                        self.local_day(element.t_takeoff), element.flight_size
+                    )
             # Tracked in the order their spawn ids were issued, strike first:
             # the tracker's insertion order is the ledger's, and a replay has
             # to write the same one.
@@ -615,7 +833,7 @@ class Campaign:
                 f"{package.callsign} fragged: {package.composition(sizes=True)} "
                 f"on {target.name}, TOT {self.mission_time(package.t_tot):.0f}.",
             )
-        return self._announce_dry(coalition, bases)
+        return None
 
     def _announce_dry(self, coalition: str, bases: list[Any]) -> list[Downlink]:
         """Say so, once, when a side can no longer task anything.
@@ -856,7 +1074,7 @@ class Campaign:
         """The enemy's engaging sites whose envelopes the package's route enters.
 
         A site whose radar is gone is not among them (docs/design.md, section
-        6): it cannot engage, throws no dice at anyone, and an anti-radiation
+        7): it cannot engage, throws no dice at anyone, and an anti-radiation
         missile has nothing on it to home on. Which sites can engage is read
         afresh at each step of the TOT, so a battery the SEAD element's
         missiles blinded throws nothing at the strikers behind it.
@@ -1003,7 +1221,7 @@ class Campaign:
         and at how many sites -- never on how the dice fall.
 
         An anti-radiation missile homes on an emitter (docs/design.md,
-        section 6): only a site with a radar left is fired at
+        section 7): only a site with a radar left is fired at
         (`_route_threats`), and a hit destroys the radar, never a launcher. A
         missile that hits once the radar is gone has nothing to home on and
         destroys nothing, though it is still rolled.
@@ -1066,7 +1284,7 @@ class Campaign:
         return any(held == spawn_id for _, held in self.pending.values())
 
     def _repair(self) -> list[Downlink]:
-        """Repair air defences DCS is not holding (docs/design.md, section 6).
+        """Repair air defences DCS is not holding (docs/design.md, section 7).
 
         Logistics, not combat, so it is the engine's authority, and only where
         DCS is not: a site DCS holds changes only by snapshot, and accrues no
@@ -1236,12 +1454,21 @@ class Campaign:
         return frames
 
     def _settle(self, package: Package, element: Element) -> None:
-        """Close an element's reservation, returning anything still held."""
+        """Close an element's reservation, returning anything still held.
+
+        Airframes that took off come back through their squadron's
+        turnaround, from now: home on schedule, or scrubbed in the air by a
+        refused spawn. An element stood down before its takeoff never left
+        the ramp, and its airframes are ready at once.
+        """
         squadron = self._squadron_for(package, element)
         if squadron is None:
             return
+        flew = self.clock >= element.t_takeoff
         try:
-            squadron.release(element.reservation_id)
+            squadron.release(
+                element.reservation_id, landed_at=self.clock if flew else None
+            )
         except UnknownReservation:
             return
 
@@ -1706,6 +1933,7 @@ class Campaign:
         return {
             "save_version": SAVE_VERSION,
             "seed": self.seed,
+            "start": self.start.isoformat(),
             "rng_state": [version, list(internal), gauss],
             "clock": self.clock,
             "mission_epoch": self.mission_epoch,
@@ -1746,6 +1974,7 @@ class Campaign:
             despawn_radius=float(raw["despawn_radius"]),
             state_period=float(raw["state_period"]),
             observer_period=float(raw["observer_period"]),
+            start=datetime.fromisoformat(raw["start"]),
         )
         version, internal, gauss = raw["rng_state"]
         campaign.rng.setstate((version, tuple(internal), gauss))

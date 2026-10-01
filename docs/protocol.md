@@ -167,7 +167,7 @@ sends `{}`. Aircraft, ships and statics send none.
 
 Why: an air-defence site's units are not interchangeable. Its radar is what
 an anti-radiation missile homes on and what the battery cannot engage
-without (docs/design.md, section 6), so the engine needs to know whether the
+without (docs/design.md, section 7), so the engine needs to know whether the
 sim destroyed the radar or a launcher, and a bare count cannot say. The
 engine may not guess it from its own paper track either: for a site DCS
 holds the snapshot is the only authority (docs/design.md, section 1).
@@ -387,7 +387,7 @@ One breaking change, in two halves that only work together:
 1. **`state` snapshots carry a ground group's units by type** (`unit_types`;
    see `state`). The engine needs it to know whether the sim destroyed an
    air-defence site's radar or one of its launchers, which decides whether
-   the site can engage (docs/design.md, section 6). A v3 client never sends
+   the site can engage (docs/design.md, section 7). A v3 client never sends
    it, and a v4 engine would book none of a site's losses in the sim; a v3
    engine refuses a snapshot member with a field it does not know, so it
    would close the connection on the first v4 `state` that held a site.

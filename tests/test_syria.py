@@ -70,8 +70,8 @@ CLIENT = ROOT / "mission" / "campaign_client.lua"
 VALIDATOR = ROOT / "mission" / "validate_templates.lua"
 
 DAY = 86_400.0
-#: Long enough for any war on this map to end: they have been measured at
-#: under two days.
+#: Long enough for any war on this map to end: on the sortie-rate model
+#: (docs/design.md, section 6) they have been measured at 50 to 60 hours.
 WAR_LIMIT = 5 * DAY
 #: Several seeds, none chosen for what it does: every assertion below has to
 #: hold for each.
@@ -360,8 +360,23 @@ class TestPlanning(unittest.TestCase):
 
     def test_each_side_flies_its_first_target_from_the_base_nearest_it(self):
         campaign = new_syria()
-        campaign.advance(PAPER_STEP)
-        by_side = {p.coalition: p for p in campaign.packages.values()}
+        first = {side: select_target(campaign.theater, enemy_of(side))
+                 for side in ("blue", "red")}
+
+        # The package against each side's first target. A side frags several
+        # packages at once now, so the last one fragged may be against
+        # another target from a farther base, and at first light the first
+        # target may wait a few steps for the sun (docs/design.md, section 6).
+        def against_first() -> dict:
+            found: dict = {}
+            for package in sorted(campaign.packages.values(), key=lambda p: p.id):
+                if package.target_id == first[package.coalition].id:
+                    found.setdefault(package.coalition, package)
+            return found
+
+        while set(against_first()) != {"blue", "red"} and campaign.clock < 3600.0:
+            campaign.advance(PAPER_STEP)
+        by_side = against_first()
         self.assertEqual(set(by_side), {"blue", "red"})
         for side, package in by_side.items():
             target = campaign.theater.targets[package.target_id]
@@ -463,7 +478,10 @@ def _conservation_problems(campaign: Campaign) -> list[str]:
     for side in sorted(campaign.inventories):
         for squadron in campaign.inventories[side].squadrons.values():
             reserved = sum(r.airframes for r in squadron.open_reservations.values())
-            held = squadron.airframes_available + reserved + squadron.airframes_lost
+            # Airframes home from a sortie and not yet turned round are a
+            # fourth bucket (docs/design.md, section 6).
+            turning = sum(batch.airframes for batch in squadron.turning)
+            held = squadron.airframes_available + reserved + turning + squadron.airframes_lost
             if held != squadron.airframes_total or squadron.airframes_available < 0:
                 problems.append(f"{campaign.clock}: {squadron.id} airframes {held}")
             for munition, total in squadron.munitions_total.items():

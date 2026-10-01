@@ -135,7 +135,7 @@ HARM_RANGE = launch_range("AGM-88C")
 
 #: The slice's SA-6 rebuilt as a battery whose every unit is its own radar,
 #: as a Tor's is (`theater.SITE_UNIT_TYPES`). Since docs/design.md, section
-#: 6, an anti-radiation missile destroys only an emitter, so against the
+#: 7, an anti-radiation missile destroys only an emitter, so against the
 #: real SA-6 -- one radar, four launchers -- the first hit blinds the battery
 #: and no later one destroys anything. The tests that count missiles by the
 #: units they take, and then fly the strike against what is left, are
@@ -863,7 +863,7 @@ class TestMixedAuthority(unittest.TestCase):
     Both batteries are `ALL_EMITTERS`, so that "every missile hits" still
     means one unit a missile and a battery that still engages the strike:
     this is the rule for who may fire what, not the rule for what a missile
-    kills (docs/design.md, section 6, and tests/test_typed_sites.py).
+    kills (docs/design.md, section 7, and tests/test_typed_sites.py).
     """
 
     def _run(
@@ -1217,7 +1217,7 @@ class TestSeadIsWorthFlying(unittest.TestCase):
     placeholder numbers (Pk 0.15, suppression halving it per surviving SEAD
     aircraft) 3 against 26 for blue and 4 against 26 for red -- 7 and 10
     before site units were typed, when a missile that hit took a launcher
-    rather than the battery's radar (docs/design.md, section 6). And, where the
+    rather than the battery's radar (docs/design.md, section 7). And, where the
     SEAD element's missile out-ranges the site it faces, the whole package
     loses fewer aircraft escorted than the strike alone does: the SEAD
     element fires from standoff and takes no exposure, so it costs no

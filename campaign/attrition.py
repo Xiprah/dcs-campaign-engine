@@ -173,7 +173,7 @@ class TrackedGroup:
     #: interchangeable -- an air-defence site's radar and launchers. None for
     #: every other group, which is counted, not typed. When set, its total is
     #: `units_alive`, and it is what a snapshot's `unit_types` is reconciled
-    #: against (docs/design.md, section 6).
+    #: against (docs/design.md, section 7).
     units_by_type: dict[str, int] | None = None
 
     @property
