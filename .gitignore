@@ -3,3 +3,7 @@ __pycache__/
 *.miz
 saves/
 .venv/
+# tools/build_exe.py output and its toolchain (docs/building.md)
+build/
+dist/
+.venv-build/
