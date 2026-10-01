@@ -235,6 +235,14 @@ the sandbox is gone for everything, and it stays gone.
   omitted from it, and a `despawn` sends a state report *before* destroying the
   group. Destroying first would turn a flight recalled from the bubble into a
   combat loss.
+- **Reports ammunition** for every aircraft group in each state report
+  (protocol v3): what `Unit.getAmmo` says is aboard its living units, summed
+  per weapon and named through the `WEAPON_NAMES` table, beside the same
+  reading taken when the group was built. The engine fires on paper only the
+  SEAD missiles the sim has not. A `getAmmo` that raises costs that group its
+  count for that report, never the report. The type names in `WEAPON_NAMES`
+  are unverified; `validate_templates.lua`'s `ammo.*` cases record DCS's own
+  (VALIDATION.md, section 4a).
 - **Reports events** as attribution only, and filters them hard: an event is
   sent only when an engine-owned entity is the initiator or target. Dropping
   events is safe by design — the campaign must reach identical state with every
@@ -297,7 +305,7 @@ These are deliberate for the first vertical slice, not oversights:
 | `load mission/json.lua before this file` | trigger actions are in the wrong order |
 | `unknown template: X` in an `ack` | the engine asked for a template that is not in `TEMPLATES` |
 | `units N exceeds template X capacity of C` in an `ack` | the engine issued a bigger group than `TEMPLATES[X].count` holds; raise `count` or fix the engine's flight size — the client will not clamp |
-| `bad units: ...` in an `ack` | the spawn carried no unit count, or not a positive integer; protocol 2 requires one, so this is an engine bug |
+| `bad units: ...` in an `ack` | the spawn carried no unit count, or not a positive integer; protocol 2 and later require one, so this is an engine bug |
 | `engine speaks protocol N` | version mismatch; the engine closes the connection and the client backs off to `reconnect_max` |
 | `CONFIG.host must be an IPv4 address` | `host` was overridden with a name; resolving one would block the sim thread, so the client refuses to dial it — use the address |
 | nothing at all in `dcs.log` | the trigger never fired — a `MISSION START` rule must carry **no condition**; `TIME MORE (1)` is false at mission start and the rule is never evaluated again |

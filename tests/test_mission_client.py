@@ -39,6 +39,9 @@ The tests are ordered by what they would catch:
   `campaign/protocol.py`'s own decoder.
 * `TestAnAttritedEntityComesBackAttrited` -- re-instantiation must not hand
   the campaign back an airframe it has already written off.
+* `TestAmmunitionIsReported` -- what Unit:getAmmo says is aboard reaches the
+  engine summed and named, and a getAmmo that raises costs one count, never
+  the snapshot.
 * `TestClientRefusesBadSpawns`, `TestSpawnShapes`, `TestFramingAndBackpressure`,
   `TestNonBlockingDiscipline`, `TestEventsAndObservers`,
   `TestReloadingTheScript`, `TestHelloCarriesTheMissionEpoch`,
@@ -1452,6 +1455,22 @@ class TestNonBlockingDiscipline(unittest.TestCase):
         )
         self.assertEqual(mission.engine.uplink_of(Hello)[0].protocol, PROTOCOL_VERSION)
 
+    def test_a_version_2_engine_is_refused(self):
+        """A v2 engine has never heard of ammunition: it would read every
+        snapshot as carrying none and resolve on paper what the sim fired."""
+        mission = sortie_with_observer_over_the_target()
+        self.addCleanup(mission.close)
+        mission.engine.mute = True
+        mission.run_until(lambda m: bool(m.engine.uplink_of(Hello)), limit=60.0)
+        mission.engine.send([Sync(seq=1, t=0.0, campaign_time=0.0, protocol=2)])
+        mission.step(3)
+        self.assertFalse(mission.mock.status()["synced"], "the client served a v2 engine")
+        self.assertTrue(
+            any("engine speaks protocol 2" in msg for msg in mission.mock.logs("error")),
+            mission.mock.logs(),
+        )
+        self.assertEqual(mission.engine.uplink_of(Hello)[0].protocol, 3)
+
     def test_a_protocol_mismatch_tears_the_connection_down(self):
         mission = sortie_with_observer_over_the_target()
         self.addCleanup(mission.close)
@@ -2195,6 +2214,160 @@ class TestFramingAndBackpressure(unittest.TestCase):
             any("outbox full" in msg for msg in mission.mock.logs("error")),
             mission.mock.logs(),
         )
+
+
+@requires_lua
+class TestAmmunitionIsReported(unittest.TestCase):
+    """Protocol v3: a snapshot says what each flight still carries.
+
+    The mock has no weapons model; a test loads a unit type and empties a
+    pylon by hand. What is checked is the client's arithmetic and its
+    conduct: the sum over living units, the engine's names for the weapons
+    it knows and DCS's own for the rest, the gun left out, the spawn-time
+    reading reported as the baseline, and a getAmmo that raises costing
+    that group its count -- never the snapshot, and never the sim thread.
+    """
+
+    HARM = "weapons.missiles.AGM_88"
+    LOADOUT = [
+        (HARM, 2, 4),
+        ("weapons.missiles.AIM_120C", 2, 1),
+        ("weapons.shells.M61_20_HE", 510, 0),
+    ]
+
+    def setUp(self) -> None:
+        self.mission = Mission(observer_pos=NOWHERE)
+        self.addCleanup(self.mission.close)
+        self.mission.run_until(lambda m: m.mock.status()["synced"], limit=60.0)
+        self.assertEqual(self.mission.mock.status()["live_spawns"], 0)
+        self.mission.mock.load_ammo("F-16C_50", self.LOADOUT)
+        self.ref = 8000
+
+    def spawn(self, spawn_id: str, **overrides) -> Ack:
+        self.ref += 1
+        fields = dict(
+            seq=self.ref,
+            t=self.mission.mock.time,
+            ref=self.ref,
+            spawn_id=spawn_id,
+            coalition="blue",
+            category="plane",
+            template="F-16C_sead_harm",
+            units=2,
+            position=(1000.0, 5000.0, 2000.0),
+            heading=0.0,
+            route=[],
+            tasking={},
+        )
+        fields.update(overrides)
+        self.mission.engine.send([Spawn(**fields)])
+        self.mission.step(3)
+        acks = [a for a in self.mission.engine.uplink_of(Ack) if a.ref == self.ref]
+        self.assertTrue(acks, f"no ack for {spawn_id}")
+        return acks[-1]
+
+    def next_snapshot(self, spawn_id: str):
+        """The group's entry in the next state report the client sends."""
+        sent = len(self.mission.engine.uplink_of(StateReport))
+        self.mission.run_until(
+            lambda m: len(m.engine.uplink_of(StateReport)) > sent, limit=self.mission.mock.time + 60.0
+        )
+        reports = self.mission.engine.uplink_of(StateReport)
+        self.assertGreater(len(reports), sent, "no state report was sent")
+        groups = [g for g in reports[-1].groups if g.spawn_id == spawn_id]
+        self.assertEqual(len(groups), 1, reports[-1])
+        return groups[0]
+
+    def test_what_is_aboard_is_summed_over_the_units_and_named_for_the_engine(self):
+        self.assertTrue(self.spawn("beef").ok)
+        snap = self.next_snapshot("beef")
+        # The HARM under the engine's name, a weapon the table does not know
+        # under DCS's own so a miss is visible, and the gun not at all.
+        expected = {"AGM-88C": 4, "weapons.missiles.AIM_120C": 4}
+        self.assertEqual(snap.ammo, expected)
+        self.assertEqual(snap.ammo_initial, expected)
+        self.mission.assert_lua_was_clean(self)
+
+    def test_a_missile_fired_comes_off_the_count_and_the_baseline_stays(self):
+        self.assertTrue(self.spawn("beef").ok)
+        self.assertEqual(self.mission.mock.fire_weapon("cmp_beef_1", self.HARM, 1), 1)
+        snap = self.next_snapshot("beef")
+        self.assertEqual(snap.ammo["AGM-88C"], 3)
+        self.assertEqual(snap.ammo_initial["AGM-88C"], 4)
+        self.assertEqual(self.mission.mock.fire_weapon("cmp_beef_1", self.HARM, 5), 1)
+        self.assertEqual(self.mission.mock.fire_weapon("cmp_beef_2", self.HARM, 2), 2)
+        snap = self.next_snapshot("beef")
+        # DCS stops listing a weapon none of the group carries any more.
+        self.assertEqual(snap.ammo, {"weapons.missiles.AIM_120C": 4})
+        self.assertEqual(snap.ammo_initial["AGM-88C"], 4)
+
+    def test_an_aircraft_lost_takes_its_load_out_of_the_count(self):
+        self.assertTrue(self.spawn("beef").ok)
+        self.mission.mock.kill_unit("cmp_beef_2")
+        snap = self.next_snapshot("beef")
+        self.assertEqual(snap.units, 1)
+        self.assertEqual(snap.ammo["AGM-88C"], 2)
+        self.assertEqual(snap.ammo_initial["AGM-88C"], 4)
+        self.mission.mock.kill_unit("cmp_beef_1")
+        snap = self.next_snapshot("beef")
+        self.assertEqual((snap.alive, snap.units, snap.ammo), (False, 0, {}))
+
+    def test_an_empty_jet_reports_an_empty_count_not_none(self):
+        """DCS today: the pylons are empty and getAmmo answers nil."""
+        self.assertTrue(self.spawn("cafe", coalition="red", template="Su-24M_sead_kh58").ok)
+        snap = self.next_snapshot("cafe")
+        self.assertEqual((snap.ammo, snap.ammo_initial), ({}, {}))
+
+    def test_a_getammo_that_raises_costs_that_group_its_count_and_nothing_else(self):
+        self.assertTrue(self.spawn("beef").ok)
+        self.assertTrue(self.spawn("f00d").ok)
+        self.mission.mock.fail_get_ammo("cmp_beef_2")
+        snap = self.next_snapshot("beef")
+        # Reported, alive and counted -- only the ammunition is withheld,
+        # because a sum missing one jet would read as missiles fired.
+        self.assertEqual((snap.alive, snap.units), (True, 2))
+        self.assertIsNone(snap.ammo)
+        self.assertEqual(snap.ammo_initial["AGM-88C"], 4)
+        other = [g for g in self.mission.engine.uplink_of(StateReport)[-1].groups
+                 if g.spawn_id == "f00d"][0]
+        self.assertEqual(other.ammo["AGM-88C"], 4)
+        self.mission.assert_lua_was_clean(self)
+        self.assertTrue(self.mission.mock.status()["synced"])
+
+        self.mission.mock.fail_get_ammo("cmp_beef_2", False)
+        self.assertEqual(self.next_snapshot("beef").ammo["AGM-88C"], 4)
+
+    def test_a_getammo_that_raises_at_spawn_leaves_no_baseline_and_still_spawns(self):
+        self.mission.mock.fail_get_ammo("cmp_d00d_1")
+        self.assertTrue(self.spawn("d00d").ok)
+        self.mission.mock.fail_get_ammo("cmp_d00d_1", False)
+        snap = self.next_snapshot("d00d")
+        self.assertIsNone(snap.ammo_initial)
+        self.assertEqual(snap.ammo["AGM-88C"], 4)
+        self.mission.assert_lua_was_clean(self)
+
+    def test_without_getammo_at_all_the_snapshot_still_goes_out(self):
+        self.mission.mock.without_get_ammo()
+        self.assertTrue(self.spawn("beef").ok)
+        snap = self.next_snapshot("beef")
+        self.assertEqual((snap.alive, snap.units), (True, 2))
+        self.assertIsNone(snap.ammo)
+        self.assertIsNone(snap.ammo_initial)
+        self.mission.assert_lua_was_clean(self)
+
+    def test_statics_and_ground_groups_report_no_ammunition(self):
+        self.assertTrue(self.spawn(
+            "5a60", coalition="red", category="ground", template="SA-6_Kub_site",
+            units=5, tasking={"kind": "air_defence"},
+        ).ok)
+        self.assertTrue(self.spawn(
+            "70f0", coalition="red", category="structure", template="fuel_depot_medium",
+            units=4, tasking={"kind": "static"},
+        ).ok)
+        for spawn_id in ("5a60", "70f0"):
+            snap = self.next_snapshot(spawn_id)
+            self.assertIsNone(snap.ammo, spawn_id)
+            self.assertIsNone(snap.ammo_initial, spawn_id)
 
 
 @requires_lua

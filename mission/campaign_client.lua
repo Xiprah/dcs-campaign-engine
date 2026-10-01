@@ -99,7 +99,7 @@ if type(_G.CAMPAIGN_CLIENT_CONFIG) == "table" then
     for k, v in pairs(_G.CAMPAIGN_CLIENT_CONFIG) do CONFIG[k] = v end
 end
 
-local PROTOCOL_VERSION = 2
+local PROTOCOL_VERSION = 3
 local MAX_FRAME_BYTES = 64 * 1024
 local MAX_FRAMES_PER_TICK = CONFIG.max_frames_per_tick
 local OWNED_PREFIX = "cmp_"
@@ -587,6 +587,75 @@ local TEMPLATES = {
 local AIRBORNE = {plane = true, airplane = true, helicopter = true}
 
 -- ------------------------------------------------------------------
+-- Ammunition
+--
+-- The engine's munition name for each weapon type name DCS reports in
+-- Unit:getAmmo()'s desc.typeName. A state snapshot sums what is aboard under
+-- these names (docs/protocol.md, `ammo`), and the engine withholds from the
+-- paper exactly what has left the sim, so a wrong key is a missile fired
+-- twice once the pylons are loaded.
+--
+-- UNVERIFIED. Every key below is a guess at DCS content nobody has read out
+-- of a running sim. mission/validate_templates.lua's `ammo.*` cases record
+-- the type names DCS actually reports and whether this table knows them;
+-- settle it from that run before trusting any of it. A type name missing
+-- here is reported under its own DCS name rather than dropped, so a miss is
+-- visible in the snapshot instead of silently reading as an empty pylon.
+-- The pylons are empty today (see TEMPLATES), so nothing is reported under
+-- any of these until a loadout is filled in.
+-- ------------------------------------------------------------------
+
+local WEAPON_NAMES = {
+    ["weapons.missiles.AGM_88"] = "AGM-88C",
+    ["AGM_88"] = "AGM-88C",
+    ["weapons.missiles.X_58"] = "Kh-58U",
+    ["X_58"] = "Kh-58U",
+    ["weapons.bombs.GBU_38"] = "GBU-38",
+    ["GBU_38"] = "GBU-38",
+    ["weapons.bombs.FAB_500"] = "FAB-500",
+    ["FAB_500"] = "FAB-500",
+}
+
+--- Weapon desc.category of the internal gun. Its shells are not ordnance the
+--- engine reserves, and counting them would change every snapshot of a
+--- flight that strafed.
+local SHELL = 0
+
+--- Rounds aboard `units`, per engine munition name, as a JSON object.
+---
+--- Returns nil -- reported as nothing at all, which the engine reads as an
+--- unvouched count -- when any unit's getAmmo raises or answers something
+--- that is not a list of {count, desc}. A partial sum would read as missiles
+--- fired that were never fired, or the reverse; never guess. A nil answer is
+--- DCS's way of saying a unit carries nothing, and counts as empty.
+local function read_ammo(units)
+    local total = json.object({})
+    for i = 1, #units do
+        local u = units[i]
+        local ok, ammo = pcall(function() return u:getAmmo() end)
+        if not ok then return nil end
+        if ammo ~= nil then
+            if type(ammo) ~= "table" then return nil end
+            for j = 1, #ammo do
+                local entry = ammo[j]
+                local desc = type(entry) == "table" and entry.desc or nil
+                local count = type(entry) == "table" and entry.count or nil
+                if type(desc) ~= "table" or type(desc.typeName) ~= "string"
+                   or type(count) ~= "number" or count < 0
+                   or count ~= math.floor(count) then
+                    return nil
+                end
+                if desc.category ~= SHELL then
+                    local name = WEAPON_NAMES[desc.typeName] or desc.typeName
+                    total[name] = (total[name] or 0) + count
+                end
+            end
+        end
+    end
+    return total
+end
+
+-- ------------------------------------------------------------------
 -- Spawn
 -- ------------------------------------------------------------------
 
@@ -1025,6 +1094,16 @@ local function handle_spawn(frame)
         end
     end
 
+    -- Read before the first tick can fire anything: the engine counts what
+    -- the sim spends from here, and a baseline taken at the first state
+    -- report would miss whatever went in the seconds before it.
+    local ammo_initial = nil
+    if not tmpl.static and AIRBORNE[frame.category] then
+        local grp = try(Group.getByName, name)
+        local members = grp and try(grp.getUnits, grp) or {}
+        ammo_initial = read_ammo(members)
+    end
+
     S.spawns[sid] = {
         name = name,
         names = names,
@@ -1035,6 +1114,7 @@ local function handle_spawn(frame)
         -- aircraft a short while after they land, and without this the client
         -- would report a flight that made it home as a flight that died.
         landed = {},
+        ammo_initial = ammo_initial,
     }
 
     log_info("spawned " .. name .. " from " .. tostring(frame.template)
@@ -1097,6 +1177,13 @@ local function snapshot_of(sid, rec)
     local recovered, recovered_names = 0, rec.landed or {}
     for _ in pairs(recovered_names) do recovered = recovered + 1 end
 
+    -- Ammunition is reported for aircraft only, and only where every unit
+    -- counted in `units` could be read; otherwise it is left out, never
+    -- guessed. The spawn-time reading goes with every snapshot so the engine
+    -- has its baseline even if the first report comes after a shot.
+    local airborne = AIRBORNE[rec.category]
+    if airborne then snap.ammo_initial = rec.ammo_initial end
+
     local grp = try(Group.getByName, rec.name)
     if not (grp and try(grp.isExist, grp)) then
         -- Gone with no event is the case snapshots exist to catch. Report
@@ -1104,6 +1191,9 @@ local function snapshot_of(sid, rec)
         -- in which case it is at an airbase, not at the bottom of a crater.
         snap.units = math.min(recovered, rec.units_initial)
         snap.alive = snap.units > 0
+        -- Nobody left to read, and a jet DCS deleted after landing cannot
+        -- say what it brought home.
+        if airborne and snap.units == 0 then snap.ammo = json.object({}) end
         return snap
     end
 
@@ -1113,10 +1203,12 @@ local function snapshot_of(sid, rec)
     local units = try(grp.getUnits, grp) or {}
     local alive, first = 0, nil
     local present = {}
+    local living = {}
     for i = 1, #units do
         local u = units[i]
         if u and try(u.isExist, u) then
             alive = alive + 1
+            living[#living + 1] = u
             local uname = try(u.getName, u)
             if uname then present[uname] = true end
             if not first then first = try(u.getPoint, u) end
@@ -1126,13 +1218,18 @@ local function snapshot_of(sid, rec)
     -- A landed aircraft DCS has already deleted is still an aircraft we have.
     -- Only count the ones no longer in the unit list, or a jet that landed and
     -- is still sitting there would be counted twice.
+    local deleted = 0
     for uname in pairs(recovered_names) do
-        if not present[uname] then alive = alive + 1 end
+        if not present[uname] then
+            alive = alive + 1
+            deleted = deleted + 1
+        end
     end
 
     snap.units = math.min(alive, rec.units_initial)
     snap.alive = snap.units > 0
     if first then snap.pos = json.array({first.x, first.y, first.z}) end
+    if airborne and deleted == 0 then snap.ammo = read_ammo(living) end
     return snap
 end
 
@@ -1908,6 +2005,7 @@ end
 M.CONFIG = CONFIG
 M.TEMPLATES = TEMPLATES
 M.SEAD_TARGET_TYPES = SEAD_TARGET_TYPES
+M.WEAPON_NAMES = WEAPON_NAMES
 
 -- Reloading this file (a second DO SCRIPT FILE, or a mission restart
 -- inside one DCS session) must not leave two clients fighting over one

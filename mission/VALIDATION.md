@@ -63,7 +63,10 @@ out one crash at a time, a week apart, in the middle of a sortie.
 - **whether a named weapon CLSID actually loads**, by reading `Unit.getAmmo`
   off the spawned jet rather than trusting that the spawn succeeded. An
   unknown CLSID is not an error in DCS — it yields an empty pylon, which is
-  exactly how a strike package ends up unarmed with nobody noticing.
+  exactly how a strike package ends up unarmed with nobody noticing;
+- **what DCS calls the SEAD elements' missiles** in `Unit.getAmmo`'s
+  `desc.typeName`, and whether the client's `WEAPON_NAMES` table reports
+  them under the engine's names (`ammo.*`, section 4a).
 
 **It cannot tell you:**
 
@@ -210,6 +213,42 @@ A CLSID that comes back `OK` here is one you can paste into
 `campaign_client.lua`'s `TEMPLATES` with confidence. That is the point of the
 exercise.
 
+## 4a. The weapon type names
+
+Since protocol v3 every `state` snapshot carries the ammunition aboard each
+flight (docs/protocol.md, `state`), and the engine fires on paper only the
+SEAD missiles the sim has not (docs/design.md, section 5). The client reports
+each weapon under the engine's name for it — `AGM-88C`, `Kh-58U` — through
+one table, `WEAPON_NAMES`, keyed by the type name `Unit.getAmmo` gives in
+`desc.typeName`. **Every key in it is a guess.** A wrong one does not fail:
+the missile is reported under DCS's own name, the engine sees no `AGM-88C`
+leave the sim, and once the pylons are loaded it would fire on paper a
+missile DCS already fired.
+
+| id | what it is | required |
+|---|---|---|
+| `ammo.F-16C_sead_harm` | an F-16C (USA) with a candidate AGM-88C CLSID on a pylon; records every non-gun type name aboard and what `WEAPON_NAMES` maps it to. | no |
+| `ammo.Su-24M_sead_kh58` | the same for a Su-24M (RUSSIA) with a candidate Kh-58U CLSID. | no |
+
+`OK` means DCS loaded the missile and the table reports it as the engine's
+munition. `REJECTED` means it loaded under a type name the table does not
+know: the `type_names` detail is the key to add, as `"<name>" = "AGM-88C"`.
+`UNKNOWN` means the pylon stayed empty, so DCS named nothing; fix the CLSID
+first (section 4), with `CAMPAIGN_VALIDATE_CONFIG.ammo_probes`:
+
+```lua
+CAMPAIGN_VALIDATE_CONFIG = {
+    ammo_probes = {
+        {template = "F-16C_sead_harm", munition = "AGM-88C", country = "USA",
+         clsid = "{CLSID-FROM-YOUR-EXPORT}", pylon = 3},
+    },
+}
+```
+
+They are not required while the client's pylons are empty — nothing is
+reported under any of these names until a loadout is filled in — but they
+should be `OK` before one is.
+
 ---
 
 ## 5. Reading the result
@@ -275,6 +314,9 @@ worse than no run.
 - the client also exports `CampaignClient.SEAD_TARGET_TYPES`, the attribute
   names in a SEAD element's `EngageTargets` task, and `SPEC.sead_target_types`
   is cross-checked against it the same way (`drift.sead_target_types`);
+- and `CampaignClient.WEAPON_NAMES`, which `SPEC.weapon_names` mirrors so the
+  `ammo.*` cases judge the table the client actually reports with
+  (`drift.weapon_names`), entry by entry;
 - `tests/test_validation.py` asserts the same equality offline, so drift
   turns the test suite red rather than quietly invalidating a DCS run;
 - the country map, the group task strings, the waypoint action table, the

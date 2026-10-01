@@ -67,6 +67,18 @@ UPLINK_SAMPLES = [
                 pos=(41000.0, 3000.0, -88000.0),
             ),
             GroupSnapshot(spawn_id="7c02", alive=False, units=0, units_initial=4),
+            GroupSnapshot(
+                spawn_id="b311",
+                alive=True,
+                units=2,
+                units_initial=2,
+                ammo={"AGM-88C": 3, "weapons.missiles.AIM_9": 2},
+                ammo_initial={"AGM-88C": 4, "weapons.missiles.AIM_9": 2},
+            ),
+            GroupSnapshot(
+                spawn_id="b312", alive=True, units=2, units_initial=2,
+                ammo={}, ammo_initial={},
+            ),
         ],
     ),
     StateReport(seq=42, t=860.0),
@@ -239,10 +251,13 @@ class RejectionTests(unittest.TestCase):
 
 
 class Version2Tests(unittest.TestCase):
-    """What protocol 2 changed on the wire. docs/protocol.md, Changes from v1."""
+    """What protocol 2 changed on the wire. docs/protocol.md, Changes from v1.
 
-    def test_the_version_is_2(self) -> None:
-        self.assertEqual(PROTOCOL_VERSION, 2)
+    Still the wire in v3, which only adds to the snapshot.
+    """
+
+    def test_the_version_is_3(self) -> None:
+        self.assertEqual(PROTOCOL_VERSION, 3)
 
     def test_a_spawn_without_a_unit_count_does_not_decode(self) -> None:
         """`units` is required. A v1-shaped spawn is malformed, not a guess."""
@@ -266,6 +281,62 @@ class Version2Tests(unittest.TestCase):
             del waypoint["airdrome_id"]
         absent = decode_downlink(json.dumps(raw))
         self.assertEqual([wp.airdrome_id for wp in absent.route], [None, None])
+
+
+class Version3Tests(unittest.TestCase):
+    """What protocol 3 changed on the wire. docs/protocol.md, Changes from v2."""
+
+    @staticmethod
+    def state(**member: object) -> bytes:
+        group = {"spawn_id": "b311", "alive": True, "units": 2, "units_initial": 2}
+        group.update(member)
+        return json.dumps(
+            {"type": "state", "seq": 1, "t": 0.0, "groups": [group]}
+        ).encode("utf-8")
+
+    def test_ammunition_round_trips_per_weapon(self) -> None:
+        decoded = decode_uplink(
+            self.state(ammo={"AGM-88C": 3}, ammo_initial={"AGM-88C": 4})
+        )
+        (group,) = decoded.groups
+        self.assertEqual(group.ammo, {"AGM-88C": 3})
+        self.assertEqual(group.ammo_initial, {"AGM-88C": 4})
+        self.assertEqual(decode_uplink(encode(decoded)), decoded)
+
+    def test_an_empty_count_is_nothing_aboard_and_stays_an_object(self) -> None:
+        (group,) = decode_uplink(self.state(ammo={}, ammo_initial={})).groups
+        self.assertEqual((group.ammo, group.ammo_initial), ({}, {}))
+
+    def test_ammunition_is_optional_and_null_means_none(self) -> None:
+        """A static, a ground group, or a count the client could not read."""
+        for member in ({}, {"ammo": None, "ammo_initial": None}, {"ammo": None}):
+            with self.subTest(member=member):
+                (group,) = decode_uplink(self.state(**member)).groups
+                self.assertIsNone(group.ammo)
+                if "ammo_initial" not in member:
+                    self.assertIsNone(group.ammo_initial)
+
+    def test_a_malformed_ammunition_field_is_a_protocol_error(self) -> None:
+        """Ground truth, so refused rather than repaired, like any snapshot."""
+        junk = [
+            [4],
+            "AGM-88C",
+            4,
+            True,
+            {"AGM-88C": "4"},
+            {"AGM-88C": 3.5},
+            {"AGM-88C": 3.0},
+            {"AGM-88C": -1},
+            {"AGM-88C": True},
+            {"AGM-88C": None},
+            {"AGM-88C": [3]},
+            {"": 3},
+        ]
+        for field in ("ammo", "ammo_initial"):
+            for value in junk:
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(ProtocolError):
+                        decode_uplink(self.state(**{field: value}))
 
 
 class EventNamesAreStringsOrNothing(unittest.TestCase):

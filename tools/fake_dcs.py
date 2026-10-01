@@ -23,6 +23,13 @@ Three flags earn their keep:
     restart does. The client then knows nothing: the engine re-issues every
     spawn that should be live, which is what makes a campaign survive the sim.
 
+``--loadout N``, ``--sead-shots N``
+    What each aircraft carries of its template's munition, and how many
+    missiles a SEAD pass fires. Snapshots report the ammunition aboard, as
+    the Lua client reads it through Unit.getAmmo, and a pass that fires
+    nothing destroys nothing. ``--loadout 0`` is DCS as it is today, with
+    the client's pylons empty.
+
 Nothing here reads a wall clock for simulation purposes; mission time advances
 in fixed steps, and ``--speed`` only decides how fast those steps are paced.
 
@@ -106,6 +113,15 @@ DEFENDERS: dict[str, tuple[tuple[str, ...], str]] = {
 #: What a SEAD element fires, by its coalition. Attribution only, like
 #: DEFENDERS: the engine never learns a thing from it.
 ANTI_RADIATION: dict[str, str] = {"blue": "AGM-88C", "red": "Kh-58U"}
+#: The munition each air template carries, under the engine's name for it --
+#: what the Lua client reports once its WEAPON_NAMES table has mapped DCS's
+#: type name. `--loadout` says how many an aircraft carries.
+TEMPLATE_MUNITION: dict[str, str] = {
+    "F-16C_strike_jdam": "GBU-38",
+    "Su-24M_strike_fab": "FAB-500",
+    "F-16C_sead_harm": "AGM-88C",
+    "Su-24M_sead_kh58": "Kh-58U",
+}
 #: Inbound frames handled per sim tick, mirroring the real client's cap.
 MAX_FRAMES_PER_TICK = 32
 _AIR_CATEGORIES = frozenset({"plane", "helicopter"})
@@ -144,6 +160,11 @@ class Config:
     flight_losses: int = 1
     sead_kills: int = 0
     sead_range: float = 25_000.0
+    #: Rounds of its template's munition each aircraft is built with. The
+    #: engine reserves two an aircraft; zero is the empty pylons DCS has.
+    loadout: int = 2
+    #: Missiles a SEAD pass fires, at most what it carries; None fires all.
+    sead_shots: int | None = None
     dead_linger: int = 1
     takeoff_delay: float = 5.0
     spawn_timeout: float = 900.0
@@ -175,6 +196,11 @@ class SimGroup:
     #: Logged once, not every step, when a strike cannot resolve for want of a
     #: target the engine has not instantiated.
     warned_no_target: bool = False
+    #: Rounds aboard per weapon, summed over the living aircraft, and what was
+    #: aboard when the group was built. None for anything that is not an
+    #: aircraft, which the client reports no ammunition for either.
+    ammo: dict[str, int] | None = None
+    ammo_initial: dict[str, int] | None = None
 
     @property
     def name(self) -> str:
@@ -373,6 +399,12 @@ class FakeDCS:
             return
         tasking = dict(frame.tasking)
         units = int(frame.units)
+        ammo: dict[str, int] | None = None
+        if frame.category in _AIR_CATEGORIES:
+            munition = TEMPLATE_MUNITION.get(frame.template)
+            ammo = {}
+            if munition is not None and self.cfg.loadout > 0:
+                ammo[munition] = units * self.cfg.loadout
         group = SimGroup(
             spawn_id=frame.spawn_id,
             coalition=frame.coalition,
@@ -389,6 +421,8 @@ class FakeDCS:
             # again when the bubble re-instantiates it. spawn_id is stable for
             # the life of the entity, so this survives a reconnect too.
             resolved=frame.spawn_id in self.struck,
+            ammo=ammo,
+            ammo_initial=None if ammo is None else dict(ammo),
         )
         self.groups[frame.spawn_id] = group
         self.saw_spawn = True
@@ -565,7 +599,23 @@ class FakeDCS:
         flight.resolved = True
         self.struck.add(flight.spawn_id)
         weapon = ANTI_RADIATION.get(flight.coalition, "AGM-88C")
-        for site in in_range:
+        munition = TEMPLATE_MUNITION.get(flight.template)
+        carried = (flight.ammo or {}).get(munition, 0) if munition else 0
+        shots = carried
+        if self.cfg.sead_shots is not None:
+            shots = min(carried, max(0, self.cfg.sead_shots))
+        if munition is not None and flight.ammo is not None:
+            self._expend(flight, munition, shots)
+        if shots == 0:
+            # No more forgiving than DCS: a jet with empty pylons makes its
+            # pass and destroys nothing.
+            log.info("SEAD at t=%.0f: %s carries nothing to fire", self.t, flight.name)
+        for index, site in enumerate(in_range):
+            # Shared over the sites in reach in the order they were named, as
+            # the engine shares its paper missiles.
+            missiles = shots // len(in_range) + (1 if index < shots % len(in_range) else 0)
+            if missiles == 0:
+                continue
             await self._emit_event(
                 "shot", initiator=flight.name, target=site.name, weapon=weapon
             )
@@ -586,6 +636,7 @@ class FakeDCS:
                     "t": self.t,
                     "flight": flight.name,
                     "site": site.name,
+                    "missiles": missiles,
                     "site_units_killed": before - site.units,
                     "site_alive": site.alive,
                 }
@@ -603,6 +654,10 @@ class FakeDCS:
         flight.resolved = True
         self.struck.add(flight.spawn_id)
         cfg = self.cfg
+        munition = TEMPLATE_MUNITION.get(flight.template)
+        carried = (flight.ammo or {}).get(munition, 0) if munition else 0
+        if munition is not None and flight.ammo is not None:
+            self._expend(flight, munition, carried)
         await self._emit_event(
             "shot",
             initiator=flight.name,
@@ -610,7 +665,13 @@ class FakeDCS:
             weapon=cfg.weapon,
         )
         killed = 0
-        if cfg.target_outcome != "intact" and self.rng.random() < cfg.target_pk:
+        # The bombs are checked after the die is thrown, so an unarmed flight
+        # does not shift the harness's own dice for everything after it.
+        if (
+            cfg.target_outcome != "intact"
+            and self.rng.random() < cfg.target_pk
+            and carried > 0
+        ):
             before = target.units
             if cfg.target_outcome == "destroyed":
                 target.units = 0
@@ -630,8 +691,7 @@ class FakeDCS:
 
         losses = min(cfg.flight_losses, flight.units)
         if losses:
-            flight.units -= losses
-            flight.alive = flight.units > 0
+            self._lose(flight, losses)
             # One draw from a three-name list either way, so which side is
             # being shot at does not move the harness's own dice.
             names, weapon = DEFENDERS.get(flight.coalition, DEFENDERS["blue"])
@@ -666,6 +726,37 @@ class FakeDCS:
             flight.units,
             flight.units_initial,
         )
+
+    @staticmethod
+    def _expend(group: SimGroup, munition: str, count: int) -> None:
+        if group.ammo is None or count <= 0:
+            return
+        group.ammo[munition] = max(0, group.ammo.get(munition, 0) - count)
+
+    @staticmethod
+    def _lose(group: SimGroup, count: int) -> None:
+        """Aircraft shot down take their share of what is aboard with them."""
+        before = group.units
+        group.units -= count
+        group.alive = group.units > 0
+        if group.ammo is not None and before > 0:
+            group.ammo = {
+                weapon: rounds * group.units // before
+                for weapon, rounds in sorted(group.ammo.items())
+            }
+
+    @staticmethod
+    def _ammo_report(ammo: dict[str, int] | None, units: int) -> dict[str, int] | None:
+        """What Unit.getAmmo summed over the living units would say.
+
+        DCS lists a weapon only while some is aboard, and a group with nobody
+        left alive has nothing to list.
+        """
+        if ammo is None:
+            return None
+        if units <= 0:
+            return {}
+        return {weapon: rounds for weapon, rounds in sorted(ammo.items()) if rounds > 0}
 
     def _observer_goal(self) -> tuple[float, float]:
         if self.t < self.cfg.observer_hold:
@@ -726,6 +817,8 @@ class FakeDCS:
                     units=group.units,
                     units_initial=group.units_initial,
                     pos=(group.pos[0], group.pos[1], group.pos[2]),
+                    ammo=self._ammo_report(group.ammo, group.units),
+                    ammo_initial=self._ammo_report(group.ammo_initial, group.units_initial),
                 )
             )
         await self._send(StateReport(seq=self._next_seq(), t=self.t, groups=snapshots))
@@ -963,6 +1056,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
                    help="units a SEAD element destroys on each named site it reaches")
     p.add_argument("--sead-range", type=float, default=25_000.0,
                    help="ground range at which a SEAD element engages a named site")
+    p.add_argument("--loadout", type=int, default=2,
+                   help="rounds of its template's munition each aircraft carries; "
+                        "0 is DCS today, whose pylons the client leaves empty")
+    p.add_argument("--sead-shots", type=int, default=None,
+                   help="missiles a SEAD pass fires (default: everything it carries)")
     p.add_argument("--dead-linger", type=int, default=1,
                    help="snapshots a destroyed group still appears in before DCS forgets it")
     p.add_argument("--spawn-timeout", type=float, default=900.0)
@@ -1004,6 +1102,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         flight_losses=args.flight_losses,
         sead_kills=args.sead_kills,
         sead_range=args.sead_range,
+        loadout=args.loadout,
+        sead_shots=args.sead_shots,
         dead_linger=args.dead_linger,
         spawn_timeout=args.spawn_timeout,
         summary=args.summary,

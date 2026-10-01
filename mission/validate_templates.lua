@@ -31,6 +31,11 @@
     noticing. The pylon probes below are therefore about ammunition that is
     actually aboard the jet, not about whether the spawn succeeded.
 
+  The `ammo.*` cases answer a third question: what weapon type names does
+  Unit:getAmmo() report for the SEAD elements' missiles? The client names
+  them to the engine through its WEAPON_NAMES table, which is a guess; these
+  cases record the names DCS actually uses and whether the table knows them.
+
   WHERE THE VALUES COME FROM
 
   The client keeps its content in locals. Only `TEMPLATES` is exported
@@ -107,6 +112,11 @@ local CONFIG = {
     --- DCS airdrome id the ramp-start case parks on. Leave nil to pick one --
     --- see `pick_airdrome`. Ids are per map, so there is no safe default.
     airdrome_id = nil,
+
+    --- Loadouts whose getAmmo type names the `ammo.*` cases record. Replace
+    --- the CLSIDs with ones copied out of a mission-editor export, as for
+    --- `clsids`; see mission/VALIDATION.md.
+    ammo_probes = nil,
 }
 
 if type(_G.CAMPAIGN_VALIDATE_CONFIG) == "table" then
@@ -270,6 +280,21 @@ local SPEC = {
     --- Exported by the client, so `cross_check` compares the two.
     sead_target_types = {"Air Defence"},
 
+    --- campaign_client.lua: WEAPON_NAMES, DCS weapon type name -> the
+    --- engine's munition name, which the client reports ammunition under.
+    --- Unverified there and here; the `ammo.*` cases are how a run settles
+    --- it. Exported by the client, so `cross_check` compares the two.
+    weapon_names = {
+        ["weapons.missiles.AGM_88"] = "AGM-88C",
+        ["AGM_88"] = "AGM-88C",
+        ["weapons.missiles.X_58"] = "Kh-58U",
+        ["X_58"] = "Kh-58U",
+        ["weapons.bombs.GBU_38"] = "GBU-38",
+        ["GBU_38"] = "GBU-38",
+        ["weapons.bombs.FAB_500"] = "FAB-500",
+        ["FAB_500"] = "FAB-500",
+    },
+
     --- Static type/category pairs. The first is the client's; the rest are
     --- alternatives to fall back to when it turns out to be rejected.
     static_pairs = {
@@ -295,6 +320,17 @@ local DEFAULT_CLSIDS = {
     -- real one out of a mission-editor export before trusting a miss.
     {clsid = "{B06DD79A-F21E-4EB9-BD9D-AB3844618C93}", pylon = 3,
      label = "AGM-88C HARM (candidate)"},
+}
+
+--- One `ammo.*` case per SEAD template: its own airframe, for its own side,
+--- with its anti-radiation missile on a pylon, so getAmmo has something to
+--- name. The CLSIDs are candidates exactly as DEFAULT_CLSIDS's are; a miss
+--- leaves the pylon empty and the case says so rather than passing.
+local DEFAULT_AMMO_PROBES = {
+    {template = "F-16C_sead_harm", munition = "AGM-88C", country = "USA",
+     clsid = "{B06DD79A-F21E-4EB9-BD9D-AB3844618C93}", pylon = 3},
+    {template = "Su-24M_sead_kh58", munition = "Kh-58U", country = "RUSSIA",
+     clsid = "{B5CA9846-776E-4230-B4FD-8BCC9BFB1676}", pylon = 2},
 }
 
 -- ------------------------------------------------------------------
@@ -702,6 +738,65 @@ local function inspect_ammo(unit_name)
     end
     table.sort(names)
     return n, table.concat(names, ","), nil
+end
+
+--- Every weapon aboard a unit other than the gun, as {type_name, count} in
+--- type-name order. Returns list, err.
+local function read_type_names(unit_name)
+    local unit = try(Unit.getByName, unit_name)
+    if not unit then return nil, "unit " .. unit_name .. " is not retrievable" end
+    if type(unit.getAmmo) ~= "function" then
+        return nil, "Unit.getAmmo is unavailable in this environment"
+    end
+    local ok, ammo = pcall(unit.getAmmo, unit)
+    if not ok then return nil, "getAmmo raised: " .. tostring(ammo) end
+    local out = {}
+    if type(ammo) ~= "table" then return out, nil end
+    for i = 1, #ammo do
+        local entry = ammo[i]
+        local desc = entry and entry.desc
+        if desc and desc.category ~= SHELL then
+            out[#out + 1] = {type_name = tostring(desc.typeName),
+                             count = tonumber(entry.count) or 0}
+        end
+    end
+    table.sort(out, function(a, b) return a.type_name < b.type_name end)
+    return out, nil
+end
+
+--- Second half of an `ammo.*` case: what DCS called the missile, and
+--- whether the client's WEAPON_NAMES reports it under the engine's name.
+local function inspect_type_names(rec)
+    local found, err = read_type_names(rec.inspect_unit)
+    if err then
+        rec.detail.type_names = "unknown"
+        if rec.status == "OK" then
+            rec.status = "UNKNOWN"
+            rec.error = err
+        end
+        return
+    end
+    local names, unmapped, matched = {}, {}, false
+    for i = 1, #found do
+        local name = found[i].type_name
+        local mapped = SPEC.weapon_names[name]
+        names[#names + 1] = name .. "x" .. tostring(found[i].count)
+                            .. "->" .. tostring(mapped or "unmapped")
+        if mapped == nil then unmapped[#unmapped + 1] = name end
+        if mapped == rec.munition then matched = true end
+    end
+    rec.detail.type_names = table.concat(names, ",")
+    if rec.status ~= "OK" then return end
+    if #found == 0 then
+        rec.status = "UNKNOWN"
+        rec.error = "the pylon stayed empty, so DCS named no weapon: this "
+                    .. "build does not know that CLSID"
+    elseif not matched or #unmapped > 0 then
+        rec.status = "REJECTED"
+        rec.error = "WEAPON_NAMES does not report what DCS loaded as "
+                    .. rec.munition .. "; DCS calls it: "
+                    .. table.concat(unmapped, ", ")
+    end
 end
 
 -- ------------------------------------------------------------------
@@ -1349,6 +1444,56 @@ local function build_cases()
         })
     end
 
+    -- 8. The weapon type names getAmmo reports for the SEAD missiles. Not
+    -- required: today's pylons are empty, so this is discovery until a
+    -- loadout is filled in, and then it is what makes the client's ammunition
+    -- report mean anything.
+    local probes = CONFIG.ammo_probes or DEFAULT_AMMO_PROBES
+    for i = 1, #probes do
+        local probe = probes[i]
+        local tmpl = SPEC.templates[probe.template] or {}
+        add({
+            id = "ammo." .. tostring(probe.template),
+            kind = "ammo",
+            required = false,
+            label = "getAmmo type name of " .. tostring(probe.munition)
+                    .. " on " .. tostring(tmpl.unit_type) .. " -- "
+                    .. tostring(probe.clsid) .. " on pylon "
+                    .. tostring(probe.pylon or 1),
+            attempt = function(case, index)
+                local rec = new_case_record(case)
+                local cid = country_id(probe.country or "USA")
+                local cat = group_category("AIRPLANE")
+                if cid == nil or cat == nil or tmpl.unit_type == nil then
+                    rec.status = "SKIP"
+                    rec.error = "country, Group.Category or template unavailable"
+                    return rec
+                end
+                local base = tmpl.payload or DEFAULT_PAYLOAD
+                local payload = {
+                    pylons = {[probe.pylon or 1] = {CLSID = probe.clsid}},
+                    fuel = base.fuel,
+                    flare = base.flare,
+                    chaff = base.chaff,
+                    gun = base.gun,
+                }
+                local x, y = case_position(index)
+                local name = NAME_PREFIX .. "ammo_" .. i
+                rec.inspect_unit = name .. "_1"
+                rec.munition = probe.munition
+                rec.detail.clsid = probe.clsid
+                return try_group(rec, {data = build_group_data({
+                    name = name,
+                    unit_type = tmpl.unit_type,
+                    count = 1,
+                    task = tmpl.task,
+                    payload = payload,
+                    x = x, y = y, alt = CONFIG.altitude,
+                })}, cid, cat)
+            end,
+        })
+    end
+
     return cases
 end
 
@@ -1393,6 +1538,16 @@ local function cross_check()
             status = "SKIP",
             label = "cross-check SPEC.sead_target_types against "
                     .. "CampaignClient.SEAD_TARGET_TYPES",
+            error = "campaign_client.lua is not loaded in this mission",
+            detail = {},
+        })
+        record({
+            id = "drift.weapon_names",
+            kind = "meta",
+            required = false,
+            status = "SKIP",
+            label = "cross-check SPEC.weapon_names against "
+                    .. "CampaignClient.WEAPON_NAMES",
             error = "campaign_client.lua is not loaded in this mission",
             detail = {},
         })
@@ -1468,6 +1623,38 @@ local function cross_check()
         label = label,
         error = why,
         detail = {},
+    })
+
+    -- The weapon names: the `ammo.*` cases judge the client's table by this
+    -- copy, so a copy that drifted would settle a table the client no
+    -- longer reports with.
+    local names = client.WEAPON_NAMES
+    local diffs = {}
+    if type(names) ~= "table" then
+        diffs[1] = "the client does not export WEAPON_NAMES"
+    else
+        for key, value in pairs(SPEC.weapon_names) do
+            if names[key] ~= value then
+                diffs[#diffs + 1] = tostring(key) .. ": validator " .. tostring(value)
+                                    .. " vs client " .. tostring(names[key])
+            end
+        end
+        for key, value in pairs(names) do
+            if SPEC.weapon_names[key] == nil then
+                diffs[#diffs + 1] = tostring(key) .. ": in the client ("
+                                    .. tostring(value) .. "), not validated here"
+            end
+        end
+    end
+    table.sort(diffs)
+    record({
+        id = "drift.weapon_names",
+        kind = "meta",
+        required = true,
+        status = (#diffs == 0) and "OK" or "DRIFT",
+        label = "cross-check SPEC.weapon_names against CampaignClient.WEAPON_NAMES",
+        error = (#diffs > 0) and table.concat(diffs, "; ") or nil,
+        detail = {mismatches = #diffs},
     })
 end
 
@@ -1628,6 +1815,9 @@ end
 --- Second half of a case: re-check retrievability a tick later, read the
 --- ammunition, destroy everything and confirm it is gone.
 local function finish(rec)
+    if rec.kind == "ammo" and rec.inspect_unit then
+        inspect_type_names(rec)
+    end
     if rec.kind == "pylon" and rec.inspect_unit then
         local n, summary, err = inspect_ammo(rec.inspect_unit)
         if err then
@@ -1804,6 +1994,7 @@ V.CONFIG = CONFIG
 V.SPEC = SPEC
 V.PREFIX = PREFIX
 V.DEFAULT_CLSIDS = DEFAULT_CLSIDS
+V.DEFAULT_AMMO_PROBES = DEFAULT_AMMO_PROBES
 V.json_encode = json_encode
 
 _G.CampaignValidator = V

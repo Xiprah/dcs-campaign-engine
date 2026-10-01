@@ -308,20 +308,23 @@ this order:
 
 1. the SEAD element flies its exposure to every site it cannot out-range
    (below), at the site's full kill probability, because it goes in first;
-2. its survivors' missiles are rolled against the sites, shared round-robin
-   in site-id order, each removing a unit at `resolver.ARM_PK` (0.25),
-   through the tracker like any paper loss;
-3. every surviving SEAD aircraft halves the kill probability of each site it
-   engaged, compounding (`resolver.SEAD_SUPPRESSION_PER_AIRCRAFT`), so a SEAD
-   element that lost a jet only half does its job;
+2. its survivors' missiles — those the sim has not already spent (below)
+   — are rolled against the sites, shared round-robin in site-id order,
+   each removing a unit at `resolver.ARM_PK` (0.25), through the tracker
+   like any paper loss;
+3. every SEAD aircraft that fires in step 2 halves the kill probability of
+   each site it engaged, compounding
+   (`resolver.SEAD_SUPPRESSION_PER_AIRCRAFT`), so a SEAD element that lost a
+   jet only half does its job;
 4. the strike element flies its exposure against the sites still standing,
    at those probabilities: a site the missiles destroyed does not fire;
 5. the strike element's survivors release.
 
-Each element's survivors expend what they carried, there, whoever held what:
-expenditure is the engine's own fact. `resolve_exposure` rolls the
-probabilities it is given, so suppression changes its inputs and nothing
-downstream.
+Each element's survivors expend there what is left of its reservation,
+whoever held what: the engine books what it loaded, less what the snapshots
+already showed leaving the sim (below), so every round is debited once.
+`resolve_exposure` rolls the probabilities it is given, so suppression
+changes its inputs and nothing downstream.
 
 **Standoff.** A SEAD element is exposed to a site on paper only if it has to
 enter that site's envelope to get a shot at it: only when the site's
@@ -341,8 +344,8 @@ who valued airframes should never have flown SEAD.
 
 The comparison is decided by content alone, never by authority: an
 out-ranged site is out-ranged in every row of the table below, whether DCS
-holds it, whether the SEAD element has a paper shot at it, or whether the two
-shared the sim. Whether the SEAD element is *rolled* at all is still
+holds it, whether the SEAD element has a paper shot at it, or what the sim
+spent of its missiles. Whether the SEAD element is *rolled* at all is still
 section 1's: one DCS is holding is never rolled. Observed, nothing changes:
 DCS flies the SEAD task and decides.
 
@@ -381,60 +384,117 @@ outcome.
 
 **Mixed authority.** Section 1 holds per entity, at the TOT: an element DCS
 is holding is never flown through the sites on paper, and a site DCS is
-holding loses units only to snapshots. What SEAD does on paper is therefore
-bounded by the rule this section adds:
+holding loses units only to snapshots. A SEAD element's missiles add a third
+thing to keep single: a missile the sim fired was resolved there, and must
+never be fired again on paper. What SEAD does on paper is therefore bounded
+by the rule this section adds:
 
 > A SEAD element has a paper effect on a site — missiles rolled at it, and
 > suppression of it for the strike element — only when the SEAD element and
-> the site are both outside DCS at the TOT, **and** DCS never held the two at
-> the same time before it.
+> the site are both outside DCS at the TOT, and then only with the missiles
+> the sim has not spent: what the engine reserved, less what the snapshots
+> showed leaving the sim, and no more than its surviving aircraft carry.
+> Only the aircraft that fire those missiles suppress.
 
 | at the TOT | SEAD exposure | missiles at the site | strike's kill probability |
 |---|---|---|---|
-| SEAD paper, site paper, never shared the sim | rolled\* | rolled | suppressed |
-| SEAD paper, site paper, shared the sim earlier | rolled\* | none | full |
+| SEAD paper, site paper, the sim spent none of its missiles | rolled\* | all its survivors carry | suppressed by every survivor |
+| SEAD paper, site paper, the sim spent some | rolled\* | the rest | suppressed by the aircraft that fire the rest |
+| SEAD paper, site paper, the sim spent all of them | rolled\* | none | full |
 | SEAD paper, site held | rolled\* | none | full |
 | SEAD held, site either | not rolled | none | full |
 
 \* unless its missile out-ranges the site (standoff, above), in which case
 that site is not rolled against it in any row. Independently of the table
-the strike element is rolled only if DCS is not holding it. The cases the
+the strike element is rolled only if DCS is not holding it. "Spent" is
+counted per element over its whole sortie, every stretch DCS held it
+included, and an element DCS never held has spent nothing. The cases the
 rule settles:
 
 * *SEAD observed, strike not.* The sim decides what the SEAD element did,
-  and a snapshot can carry only site units destroyed, never suppression. So
-  no suppression is inferred: the unwatched strikers meet the site at its
-  full kill probability, less whatever the snapshots destroyed (a site
-  destroyed outright fires at nobody). Crediting suppression as well would
-  count one sortie's effect twice, or credit an effect no authority
-  observed. It errs against the players on the rare edge of the bubble
-  where the two elements, 17 km apart, are held differently.
+  and a snapshot can carry only site units destroyed and missiles gone,
+  never suppression. So no suppression is inferred: the unwatched strikers
+  meet the site at its full kill probability, less whatever the snapshots
+  destroyed (a site destroyed outright fires at nobody). Crediting
+  suppression as well would count one sortie's effect twice, or credit an
+  effect no authority observed. It errs against the players on the rare
+  edge of the bubble where the two elements, 17 km apart, are held
+  differently.
 * *Strike observed, SEAD not.* The SEAD element flies its exposure on paper
-  to any site it cannot out-range, and its missiles are rolled at any site
-  DCS is not holding; the strike's
-  exposure is the sim's, so suppression has nothing to act on.
+  to any site it cannot out-range, and what it has not spent is rolled at
+  any site DCS is not holding; the strike's exposure is the sim's, so
+  suppression has nothing to act on.
 * *A site DCS holds* loses units only to snapshots: paper missiles cannot
   take one (the tracker refuses), and a paper SEAD element cannot have shut
   down a radar that is being simulated.
-* *Shared sim time.* The client tasks a SEAD element to engage any air
+* *What the sim spent.* The client tasks a SEAD element to engage any air
   defence it meets along its route, not at a waypoint, so a SEAD element DCS
-  held at the same time as a site had its chance to fire at it, and what it
-  did came back by snapshot. If both then leave the bubble before the TOT,
-  firing the same missiles on paper would resolve them twice. The engine
-  records the contact (`Element.sim_contact`) whenever the client
-  acknowledges a spawn, which is the only moment two entities can begin to
-  be held together, so no stretch of shared time is missed and a replay
-  records the same contact. A strike element has no such rule: its attack
-  hangs on the waypoint it reaches at its TOT, so the sim resolves its bombs
-  only if it holds the strike then.
+  held may have fired at a site long before the TOT, and what its missiles
+  did came back by snapshot. Since protocol v3 the snapshot also says what
+  is still aboard each flight, beside the count the client read when it
+  built the group (docs/protocol.md, `state`). The engine reads a SEAD
+  element's munition from every snapshot of it before its TOT, held or not
+  — the census a client sends just before obeying a despawn is the last
+  word on that instantiation — and adds every drop from one reading to the
+  next to `Element.sim_spent`. The first reading of each instantiation is
+  the spawn-time count, never an absolute load: the pylons are empty in DCS
+  today, so a jet reports no missiles from its first snapshot, and read as
+  an absolute count that would say every missile had been fired. Each
+  instantiation starts a new baseline, because the client builds every
+  spawn with its template's loadout and a re-spawned element is re-armed in
+  the sim; what it spent before stays spent. A count the client could not
+  read is taken as everything spent: the cost is a SEAD element that does
+  nothing more on paper, the alternative a missile fired twice. Events,
+  `shot` included, play no part, so the reconciliation equivalence of
+  section 1 holds: drop every event frame and the same missiles are counted.
+* *Suppression after the sim fired.* A SEAD aircraft that spent everything
+  in the sim does not suppress on paper. On paper, suppression is what
+  missiles in the air do to a site while the strikers cross its envelope;
+  a jet with nothing left to fire buys none. Its shots were the sim's, and
+  what they achieved is already in the snapshots; crediting a paper
+  suppression for them too would count one missile's effect twice — the
+  same reason a SEAD element DCS holds buys none. So the number of
+  suppressing aircraft is the number it takes to carry the missiles fired
+  on paper, never more than survived: two missiles left on a two-ship is
+  one aircraft's worth, and halves the site's kill probability once. An
+  element whose pylons were empty in the sim spent nothing there, fires its
+  whole reservation on paper and suppresses with every survivor, exactly as
+  an element DCS never held.
+* *Booking every missile once.* The element's reservation is the paper's
+  licence to fire, so it is kept equal to what the paper may still fire.
+  Whenever either bound moves — a snapshot shows rounds gone from the sim,
+  or an aircraft is lost — the excess is debited then: up to the dead
+  aircraft's share (two rounds each) as lost with them, the rest as
+  expended. At the TOT the survivors expend what the reservation still
+  holds, and the paper fires exactly that. A summed count cannot tell
+  whether rounds that left the sim in the same interval an aircraft died
+  were fired or went down with it; calling the dead aircraft's share lost is
+  exact whenever each jet carried its full load, and either way the round
+  is in exactly one bucket and the paper never gets it. An element the sim
+  never armed books precisely what the one-flight package always did, the
+  rounds of each aircraft lost, and the eleven pre-SEAD wars replay
+  unchanged.
+* *What the sim did after its last snapshot.* If DCS goes away between
+  snapshots, whatever it fired since the last one never reaches the
+  campaign, and neither does anything those missiles destroyed. The paper
+  may fire such a missile; it is then resolved once, by the only authority
+  that ever reported on it. A DCS restart already treats losses this way
+  (docs/protocol.md, Reconnect): a unit killed after the last snapshot is
+  re-spawned at the count the snapshots recorded.
 * *After the TOT.* An element whose part in the TOT is resolved is spawned
-  with the tasking `{"kind": "egress"}`, which carries no task. Without it a
-  flight that re-entered the bubble on the way home was tasked to attack
-  again — the client hangs the attack on the last waypoint when there is no
-  attack waypoint left — and a strike resolved on paper bombed the same
-  target a second time in DCS. That was true of the one-flight package too,
-  and is the one change made to it on purpose: its frames now differ from
-  the recorded ones in those spawns' tasking and nowhere else.
+  with the tasking `{"kind": "egress"}`, which carries no task, and its
+  ammunition is no longer read: the paper has nothing left to withhold.
+  Without the egress tasking a flight that re-entered the bubble on the way
+  home was tasked to attack again — the client hangs the attack on the last
+  waypoint when there is no attack waypoint left — and a strike resolved on
+  paper bombed the same target a second time in DCS. That was true of the
+  one-flight package too, and is the one change made to it on purpose: its
+  frames now differ from the recorded ones in those spawns' tasking and
+  nowhere else.
+
+A strike element has no ammunition rule: its attack hangs on the waypoint it
+reaches at its TOT, so the sim resolves its bombs only if it holds the
+strike then, and whoever holds it at the TOT is the one authority over them.
 
 Section 3's caveat carries over per element: one held for part of its route
 but not at the TOT is rolled for the whole route. It cannot lose an aircraft
@@ -450,9 +510,14 @@ flies out (section 4).
 client puts an `EngageTargets` task for `"Air Defence"` on the first
 waypoint, active for the whole route, and an `AttackGroup` on the attack
 waypoint against each fragged site that exists in the sim when the element
-spawns. What it achieves the engine learns only from snapshots. The pylons
-are as empty as the strike's (README), so until a mission-editor export
-fills them these jets carry no missiles in DCS and suppress nothing there.
+spawns. What it achieves the engine learns only from snapshots, and since
+protocol v3 that includes what it fired. The pylons are as empty as the
+strike's (README), so until a mission-editor export fills them these jets
+carry no missiles in DCS, fire nothing there, and fire their whole load on
+paper if they meet their TOT outside the bubble. The DCS weapon type names
+the client reports them under are as unverified as the CLSIDs that would
+load them; mission/validate_templates.lua's `ammo.*` cases record the names
+DCS uses.
 
 **What it buys, at the placeholder numbers.** Over each side's first sortie
 on seeds 0 to 399, the only situation both configurations fly identically,
@@ -479,6 +544,21 @@ out-ranges the site, so does the escorted package as a whole.
 Rejected: modelling SEAD as a bonus on the strike flight. The point of a
 package is that its parts can fail independently — the SEAD element can be
 shot down, arrive late, or run dry — and a bonus cannot.
+
+Rejected: the contact rule this replaced. Before protocol v3 the engine
+could not see what the sim fired, so a SEAD element that DCS had ever held
+at the same time as a site, before the TOT, had no paper effect on that site
+at all. It over-triggered badly: in a harness run red's SEAD element shared
+the sim with the Patriot briefly and early, fired nothing — its pylons were
+empty — and then fired nothing and suppressed nothing on paper for the rest
+of its sortie, and the Patriot shot down both Su-24M strikers behind it.
+Ammunition is ground truth the snapshot already had authority over, like
+liveness and unit counts, so the engine now knows how many missiles the sim
+fired, and the paper fires the remainder.
+
+Rejected: counting missiles from `shot` events. Events are attribution only;
+a campaign that moved when an event arrived would reach a different state
+with the event stream dropped.
 
 Rejected: inferring suppression from a watched SEAD element's survivors. The
 snapshot says it is alive, not that it fired or where; and a site it could

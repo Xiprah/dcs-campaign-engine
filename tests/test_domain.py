@@ -113,6 +113,16 @@ class Damage:
     #: before its strike: "the first plane" is no longer the strike flight.
     kind: str | None = None
     coalition: str | None = None
+    #: Rounds of `munition` the group fires before anything is removed, so
+    #: one damage can say "fired, then died". Taken from the first aircraft
+    #: that still has one, as a lead shoots before his wingman.
+    fire: int = 0
+    munition: str | None = None
+
+
+#: Categories that carry ammunition in a snapshot, as the Lua client's
+#: AIRBORNE table has it.
+_ARMED = frozenset({"plane", "helicopter"})
 
 
 @dataclass
@@ -124,6 +134,21 @@ class _LiveGroup:
     alive: bool = True
     kind: str | None = None
     coalition: str | None = None
+    #: Per living aircraft, what it still carries. The snapshot sums it, as
+    #: the client sums Unit.getAmmo, so an aircraft lost takes its share out
+    #: of the count. Empty for anything that is not an aircraft.
+    ammo: list[dict[str, int]] = field(default_factory=list)
+    #: What the group carried when it was built; None if not an aircraft.
+    ammo_initial: dict[str, int] | None = None
+
+    def ammo_now(self) -> dict[str, int] | None:
+        if self.ammo_initial is None:
+            return None
+        total: dict[str, int] = {}
+        for load in self.ammo[: self.units]:
+            for weapon, count in sorted(load.items()):
+                total[weapon] = total.get(weapon, 0) + count
+        return total
 
 
 @dataclass
@@ -133,6 +158,9 @@ class FakeDCS:
     campaign: Campaign
     deliver_events: bool = True
     damages: list[Damage] = field(default_factory=list)
+    #: Template -> what one aircraft of it carries. Empty by default, which
+    #: is what DCS loads today: the client's pylons are empty.
+    loadouts: dict[str, dict[str, int]] = field(default_factory=dict)
     groups: dict[str, _LiveGroup] = field(default_factory=dict)
     downlink: list[object] = field(default_factory=list)
     applied: set[int] = field(default_factory=set)
@@ -171,6 +199,15 @@ class FakeDCS:
             f"reject it and the campaign would lose the entity"
         )
         units = frame.units
+        armed = frame.category in _ARMED
+        load = self.loadouts.get(frame.template, {})
+        per_unit = [dict(load) for _ in range(units)] if armed else []
+        initial: dict[str, int] | None = None
+        if armed:
+            initial = {}
+            for unit_load in per_unit:
+                for weapon, count in sorted(unit_load.items()):
+                    initial[weapon] = initial.get(weapon, 0) + count
         self.groups[frame.spawn_id] = _LiveGroup(
             spawn_id=frame.spawn_id,
             category=frame.category,
@@ -178,6 +215,8 @@ class FakeDCS:
             units_initial=units,
             kind=frame.tasking.get("kind"),
             coalition=frame.coalition,
+            ammo=per_unit,
+            ammo_initial=initial,
         )
         self.pump(
             self.campaign.on_ack(
@@ -237,6 +276,10 @@ class FakeDCS:
                             alive=g.alive,
                             units=g.units,
                             units_initial=g.units_initial,
+                            ammo=g.ammo_now(),
+                            ammo_initial=(
+                                None if g.ammo_initial is None else dict(g.ammo_initial)
+                            ),
                         )
                         for g in self.groups.values()
                     ],
@@ -270,6 +313,7 @@ class FakeDCS:
                 # explanation -- the case an event-counting model loses.
                 del self.groups[group.spawn_id]
                 continue
+            self._fire(group, damage)
             removed = min(damage.remove, group.units)
             group.units -= removed
             if group.units == 0:
@@ -278,6 +322,20 @@ class FakeDCS:
                 continue
             for _ in range(removed):
                 self._emit_event(damage, group)
+
+    @staticmethod
+    def _fire(group: _LiveGroup, damage: Damage) -> None:
+        left = damage.fire
+        for load in group.ammo[: group.units]:
+            if left <= 0 or damage.munition is None:
+                break
+            take = min(left, load.get(damage.munition, 0))
+            load[damage.munition] = load.get(damage.munition, 0) - take
+            left -= take
+        assert left == 0, (
+            f"scripted damage fires {damage.fire} {damage.munition} that "
+            f"{group.spawn_id} does not carry; the test would measure nothing"
+        )
 
     def _emit_event(self, damage: Damage, group: _LiveGroup) -> None:
         if not self.deliver_events:
@@ -319,6 +377,7 @@ def fork_client(dcs: FakeDCS, campaign: Campaign) -> FakeDCS:
         campaign=campaign,
         deliver_events=dcs.deliver_events,
         damages=list(dcs.damages),
+        loadouts=copy.deepcopy(dcs.loadouts),
         groups=copy.deepcopy(dcs.groups),
         applied=set(dcs.applied),
         uplink_seq=dcs.uplink_seq,
@@ -336,11 +395,15 @@ def drive(
     duration: int,
     hook=None,
     dcs: FakeDCS | None = None,
+    loadouts: dict[str, dict[str, int]] | None = None,
 ) -> FakeDCS:
     """Run the closed loop from `start` to `start + duration` seconds."""
     if dcs is None:
         dcs = FakeDCS(
-            campaign=campaign, deliver_events=deliver_events, damages=list(damages)
+            campaign=campaign,
+            deliver_events=deliver_events,
+            damages=list(damages),
+            loadouts=dict(loadouts or {}),
         )
         if start == 0:
             dcs.connect(0.0)
