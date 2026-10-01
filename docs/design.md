@@ -163,6 +163,13 @@ battery (one radar, four launchers) about 5 km off the Bassel al-Assad–Incirli
 leg. Each side's only strike route runs through the other side's only
 envelope, and both carry the same placeholder kill probability, so neither
 side's air defence is tuned against the other by numbers nobody has measured.
+Their radii are not the same: each is the system's published maximum range,
+24 km for the SA-6 and 160 km for the Patriot (`theater.py` names the
+sources), because section 5 compares them with the published maximum ranges
+of the missiles fired at them, and a trimmed radius would decide that
+comparison by the trim. The Patriot's envelope takes in Bassel al-Assad
+itself. On paper that changes nothing for a strike, which is rolled once per
+site whatever the depth of the envelope it crosses.
 
 ## 4. The enemy: both sides fight
 
@@ -246,7 +253,9 @@ The planner attaches a **SEAD element** when the strike route is exposed to a
 live enemy threat site and anti-radiation munitions are available. It arrives
 ahead of the strikers. On paper, it rolls first: suppression cuts the site's
 kill probability for the strike element, and its missiles may destroy site
-units outright. Observed, it is tasked in DCS and the sim decides.
+units outright. It is shot at only by a site it cannot out-range: against
+one its missile out-ranges it fires from standoff. Observed, it is tasked in
+DCS and the sim decides.
 
 **Elements.** Each element has its own spawn id, its own reservation
 (`<package>-<role>`), its own schedule and its own state, and is tracked on
@@ -281,11 +290,12 @@ with the strike squadrons.
 **The lead is 120 seconds** (`planner.SEAD_LEAD`), on the same track: the SEAD
 element's takeoff, time over the target and recovery are the strike's less
 120 s. At the paper track's ground speed of about 140 m/s that is 17 km.
-Blue's strikers cross into the SA-6's 20 km envelope 310 s before their TOT,
-when the SEAD element ahead of them is abeam the battery, 293 s out, as close
-as it gets and with the shortest shot it has. Red's route runs 394 s inside
-the Patriot's larger envelope, and the same lead puts its SEAD element 17 km
-into it before the strikers. Much more and the SEAD element is off the target
+Blue's strikers cross into the SA-6's 24 km envelope 339 s before their TOT,
+when the SEAD element ahead of them is 8 km from the battery and closing on
+its abeam point, 293 s out, as close as it gets and with the shortest shot it
+has. Red's route is inside the Patriot's 160 km envelope from takeoff, and
+the same lead keeps its SEAD element 17 km ahead of the strikers all the way
+in. Much more and the SEAD element is off the target
 and turning for home while the strikers are still inbound; much less and the
 two are one formation that each envelope meets at once. It is a constant,
 not derived from each route's geometry, because on paper exposure is one
@@ -296,8 +306,8 @@ bubble holds it and where DCS flies it.
 **The paper order.** Everything is resolved once, at the package's TOT, in
 this order:
 
-1. the SEAD element flies its exposure, at the sites' full kill probability,
-   because it goes in first;
+1. the SEAD element flies its exposure to every site it cannot out-range
+   (below), at the site's full kill probability, because it goes in first;
 2. its survivors' missiles are rolled against the sites, shared round-robin
    in site-id order, each removing a unit at `resolver.ARM_PK` (0.25),
    through the tracker like any paper loss;
@@ -313,6 +323,49 @@ expenditure is the engine's own fact. `resolve_exposure` rolls the
 probabilities it is given, so suppression changes its inputs and nothing
 downstream.
 
+**Standoff.** A SEAD element is exposed to a site on paper only if it has to
+enter that site's envelope to get a shot at it: only when the site's
+engagement radius is at least its missile's launch range
+(`oob.ANTI_RADIATION_LAUNCH_RANGE`, `ThreatSite.outranged_by`). A site it
+out-ranges it engages from outside the envelope, and takes no exposure from;
+its missiles (step 2) and its suppression (step 3) still apply. A strike
+element is exposed to every site its route enters, as before: it has to
+reach its target, and its bombs are not aimed at the sites.
+
+Why: an anti-radiation missile is fired from outside the envelope of the
+site it targets, and that is the point of it. Without standoff the SEAD
+element flew into the unsuppressed site first, at its full kill probability,
+and an escorted package lost more aircraft in total than one sent alone —
+the model inverted the doctrine it was meant to represent, and a commander
+who valued airframes should never have flown SEAD.
+
+The comparison is decided by content alone, never by authority: an
+out-ranged site is out-ranged in every row of the table below, whether DCS
+holds it, whether the SEAD element has a paper shot at it, or whether the two
+shared the sim. Whether the SEAD element is *rolled* at all is still
+section 1's: one DCS is holding is never rolled. Observed, nothing changes:
+DCS flies the SEAD task and decides.
+
+The ranges are placeholders from published figures. Each is the system's
+published maximum, so each comparison sets one statistic against the same
+statistic:
+
+| | figure | source |
+|---|---|---|
+| AGM-88C launch range | 148 km | Wikipedia, "AGM-88 HARM", infobox, 80 nmi "standoff" (uncited there; no separate C-model figure; the USAF fact sheet gives "48 plus kilometers") |
+| Kh-58U launch range | 250 km | Wikipedia, "Kh-58", infobox, citing the JED *International Electronic Countermeasures Handbook* (2004) |
+| SA-6 engagement radius | 24 km | Wikipedia, "2K12 Kub", infobox (3M9 missile) |
+| Patriot engagement radius | 160 km | Wikipedia, "MIM-104 Patriot", infobox (PAC-2 GEM, estimated) |
+
+So both sides' SEAD out-ranges the site it faces, blue's by six times, red's
+by 90 km. Red's margin rests on the Kh-58U figure: the same article gives
+the original Kh-58 120 km from 10,000 m, which would *not* out-range the
+Patriot, and with it red's SEAD element would fly into the Patriot as before
+(over seeds 0 to 99 red's escorted first sorties would lose 44 aircraft,
+exactly as without standoff, against 26 alone). None of these was chosen for
+the balance it gives; a launch range really depends on release altitude and
+speed, and the paper track has one altitude.
+
 **Dice.** Each step draws a number of dice fixed by the state it starts from,
 and the dice thrown within a step never change how many it throws: every
 missile is rolled though the first one destroyed the site, every aircraft is
@@ -321,7 +374,10 @@ is part of the state a later one starts from: an aircraft shot down fires
 nothing, and a site destroyed throws nothing at the strikers. That is how the
 one-flight package already rolled its bombs (survivors times two), and it is
 kept. The stronger form, a TOT whose total draws ignore what happened within
-it, would change the one-flight package's dice.
+it, would change the one-flight package's dice. Standoff takes the SEAD
+element's exposure dice away for a site it out-ranges: that is a different
+situation, decided by content before a die is thrown, not a different
+outcome.
 
 **Mixed authority.** Section 1 holds per entity, at the TOT: an element DCS
 is holding is never flown through the sites on paper, and a site DCS is
@@ -335,13 +391,15 @@ bounded by the rule this section adds:
 
 | at the TOT | SEAD exposure | missiles at the site | strike's kill probability |
 |---|---|---|---|
-| SEAD paper, site paper, never shared the sim | rolled | rolled | suppressed |
-| SEAD paper, site paper, shared the sim earlier | rolled | none | full |
-| SEAD paper, site held | rolled | none | full |
+| SEAD paper, site paper, never shared the sim | rolled\* | rolled | suppressed |
+| SEAD paper, site paper, shared the sim earlier | rolled\* | none | full |
+| SEAD paper, site held | rolled\* | none | full |
 | SEAD held, site either | not rolled | none | full |
 
-and independently of the table the strike element is rolled only if DCS is
-not holding it. The cases the rule settles:
+\* unless its missile out-ranges the site (standoff, above), in which case
+that site is not rolled against it in any row. Independently of the table
+the strike element is rolled only if DCS is not holding it. The cases the
+rule settles:
 
 * *SEAD observed, strike not.* The sim decides what the SEAD element did,
   and a snapshot can carry only site units destroyed, never suppression. So
@@ -352,7 +410,8 @@ not holding it. The cases the rule settles:
   observed. It errs against the players on the rare edge of the bubble
   where the two elements, 17 km apart, are held differently.
 * *Strike observed, SEAD not.* The SEAD element flies its exposure on paper
-  and its missiles are rolled at any site DCS is not holding; the strike's
+  to any site it cannot out-range, and its missiles are rolled at any site
+  DCS is not holding; the strike's
   exposure is the sim's, so suppression has nothing to act on.
 * *A site DCS holds* loses units only to snapshots: paper missiles cannot
   take one (the tracker refuses), and a paper SEAD element cannot have shut
@@ -397,21 +456,25 @@ fills them these jets carry no missiles in DCS and suppress nothing there.
 
 **What it buys, at the placeholder numbers.** Over each side's first sortie
 on seeds 0 to 399, the only situation both configurations fly identically,
-blue's strike elements lost 37 aircraft escorted and 106 alone, red's 41 and
-111: about 0.10 a sortie against 0.27. The SEAD elements themselves lost 130
-and 111, flying into the same sites at full kill probability first, so a
-package loses more aircraft in total escorted than not. Over whole wars
-(seeds 0 to 99, a day each) strike losses per sortie fall from 0.30 to 0.09
-for blue and from 0.33 to 0.13 for red, and the wars are shorter. Red wins
-67 of them against 56 without SEAD. Part of that is a race the symmetric
-content does not remove: escorted strikes finish a target on the second
-sortie more often, for both sides, and red's second TOT falls 52 s before
-blue's. In 14 of red's 39 wins at that moment blue's strike, already
-airborne, flattened the depot 52 s later (9 of 28 without SEAD). None of
-those numbers was tuned: the missile and suppression values were set before
-any war was flown and are as uncalibrated as the kill probabilities they
-cut.
-`tests/test_sead.py` holds only the claim that escorted strikers lose fewer.
+blue's strike elements lost 28 aircraft escorted and 106 alone, red's 32 and
+111: about 0.08 a sortie against 0.27. The SEAD elements, firing from
+standoff, lost none, so the package as a whole loses the same 28 and 32.
+Before standoff the strike elements lost 37 and 41, and the SEAD elements,
+flying into the unsuppressed sites first, lost 130 and 111 more: escorted
+packages lost 167 and 152 aircraft against 106 and 111 alone. Over whole
+wars (seeds 0 to 99, a day each) strike losses per sortie fall from 0.30 to
+0.09 for blue and from 0.33 to 0.07 for red, no SEAD aircraft is lost, and
+the wars are shorter. Red wins 68 of them against 56 without SEAD (67 before
+standoff). Part of that is a race the symmetric content does not remove:
+escorted strikes finish a target on the second sortie more often, for both
+sides, and red's second TOT falls 52 s before blue's. In 21 of red's 45 wins
+at that moment blue's strike, already airborne, flattened the depot 52 s
+later (9 of 28 without SEAD). None of those numbers was tuned: the missile
+and suppression values were set before any war was flown, the ranges were
+taken from published figures before any was flown with them, and all are as
+uncalibrated as the kill probabilities they cut. `tests/test_sead.py` holds
+two claims: escorted strikers lose fewer, and, where the SEAD missile
+out-ranges the site, so does the escorted package as a whole.
 
 Rejected: modelling SEAD as a bonus on the strike flight. The point of a
 package is that its parts can fail independently — the SEAD element can be

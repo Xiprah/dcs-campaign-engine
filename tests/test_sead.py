@@ -13,13 +13,16 @@ What is pinned here:
   * the paper order at the TOT -- SEAD exposure, SEAD missiles, suppression,
     strike exposure, release -- with the dice scripted so that every draw is
     accounted for and every outcome is forced;
+  * standoff: a SEAD element is shot at on paper only by a site its missile
+    does not out-range, and on the slice as shipped both sides out-range;
   * a SEAD element shot down, on paper or in DCS, and the strike flying on;
   * a destroyed or suppressed site costing the strike less;
   * every mixed-authority combination at the TOT, and none of them resolving
     one aircraft, one site unit or one element's missiles twice;
   * the players told their own package's composition and never the enemy's;
   * the books, missiles included, through a long war;
-  * and the question the whole thing exists to answer: is SEAD worth flying?
+  * and the question the whole thing exists to answer: is SEAD worth flying,
+    for the strikers and, from standoff, for the package as a whole?
 
 Scripted dice: `Dice` is a `random.Random` whose `random()` returns the values
 it is given, in order, and fails the test on a draw nobody scripted. The
@@ -42,7 +45,7 @@ from campaign.attrition import (
     KIND_THREAT,
 )
 from campaign.campaign import Campaign
-from campaign.oob import ANTI_RADIATION_MUNITIONS, build_slice_oob
+from campaign.oob import ANTI_RADIATION_MUNITIONS, build_slice_oob, launch_range
 from campaign.planner import (
     ABORTED,
     COMPLETE,
@@ -71,7 +74,7 @@ from campaign.resolver import (
     SEAD_SUPPRESSION_PER_AIRCRAFT,
     suppressed_kill_probability,
 )
-from campaign.theater import Theater, build_slice_theater, ground_distance
+from campaign.theater import Theater, build_slice_theater, enemy_of, ground_distance
 from tests.test_domain import OBSERVER_AT_TARGET, OBSERVER_FAR_AWAY, Damage, drive
 from tests.test_single_element import strike_only_oob
 
@@ -119,6 +122,23 @@ def slice_with(**changes) -> Theater:
         for key, value in fields.items():
             setattr(entity, key, value)
     return theater
+
+
+#: The AGM-88C's launch range. An SA-6 that reaches this far cannot be
+#: out-ranged by it, so blue's SEAD element has to fly into the envelope to
+#: fire -- the one situation in which section 5's paper order has a SEAD
+#: exposure step. The slice as shipped is the other one (its SA-6 reaches
+#: 24 km), and `TestStandoff` pins that.
+HARM_RANGE = launch_range("AGM-88C")
+
+
+def sa6_in_reach(**fields) -> Theater:
+    """The slice with an SA-6 the HARM does not out-range, and `fields` on it.
+
+    Exactly the launch range, because the rule is that a site is out-ranged
+    only by a missile that reaches *further* than its envelope.
+    """
+    return slice_with(**{SA6: {"engagement_radius": HARM_RANGE, **fields}})
 
 
 def blue_package(campaign: Campaign):
@@ -305,7 +325,9 @@ class TestAPackageIsASetOfElements(unittest.TestCase):
                 )
 
     def test_a_brief_leaves_out_an_element_no_longer_on_task(self):
-        campaign = Campaign()
+        # An SA-6 the HARM cannot out-range: the only kind that gets a shot
+        # at the SEAD element on paper.
+        campaign = Campaign(theater=sa6_in_reach())
         to_the_brink(campaign)
         # SEAD element shot down whole, strike untouched.
         resolve_blue_tot(campaign, [HITS, HITS, SURVIVES, SURVIVES] + [SURVIVES] * 4)
@@ -436,6 +458,15 @@ class TestWhenSeadIsAttached(unittest.TestCase):
 
 
 class TestThePaperTot(unittest.TestCase):
+    """Section 5's paper order, every step of it, the SEAD exposure included.
+
+    The SEAD element has an exposure step only against a site its missile
+    cannot out-range, so these TOTs are flown against an SA-6 that reaches as
+    far as the HARM (`sa6_in_reach`), and their dice are the dice they always
+    were. The same order from standoff, on the slice as shipped, is
+    `TestStandoff`'s.
+    """
+
     def test_suppression_cuts_the_kill_probability_per_surviving_aircraft(self):
         self.assertEqual(suppressed_kill_probability(0.15, 0), 0.15)
         self.assertAlmostEqual(
@@ -449,7 +480,7 @@ class TestThePaperTot(unittest.TestCase):
 
     def test_a_suppressed_site_spares_the_strikers_it_would_have_killed(self):
         """The same strike dice, with and without the SEAD element in front."""
-        escorted = Campaign()
+        escorted = Campaign(theater=sa6_in_reach())
         to_the_brink(escorted)
         frames, dice = resolve_blue_tot(
             escorted,
@@ -464,15 +495,22 @@ class TestThePaperTot(unittest.TestCase):
         self.assertEqual(losses_of(escorted, package.sead.spawn_id), [])
         self.assertIn(f"{package.callsign} off target, 2 aircraft egressing.", texts(frames))
 
-        alone = Campaign(inventories=strike_only_oob())
+        alone = Campaign(theater=sa6_in_reach(), inventories=strike_only_oob())
         to_the_brink(alone)
         _, dice = resolve_blue_tot(alone, [KILLS_UNLESS_SUPPRESSED] * 2)
         self.assertEqual(dice.script, [])
         self.assertEqual(len(losses_of(alone, blue_package(alone).strike.spawn_id)), 2)
 
     def test_a_site_the_missiles_destroy_does_not_fire_at_the_strikers(self):
-        """And every missile is rolled, though the first one finished it."""
-        campaign = Campaign(theater=slice_with(**{SA6: {"units_alive": 1}}))
+        """And every missile is rolled, though the first one finished it.
+
+        Seed 1, not the default. Red's raid resolves fifteen seconds before
+        blue's TOT, and the threat-site loss below must be the SA-6's alone.
+        Since red's SEAD element stands off from the Patriot it no longer dies
+        on the way in, so at the default seed its Kh-58Us take two Patriot
+        launchers first; at seed 1 they miss.
+        """
+        campaign = Campaign(seed=1, theater=sa6_in_reach(units_alive=1))
         to_the_brink(campaign)
         start = standing(campaign)
         site = campaign.theater.threats[SA6]
@@ -493,7 +531,7 @@ class TestThePaperTot(unittest.TestCase):
         conserved_everywhere(self, campaign, start)
 
         # The same TOT with no SEAD element: the site is alive and fires.
-        alone = Campaign(theater=slice_with(**{SA6: {"units_alive": 1}}),
+        alone = Campaign(seed=1, theater=sa6_in_reach(units_alive=1),
                          inventories=strike_only_oob())
         to_the_brink(alone)
         _, dice = resolve_blue_tot(alone, [KILLS_UNLESS_SUPPRESSED] * 2)
@@ -514,7 +552,7 @@ class TestThePaperTot(unittest.TestCase):
             ("every missile misses", [SURVIVES] * 4, [SURVIVES, SURVIVES]),
         ):
             with self.subTest(label):
-                campaign = Campaign(theater=slice_with(**{SA6: {"units_alive": 1}}))
+                campaign = Campaign(theater=sa6_in_reach(units_alive=1))
                 to_the_brink(campaign)
                 _, dice = resolve_blue_tot(
                     campaign,
@@ -525,7 +563,7 @@ class TestThePaperTot(unittest.TestCase):
 
     def test_the_missiles_are_resolved_through_the_tracker(self):
         """A site damaged on paper comes into DCS with only what survived."""
-        campaign = Campaign()
+        campaign = Campaign(theater=sa6_in_reach())
         to_the_brink(campaign)
         resolve_blue_tot(campaign, [SURVIVES] * 2 + [HITS] * 4 + [SURVIVES] * 2 + [SURVIVES] * 4)
         site = campaign.theater.threats[SA6]
@@ -541,13 +579,118 @@ class TestThePaperTot(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Standoff
+# ---------------------------------------------------------------------------
+
+
+class TestStandoff(unittest.TestCase):
+    """A SEAD element is exposed only to a site it cannot out-range.
+
+    docs/design.md, section 5. An anti-radiation missile is fired from
+    outside the envelope of a site it out-ranges, so on paper that site
+    never gets a shot at the SEAD element; its missiles and its suppression
+    still apply. The slice as shipped is such a slice on both sides, from
+    the published figures (`oob.ANTI_RADIATION_LAUNCH_RANGE`, `theater`).
+    """
+
+    def test_both_sides_missiles_out_range_the_site_they_face(self):
+        theater = build_slice_theater()
+        blue, red = build_slice_oob()
+        for inventory, site_id in ((blue, SA6), (red, PATRIOT)):
+            with self.subTest(side=inventory.coalition):
+                (munition,) = [
+                    m for s in inventory.squadrons.values() for m in s.munitions_total
+                    if m in ANTI_RADIATION_MUNITIONS
+                ]
+                site = theater.threats[site_id]
+                self.assertTrue(
+                    site.outranged_by(launch_range(munition)),
+                    f"{munition} ({launch_range(munition):.0f} m) does not out-range "
+                    f"{site.name} ({site.engagement_radius:.0f} m)",
+                )
+
+    def test_from_standoff_the_sead_element_throws_no_exposure_dice(self):
+        """Section 5's order with step 1 empty: missiles, suppression, strike."""
+        campaign = Campaign()
+        to_the_brink(campaign)
+        frames, dice = resolve_blue_tot(
+            campaign,
+            [SURVIVES] * 4                           # four missiles, all miss
+            + [KILLS_UNLESS_SUPPRESSED] * 2          # strike exposure, suppressed
+            + [SURVIVES] * 4,                        # two strikers' bombs
+        )
+        self.assertEqual(dice.script, [], "the SEAD element was rolled after all")
+        self.assertEqual(dice.drawn, 4 + 2 + 4)
+        package = blue_package(campaign)
+        self.assertEqual(losses_of(campaign, package.sead.spawn_id), [])
+        self.assertEqual(losses_of(campaign, package.strike.spawn_id), [])
+        said = texts(frames)
+        self.assertIn(f"{package.callsign} SEAD off target, 2 aircraft egressing.", said)
+        self.assertIn(f"{package.callsign} off target, 2 aircraft egressing.", said)
+        self.assertFalse([t for t in said if "air defences inbound" in t])
+        sead = campaign.inventories["blue"].squadron(SEAD_SQN)
+        self.assertEqual(sead.munitions_expended, {"AGM-88C": 4})
+        self.assertEqual(sead.airframes_lost, 0)
+        conserved_everywhere(self, campaign)
+
+    def test_a_site_that_reaches_as_far_as_the_missile_gets_its_shot(self):
+        """The boundary: out-ranged means the missile reaches *further*."""
+        for radius, sead_dice in ((HARM_RANGE, 2), (HARM_RANGE - 1.0, 0)):
+            with self.subTest(radius=radius):
+                campaign = Campaign(theater=slice_with(**{SA6: {"engagement_radius": radius}}))
+                to_the_brink(campaign)
+                _, dice = resolve_blue_tot(campaign, [SURVIVES] * (sead_dice + 4 + 2 + 4))
+                self.assertEqual(dice.script, [])
+                self.assertEqual(dice.drawn, sead_dice + 4 + 2 + 4)
+
+    def test_the_strike_element_still_flies_into_the_envelope(self):
+        """Standoff is the SEAD element's: the strikers have to reach the target."""
+        campaign = Campaign()
+        to_the_brink(campaign)
+        _, dice = resolve_blue_tot(
+            campaign, [SURVIVES] * 4 + [HITS, HITS]  # missiles; certain strike deaths
+        )
+        self.assertEqual(dice.script, [])
+        package = blue_package(campaign)
+        self.assertEqual(len(losses_of(campaign, package.strike.spawn_id)), 2)
+        self.assertEqual(losses_of(campaign, package.sead.spawn_id), [])
+
+    def test_red_stands_off_from_the_patriot_too(self):
+        """A Patriot that kills whatever it rolls against, and red's SEAD lives.
+
+        The Kh-58U's published 250 km out-ranges the Patriot's published
+        160 km, so red's SEAD element is never rolled against it; the same
+        Patriot at the Kh-58U's own range kills both jets.
+        """
+        reach = launch_range("Kh-58U")
+        for radius, sead_lost in ((None, 0), (reach, 2)):
+            with self.subTest(radius=radius):
+                fields = {"kill_probability": 1.0}
+                if radius is not None:
+                    fields["engagement_radius"] = radius
+                campaign = Campaign(theater=slice_with(**{PATRIOT: fields}))
+                while not any(p.coalition == "red" and p.weapons_released
+                              for p in campaign.packages.values()):
+                    campaign.advance(PAPER_STEP)
+                    self.assertLess(campaign.clock, 5_000)
+                package = red_package(campaign)
+                self.assertEqual(len(losses_of(campaign, package.sead.spawn_id)), sead_lost)
+                sead = campaign.inventories["red"].squadron(package.sead.squadron_id)
+                self.assertEqual(sead.airframes_lost, sead_lost)
+                self.assertEqual(sead.munitions_expended.get("Kh-58U", 0), 4 - 2 * sead_lost)
+                conserved_everywhere(self, campaign)
+
+
+# ---------------------------------------------------------------------------
 # The parts fail independently
 # ---------------------------------------------------------------------------
 
 
 class TestTheSeadElementCanBeShotDown(unittest.TestCase):
     def test_on_paper_and_the_strike_flies_on_unsuppressed(self):
-        campaign = Campaign()
+        # On paper only a site the HARM cannot out-range shoots at the SEAD
+        # element at all; from standoff, this cannot happen.
+        campaign = Campaign(theater=sa6_in_reach())
         to_the_brink(campaign)
         frames, dice = resolve_blue_tot(
             campaign,
@@ -646,10 +789,25 @@ class TestMixedAuthority(unittest.TestCase):
     strike die kills an aircraft unless the site is suppressed. The script is
     built from the rule and must be used up exactly, so a single die thrown
     at the wrong entity -- or not thrown -- fails the case.
+
+    Each combination is flown twice: against an SA-6 the HARM cannot
+    out-range, where a paper SEAD element flies its exposure, and against the
+    slice's own, which it engages from standoff and so takes no exposure
+    from, whoever holds the site. Standoff takes dice out of the SEAD
+    element's exposure and nowhere else: the missiles, the suppression and
+    the strike are the same in both.
     """
 
-    def _run(self, *, sead_held: bool, strike_held: bool, site_held: bool, contact: bool):
-        campaign = Campaign()
+    def _run(
+        self,
+        *,
+        sead_held: bool,
+        strike_held: bool,
+        site_held: bool,
+        contact: bool,
+        standoff: bool = False,
+    ):
+        campaign = Campaign(theater=build_slice_theater() if standoff else sa6_in_reach())
         to_the_brink(campaign)
         package = blue_package(campaign)
         site = campaign.theater.threats[SA6]
@@ -673,7 +831,7 @@ class TestMixedAuthority(unittest.TestCase):
         # A strike die of 0.1 kills unless the site was suppressed.
         strikers = 2 if (strike_held or missiles) else 0
         script = (
-            ([SURVIVES, SURVIVES] if paper_sead else [])
+            ([SURVIVES, SURVIVES] if paper_sead and not standoff else [])
             + ([HITS] * 4 if missiles else [])
             + ([KILLS_UNLESS_SUPPRESSED] * 2 if paper_strike else [])
             + [SURVIVES] * (2 * strikers)
@@ -713,23 +871,27 @@ class TestMixedAuthority(unittest.TestCase):
         return campaign
 
     def test_every_combination(self):
-        for sead_held in (False, True):
-            for strike_held in (False, True):
-                for site_held in (False, True):
-                    with self.subTest(sead_held=sead_held, strike_held=strike_held,
-                                      site_held=site_held):
-                        self._run(sead_held=sead_held, strike_held=strike_held,
-                                  site_held=site_held, contact=False)
+        for standoff in (False, True):
+            for sead_held in (False, True):
+                for strike_held in (False, True):
+                    for site_held in (False, True):
+                        with self.subTest(standoff=standoff, sead_held=sead_held,
+                                          strike_held=strike_held, site_held=site_held):
+                            self._run(sead_held=sead_held, strike_held=strike_held,
+                                      site_held=site_held, contact=False, standoff=standoff)
 
     def test_a_site_the_sim_shared_with_the_sead_element_is_never_hit_again_on_paper(self):
-        for strike_held in (False, True):
-            with self.subTest(strike_held=strike_held):
-                campaign = self._run(sead_held=False, strike_held=strike_held,
-                                     site_held=False, contact=True)
-                self.assertEqual(blue_package(campaign).sead.sim_contact, [SA6])
+        for standoff in (False, True):
+            for strike_held in (False, True):
+                with self.subTest(standoff=standoff, strike_held=strike_held):
+                    campaign = self._run(sead_held=False, strike_held=strike_held,
+                                         site_held=False, contact=True, standoff=standoff)
+                    self.assertEqual(blue_package(campaign).sead.sim_contact, [SA6])
 
     def test_contact_is_only_with_the_enemys_sites_and_only_before_the_tot(self):
-        campaign = Campaign()
+        # The script below counts the SEAD element's exposure, so the SA-6 is
+        # one the HARM cannot out-range.
+        campaign = Campaign(theater=sa6_in_reach())
         to_the_brink(campaign)
         package = blue_package(campaign)
         patriot = campaign.theater.threats[PATRIOT]
@@ -883,8 +1045,10 @@ class TestConservationThroughALongWar(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-def first_sortie_strike_losses(seed: int, inventories) -> dict[str, int]:
-    """Strike-element aircraft each side lost on its first sortie."""
+def first_sorties(seed: int, inventories) -> dict[str, dict]:
+    """Each side's first sortie: what its strike element and its whole
+    package lost, and whether its SEAD element (if any) out-ranged every site
+    the route met."""
     campaign = Campaign(seed=seed, inventories=inventories)
     flown: dict = {}
     while len(flown) < 2:
@@ -893,39 +1057,68 @@ def first_sortie_strike_losses(seed: int, inventories) -> dict[str, int]:
             if package.coalition not in flown and package.weapons_released:
                 flown[package.coalition] = package
         assert campaign.clock < 10_000, "a first sortie never reached its TOT"
-    return {
-        side: len(losses_of(campaign, package.strike.spawn_id))
-        for side, package in flown.items()
-    }
+    out = {}
+    for side, package in flown.items():
+        # Every enemy site on the route, standing or not: the content decides
+        # standoff, and a site the missiles destroyed was out-ranged too.
+        base = campaign.theater.airbases[package.base_id]
+        target = campaign.theater.targets[package.target_id]
+        sites = [
+            site for site in campaign.theater.threats.values()
+            if site.coalition == enemy_of(side) and site.covers(base.pos, target.pos)
+        ]
+        out[side] = {
+            "strike": len(losses_of(campaign, package.strike.spawn_id)),
+            "package": sum(len(losses_of(campaign, e.spawn_id)) for e in package.elements),
+            "standoff": package.sead is not None and all(
+                site.outranged_by(launch_range(package.sead.munition)) for site in sites
+            ),
+        }
+    return out
+
+
+def first_sortie_strike_losses(seed: int, inventories) -> dict[str, int]:
+    """Strike-element aircraft each side lost on its first sortie."""
+    return {side: sortie["strike"] for side, sortie in first_sorties(seed, inventories).items()}
 
 
 class TestSeadIsWorthFlying(unittest.TestCase):
-    """The goal: with SEAD available, the strikers lose fewer aircraft.
+    """The goal: SEAD is worth flying, for the strikers and for the package.
 
     The same hundred seeds, each side's first sortie -- the one moment both
     configurations fly the same situation into the same site -- once on the
-    slice as shipped and once without a single anti-radiation missile. At the
-    placeholder numbers (Pk 0.15, suppression halving it per surviving SEAD
-    aircraft) the strike element should lose about 0.10 aircraft a sortie
-    escorted against 0.30 alone.
+    slice as shipped and once without a single anti-radiation missile.
 
-    That is the strike element. The SEAD element flies into the same site at
-    its full kill probability first and pays for it: counted in, a package
-    loses more aircraft escorted than not. That is a property of the
-    placeholder numbers, and docs/design.md, section 5, reports it; it is
-    not asserted either way here.
+    Two claims. The strike element loses fewer aircraft escorted: at the
+    placeholder numbers (Pk 0.15, suppression halving it per surviving SEAD
+    aircraft) 7 against 26 for blue and 10 against 26 for red. And, where the
+    SEAD element's missile out-ranges the site it faces, the whole package
+    loses fewer aircraft escorted than the strike alone does: the SEAD
+    element fires from standoff and takes no exposure, so it costs no
+    airframes on paper. Before standoff that second claim was false -- the
+    SEAD element flew into the site at its full kill probability first, and
+    escorted packages lost 46 (blue) and 44 (red) aircraft over these seeds
+    against 26 and 26 alone. A side whose missile does not out-range the site
+    it faces still flies into it, and for that side the claim is not made:
+    its subtest is skipped and says so, rather than asserting something the
+    model does not promise. On the slice as shipped both sides out-range.
     """
 
     SEEDS = range(100)
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.escorted = [first_sorties(seed, None) for seed in cls.SEEDS]
+        cls.alone = [first_sorties(seed, strike_only_oob()) for seed in cls.SEEDS]
+
     def test_escorted_strikers_lose_fewer_aircraft(self):
         escorted = {"blue": 0, "red": 0}
         alone = {"blue": 0, "red": 0}
-        for seed in self.SEEDS:
-            for side, lost in first_sortie_strike_losses(seed, None).items():
-                escorted[side] += lost
-            for side, lost in first_sortie_strike_losses(seed, strike_only_oob()).items():
-                alone[side] += lost
+        for seed in range(len(self.SEEDS)):
+            for side, sortie in self.escorted[seed].items():
+                escorted[side] += sortie["strike"]
+            for side, sortie in self.alone[seed].items():
+                alone[side] += sortie["strike"]
         for side in ("blue", "red"):
             with self.subTest(side=side):
                 self.assertGreater(alone[side], 0, "nobody was ever shot down; vacuous")
@@ -933,6 +1126,22 @@ class TestSeadIsWorthFlying(unittest.TestCase):
                     escorted[side], alone[side],
                     f"{side} strikers lost {escorted[side]} aircraft escorted and "
                     f"{alone[side]} alone over {len(self.SEEDS)} first sorties",
+                )
+
+    def test_from_standoff_an_escorted_package_loses_fewer_aircraft_in_total(self):
+        for side in ("blue", "red"):
+            with self.subTest(side=side):
+                standoff = {sorties[side]["standoff"] for sorties in self.escorted}
+                self.assertEqual(len(standoff), 1, "the same content out-ranged differently")
+                if standoff != {True}:
+                    self.skipTest(f"{side}'s SEAD missile does not out-range the site it faces")
+                escorted = sum(sorties[side]["package"] for sorties in self.escorted)
+                alone = sum(sorties[side]["package"] for sorties in self.alone)
+                self.assertGreater(alone, 0, "nobody was ever shot down; vacuous")
+                self.assertLess(
+                    escorted, alone,
+                    f"{side} packages lost {escorted} aircraft escorted and {alone} "
+                    f"alone over {len(self.SEEDS)} first sorties",
                 )
 
 
