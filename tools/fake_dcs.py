@@ -102,6 +102,7 @@ TEMPLATE_CAPACITY: dict[str, int] = {
     # four-object command post is the default and needs no entry.
     "SA-11_Buk_site": 5,
     "SA-15_Tor_site": 3,
+    "Hawk_site": 5,
     "Roland_site": 3,
     "airbase_infrastructure_large": 24,
     "munitions_storage_large": 24,

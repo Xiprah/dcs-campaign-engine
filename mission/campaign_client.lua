@@ -603,6 +603,19 @@ local TEMPLATES = {
         task = "Ground Nothing",
         skill = "High",
     },
+    -- Blue's area air defence: the AN/MPQ-46 high-power illuminator first,
+    -- because it is what guides the missiles, then M192 launchers. A DCS
+    -- Hawk site is usually also given its search radar and command post;
+    -- this table has room for one lead type, so whether illuminator and
+    -- launchers alone engage anything is, as for the Patriot, the in-sim
+    -- validator's question. The type names are unverified like the rest.
+    ["Hawk_site"] = {
+        lead_type = "Hawk tr",
+        unit_type = "Hawk ln",
+        count = 5,
+        task = "Ground Nothing",
+        skill = "High",
+    },
     -- Blue's point defence: a search radar first, as the other batteries
     -- lead with theirs, then fire units that carry their own.
     ["Roland_site"] = {

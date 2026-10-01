@@ -43,7 +43,7 @@ out one crash at a time, a week apart, in the middle of a sortie.
 - whether the SA-6 site spawns as the client builds it: a red (`RUSSIA`)
   ground group on the ground, radar as unit 1, launchers after, no payload;
   and the same of the Patriot site, as a blue (`USA`) one, and of the Syria
-  theater's SA-11 and SA-15 (red) and Roland (blue) sites. Its four static
+  theater's SA-11 and SA-15 (red) and Hawk and Roland (blue) sites. Its four static
   templates are probed as one object each, like the slice's;
 - whether each of the other templates spawns for the country the client
   spawns it for: red's Su-24M strike two-ship for `RUSSIA`, red's fuel depot

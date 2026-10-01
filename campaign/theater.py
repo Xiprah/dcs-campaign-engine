@@ -530,24 +530,45 @@ SYRIA_HAMA = _dcs_point(8662.594238, 74333.1875)  # Hama, id 14
 SYRIA_SHAYRAT = _dcs_point(-61368.212891, 90675.136719)  # Shayrat, id 36
 SYRIA_TABQA = _dcs_point(76964.6875, 243605.210938)  # Tabqa, id 37
 
-#: Placeholder envelope for an SA-11 battery, red's area air defence on the
-#: Syria map, as one ground radius: a round number between the SA-6's and the
-#: Patriot's, as the system's reach is. Uncalibrated like both. See ThreatSite.
+# Envelopes of the Syria map's site types, each one ground radius at the
+# system's published maximum range, untrimmed, for the SA-6's reason: section
+# 5 of docs/design.md compares them with the anti-radiation missiles'
+# published maxima, and a trim would decide that comparison. Each is a
+# placeholder for an envelope that really depends on altitude and terrain.
+
+#: Red's area air defence, the 9K37M1 Buk-M1 the DCS SA-11 is: 35 km
+#: (Wikipedia, "Buk missile system", comparison table, 9K37M1 "Buk-M1" with
+#: 9M38/9M38M1 missiles, "3,3–35 km"; the article's general engagement zone
+#: of 3-42 km belongs to later variants).
 SA11_ENGAGEMENT_RADIUS = 35_000.0
 
-#: Placeholder envelope shared by both sides' point defences on the Syria map,
-#: red's SA-15 and blue's Roland. One number for both, as the kill
-#: probabilities below are one number for every type: a better guess for one
-#: side than the other would decide the war by content nobody has measured.
-POINT_DEFENCE_ENGAGEMENT_RADIUS = 10_000.0
-SA15_ENGAGEMENT_RADIUS = POINT_DEFENCE_ENGAGEMENT_RADIUS
-ROLAND_ENGAGEMENT_RADIUS = POINT_DEFENCE_ENGAGEMENT_RADIUS
+#: Red's point defence: 12 km, the 9M331 missile's engagement range
+#: (Wikipedia, "Tor missile system", Missiles section, "Engagement range is up
+#: to 12 kilometres"). The 25 km in that article's infobox is the search
+#: radar's detection range, not a range the system engages at.
+SA15_ENGAGEMENT_RADIUS = 12_000.0
+
+#: Blue's point defence: 8 km (Wikipedia, "Roland (missile)", infobox,
+#: "Operational range: 8,000 m"). The same article gives 6.3 km for the
+#: original system and 8.5 km for the later Roland 3.
+ROLAND_ENGAGEMENT_RADIUS = 8_000.0
+
+#: Blue's area air defence on the Syria map, a MIM-23 Hawk, which Turkey
+#: operates: 50 km, the upper end of the published range (Wikipedia, "MIM-23
+#: Hawk", infobox, "Operational range 28–31 mi (45–50 km)"; its text gives 45
+#: km for the MIM-23K and 35 km for the MIM-23B to M). Not the Patriot the
+#: slice uses: at its published 160 km, one Patriot battery covers
+#: blue's whole side of the border, its shallow targets included, and the war
+#: loses the depth that gives it an arc. That trade is content, not physics,
+#: and the Patriot's radius stays its published figure.
+HAWK_ENGAGEMENT_RADIUS = 50_000.0
 
 #: The SA-6's placeholder, for the reason PATRIOT_KILL_PROBABILITY is. What
 #: tells the types apart is reach, not lethality, until TODO(threat-model).
 SA11_KILL_PROBABILITY = SA6_KILL_PROBABILITY
 SA15_KILL_PROBABILITY = SA6_KILL_PROBABILITY
 ROLAND_KILL_PROBABILITY = SA6_KILL_PROBABILITY
+HAWK_KILL_PROBABILITY = SA6_KILL_PROBABILITY
 
 
 #: Red's strategic targets, which blue strikes, then blue's, which red
@@ -623,15 +644,15 @@ SYRIA_SITES: tuple[tuple[str, str, Coalition, Vec3, str, int, float, float], ...
     ("shayrat_sa15", "Shayrat SA-15", "red", _offset(SYRIA_SHAYRAT, 1_000.0, -1_000.0),
      "SA-15_Tor_site", 3, SA15_ENGAGEMENT_RADIUS, SA15_KILL_PROBABILITY),
     # Blue's three deep targets are within 13 km of each other around
-    # Incirlik and Adana, so one Patriot covers them all. The second is the
-    # one envelope over the Kahramanmaras target, a middle one, as an SA-15
-    # is over each of red's.
-    ("incirlik_patriot", "Incirlik Patriot", "blue",
+    # Incirlik and Adana, so one Hawk covers them all. The second is the one
+    # envelope over the Kahramanmaras target, a middle one, as an SA-15 is
+    # over each of red's. Hawks, not Patriots: see HAWK_ENGAGEMENT_RADIUS.
+    ("incirlik_hawk", "Incirlik Hawk", "blue",
      _offset(SYRIA_INCIRLIK, -5_000.0, -5_000.0),
-     "Patriot_site", 5, PATRIOT_ENGAGEMENT_RADIUS, PATRIOT_KILL_PROBABILITY),
-    ("kahramanmaras_patriot", "Kahramanmaras Patriot", "blue",
+     "Hawk_site", 5, HAWK_ENGAGEMENT_RADIUS, HAWK_KILL_PROBABILITY),
+    ("kahramanmaras_hawk", "Kahramanmaras Hawk", "blue",
      _offset(SYRIA_KAHRAMANMARAS, 5_000.0, 0.0),
-     "Patriot_site", 5, PATRIOT_ENGAGEMENT_RADIUS, PATRIOT_KILL_PROBABILITY),
+     "Hawk_site", 5, HAWK_ENGAGEMENT_RADIUS, HAWK_KILL_PROBABILITY),
     ("sanliurfa_roland", "Sanliurfa Roland", "blue",
      _offset(SYRIA_SANLIURFA, 1_500.0, -1_000.0),
      "Roland_site", 3, ROLAND_ENGAGEMENT_RADIUS, ROLAND_KILL_PROBABILITY),

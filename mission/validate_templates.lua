@@ -243,6 +243,15 @@ local SPEC = {
             probe_category = "ground",
             probe_country = "RUSSIA",
         },
+        ["Hawk_site"] = {
+            lead_type = "Hawk tr",
+            unit_type = "Hawk ln",
+            count = 5,
+            task = "Ground Nothing",
+            skill = "High",
+            probe_category = "ground",
+            probe_country = "USA",
+        },
         ["Roland_site"] = {
             lead_type = "Roland Radar",
             unit_type = "Roland ADS",
@@ -290,7 +299,8 @@ local SPEC = {
                       "SA-6_Kub_site", "Su-24M_strike_fab",
                       "munitions_storage_medium", "Patriot_site",
                       "F-16C_sead_harm", "Su-24M_sead_kh58",
-                      "SA-11_Buk_site", "SA-15_Tor_site", "Roland_site",
+                      "SA-11_Buk_site", "SA-15_Tor_site", "Hawk_site",
+                      "Roland_site",
                       "command_post_medium", "airbase_infrastructure_large",
                       "munitions_storage_large", "fuel_depot_large"},
 
