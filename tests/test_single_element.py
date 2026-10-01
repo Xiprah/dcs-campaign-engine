@@ -20,10 +20,11 @@ a side cannot attach a SEAD element, so every package is its strike element
 alone, and anything that differs from the recording is the new mechanism
 leaking into the old case.
 
-One difference is deliberate, and is applied to the recording rather than
-hidden from the comparison: a flight spawned after its TOT is now sent home
-with no attack task (`with_the_egress_fix` says why). Nothing else moved: not
-one die, spawn id, loss, message or other frame field.
+Two differences are deliberate, and are applied to the recording rather
+than hidden from the comparison: a flight spawned after its TOT is now sent
+home with no attack task (`with_the_egress_fix` says why), and the `sync`
+frame names wire protocol 3 (`with_protocol_v3`). Nothing else moved: not one
+die, spawn id, loss, message or other frame field.
 """
 
 from __future__ import annotations
@@ -199,6 +200,24 @@ def with_the_egress_fix(recorded: dict) -> tuple[dict, int]:
     return adjusted, touched
 
 
+def with_protocol_v3(recorded: dict) -> tuple[dict, int]:
+    """The recording, with the wire version it was made under brought up to date.
+
+    Protocol v3 (docs/protocol.md, "Changes from v2") adds ammunition to the
+    uplink snapshot; the engine's `sync` says which version it speaks, so
+    that one integer in that one frame is the only thing the bump can change
+    in a downlink recording. Returns the adjusted recording and how many
+    frames it touched.
+    """
+    adjusted = json.loads(json.dumps(recorded))
+    touched = 0
+    for frame in adjusted["frames"]:
+        if frame["type"] == "sync" and frame["protocol"] == 2:
+            frame["protocol"] = 3
+            touched += 1
+    return adjusted, touched
+
+
 class TestAStrikeOnlyPackageIsTheOneFlightPackage(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -237,10 +256,13 @@ class TestAStrikeOnlyPackageIsTheOneFlightPackage(unittest.TestCase):
                 )
 
     def test_every_watched_war_is_the_recorded_one(self):
-        """Frame for frame, but for the flights sent home without a task."""
+        """Frame for frame, but for the flights sent home without a task and
+        the protocol version the sync frame names."""
         for seed, recorded in sorted(self.recorded["watched"].items()):
             with self.subTest(seed=seed):
-                expected, touched = with_the_egress_fix(recorded)
+                current, synced = with_protocol_v3(recorded)
+                self.assertEqual(synced, 1, "one sync per watched war")
+                expected, touched = with_the_egress_fix(current)
                 self.assertGreater(touched, 0, "no post-TOT spawn; the fix is untested")
                 self.assertEqual(
                     _normalised(fingerprint_watched_war(int(seed))), expected
@@ -260,6 +282,26 @@ class TestAStrikeOnlyPackageIsTheOneFlightPackage(unittest.TestCase):
                 if new != old:
                     self.assertEqual(old["tasking"]["kind"], "strike")
                     self.assertEqual(new["tasking"]["kind"], "egress")
+
+    def test_the_version_bump_changes_nothing_but_the_sync_protocol(self):
+        """Nor can the other adjustment: one integer, in the one sync frame."""
+        for seed, recorded in sorted(self.recorded["watched"].items()):
+            expected, _ = with_protocol_v3(recorded)
+            self.assertEqual(expected["state"], recorded["state"])
+            self.assertEqual(len(expected["frames"]), len(recorded["frames"]))
+            changed = [
+                (new, old)
+                for new, old in zip(expected["frames"], recorded["frames"])
+                if new != old
+            ]
+            self.assertEqual(len(changed), 1, seed)
+            new, old = changed[0]
+            self.assertEqual(old["type"], "sync")
+            self.assertEqual((old["protocol"], new["protocol"]), (2, 3))
+            self.assertEqual(
+                {k: v for k, v in new.items() if k != "protocol"},
+                {k: v for k, v in old.items() if k != "protocol"},
+            )
 
 
 if __name__ == "__main__":

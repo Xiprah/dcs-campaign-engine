@@ -244,7 +244,7 @@ class TestTheLoopCloses(unittest.TestCase):
             path = Path(self.enterContext(_tempdir())) / "campaign.json"
             self.campaign.save(path)
             raw = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(raw["save_version"], 6)
+            self.assertEqual(raw["save_version"], 7)
         reloaded = Campaign.load(path)
         self.assertEqual(reloaded.to_dict(), self.campaign.to_dict())
         # And it is an engine rather than a deserialised blob. `tick` cannot
@@ -377,10 +377,11 @@ class TestAWatchedSeadElementIsTheSimsToResolve(unittest.TestCase):
 
     Blue's SEAD element flies two minutes ahead of the strike the observer
     chases, inside the bubble, past the SA-6 the bubble also holds; the
-    harness has it destroy one unit of the battery (`--sead-kills 1`). That
-    loss may arrive only by snapshot, the paper may not fire the same
-    missiles again at the TOT, and the whole war must come out the same with
-    every event dropped.
+    harness has it fire its four missiles and destroy one unit of the
+    battery (`--sead-kills 1`). That loss may arrive only by snapshot, the
+    missiles only by the ammunition the snapshots carry, the paper may not
+    fire them again at the TOT, and the whole war must come out the same
+    with every event dropped.
     """
 
     @classmethod
@@ -406,10 +407,13 @@ class TestAWatchedSeadElementIsTheSimsToResolve(unittest.TestCase):
         site = self.with_events.theater.threats[SA6]
         self.assertEqual(site.units_alive, site.units_initial - 1)
         package = blue_packages(self.with_events)[0]
-        # The two shared the sim, so the paper left the battery alone at the
-        # TOT whoever held what by then.
-        self.assertEqual(package.sead.sim_contact, [SA6])
+        # It fired all four in the sim, so the paper had none left to fire
+        # at the battery at the TOT, whoever held what by then.
+        self.assertEqual(package.sead.sim_spent, 4)
         self.assertTrue(package.weapons_released)
+        engaged = [o for o in self.loud.sead_outcomes
+                   if o["flight"] == f"cmp_{package.sead.spawn_id}"]
+        self.assertEqual(sum(o["missiles"] for o in engaged), 4)
 
     def test_the_campaign_state_is_identical_without_events(self):
         self.assertEqual(self.quiet.sent.get("event", 0), 0)
@@ -419,6 +423,44 @@ class TestAWatchedSeadElementIsTheSimsToResolve(unittest.TestCase):
         )
         self.assertEqual(
             [x.attribution for x in self._site_losses(self.without_events)], ["unknown"]
+        )
+
+
+class TestASeadElementThatFiredPartOfItsLoad(unittest.TestCase):
+    """The reconciliation rule with the ammunition count doing work.
+
+    The harness's SEAD pass fires one missile of four (`--sead-shots 1`).
+    What the engine learns of it comes from the snapshots' ammunition alone,
+    so the war -- the missile booked when it left the sim included -- must
+    be identical with every event frame dropped.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.with_events, cls.loud = run_loop(sead_shots=1, sead_kills=1)
+        cls.without_events, cls.quiet = run_loop(
+            sead_shots=1, sead_kills=1, drop_events=True
+        )
+
+    def test_the_sim_fired_one_and_the_engine_counted_one(self):
+        package = blue_packages(self.with_events)[0]
+        engaged = [o for o in self.loud.sead_outcomes
+                   if o["flight"] == f"cmp_{package.sead.spawn_id}"]
+        self.assertEqual(sum(o["missiles"] for o in engaged), 1, self.loud.sead_outcomes)
+        self.assertEqual(package.sead.sim_spent, 1)
+        sead = self.with_events.inventories["blue"].squadron("vfa_incirlik_f16_sead")
+        self.assertEqual(
+            sead.munitions_expended.get("AGM-88C", 0) + sead.munitions_lost.get("AGM-88C", 0),
+            4,
+            "the four missiles the two-ship carried are not accounted for",
+        )
+        sead.check_invariant()
+
+    def test_the_campaign_state_is_identical_without_events(self):
+        self.assertEqual(self.quiet.sent.get("event", 0), 0)
+        self.assertEqual(
+            strip_event_derived(self.without_events.to_dict()),
+            strip_event_derived(self.with_events.to_dict()),
         )
 
 
@@ -677,14 +719,90 @@ class TestTheHarnessRefusesWhatTheClientRefuses(unittest.TestCase):
                               acks[0].error)
 
 
-class TestAVersion1ClientIsRefused(unittest.TestCase):
-    """The real engine behind the real transport closes on a v1 hello.
+class TestTheHarnessFiresOnlyWhatItCarries(unittest.TestCase):
+    """tools/fake_dcs.py may be no more forgiving about ammunition either.
 
-    Nothing may be written first: not a sync, and not a spawn the v1 client
-    would build from its template regardless of the unit count it cannot read.
+    The Lua client builds every flight with empty pylons today; a harness
+    whose SEAD pass destroyed a radar with no missiles aboard would prove
+    things about a sim that does not exist. And what it fires has to show in
+    the next snapshot, because that is all the engine may learn it from.
     """
 
-    def test_the_connection_closes_and_nothing_is_written(self):
+    def _sim(self, **config):
+        sim = FakeDCS(Config(**config))
+        sent: list = []
+
+        async def record(out):
+            sent.append(out)
+
+        sim._send = record
+        return sim, sent
+
+    def _setup(self, sim):
+        site = dict(seq=1, t=0.0, ref=1, spawn_id="5a60", coalition="red",
+                    category="ground", template="SA-6_Kub_site", units=5,
+                    position=(16000.0, 0.0, 25000.0), tasking={"kind": "air_defence"})
+        sead = dict(seq=2, t=0.0, ref=2, spawn_id="5ead", coalition="blue",
+                    category="plane", template="F-16C_sead_harm", units=2,
+                    position=(17000.0, 6000.0, 26000.0),
+                    tasking={"kind": "sead", "targets": ["cmp_5a60"], "tot": 0.0})
+        asyncio.run(sim._on_spawn(Spawn(**site)))
+        asyncio.run(sim._on_spawn(Spawn(**sead)))
+        return sim.groups["5ead"], sim.groups["5a60"]
+
+    def _pass(self, **config):
+        sim, sent = self._sim(**config)
+        with self.assertLogs("fake_dcs", level="INFO"):
+            flight, site = self._setup(sim)
+            asyncio.run(sim._resolve_strikes())
+            asyncio.run(sim._send_state())
+        state = [f for f in sent if f.type == "state"][-1]
+        reported = {g.spawn_id: g for g in state.groups}
+        return flight, site, reported
+
+    def test_with_empty_pylons_a_sead_pass_fires_and_destroys_nothing(self):
+        flight, site, reported = self._pass(loadout=0, sead_kills=1)
+        self.assertTrue(flight.resolved, "the pass was never made")
+        self.assertEqual(site.units, 5)
+        self.assertEqual(reported["5ead"].ammo, {})
+        self.assertEqual(reported["5ead"].ammo_initial, {})
+
+    def test_what_a_sead_pass_fires_comes_off_the_next_snapshot(self):
+        flight, site, reported = self._pass(loadout=2, sead_kills=1, sead_shots=1)
+        self.assertEqual(site.units, 4)
+        self.assertEqual(reported["5ead"].ammo, {"AGM-88C": 3})
+        self.assertEqual(reported["5ead"].ammo_initial, {"AGM-88C": 4})
+        # Only aircraft report ammunition, as only the Lua client's AIRBORNE
+        # categories do.
+        self.assertIsNone(reported["5a60"].ammo)
+        self.assertIsNone(reported["5a60"].ammo_initial)
+
+    def test_an_unarmed_strike_destroys_nothing(self):
+        sim, _ = self._sim(loadout=0)
+        target = dict(seq=1, t=0.0, ref=1, spawn_id="d090", coalition="red",
+                      category="structure", template="fuel_depot_medium", units=4,
+                      position=(0.0, 0.0, 0.0), tasking={"kind": "static"})
+        strike = dict(seq=2, t=0.0, ref=2, spawn_id="57e1", coalition="blue",
+                      category="plane", template="F-16C_strike_jdam", units=2,
+                      position=(100.0, 6000.0, 100.0),
+                      tasking={"kind": "strike", "target": "cmp_d090", "tot": 0.0})
+        with self.assertLogs("fake_dcs", level="INFO"):
+            asyncio.run(sim._on_spawn(Spawn(**target)))
+            asyncio.run(sim._on_spawn(Spawn(**strike)))
+            asyncio.run(sim._resolve_strikes())
+        self.assertTrue(sim.groups["57e1"].resolved)
+        self.assertEqual(sim.groups["d090"].units, 4)
+
+
+class TestAnOlderClientIsRefused(unittest.TestCase):
+    """The real engine behind the real transport closes on an old hello.
+
+    Nothing may be written first: not a sync, and not a spawn the v1 client
+    would build from its template regardless of the unit count it cannot
+    read, nor one a v2 client would fly without ever reporting what it fired.
+    """
+
+    def _refused(self, version: int) -> tuple[Campaign, bytes, bool, list[str]]:
         async def go():
             campaign = Campaign()
             server = CampaignServer(
@@ -693,7 +811,7 @@ class TestAVersion1ClientIsRefused(unittest.TestCase):
             await server.start()
             try:
                 reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
-                writer.write(encode(Hello(seq=1, t=0.0, protocol=1, theater="Syria")))
+                writer.write(encode(Hello(seq=1, t=0.0, protocol=version, theater="Syria")))
                 await writer.drain()
                 received, closed = b"", False
                 try:
@@ -709,12 +827,28 @@ class TestAVersion1ClientIsRefused(unittest.TestCase):
 
         with self.assertLogs("campaign.server", level="ERROR") as logs:
             campaign, received, closed = asyncio.run(go())
-            self.assertEqual(received, b"", "the engine answered a v1 client")
-            self.assertTrue(closed, "the engine left a v1 client connected")
+        return campaign, received, closed, logs.output
+
+    def test_the_connection_closes_and_nothing_is_written(self):
+        campaign, received, closed, output = self._refused(1)
+        self.assertEqual(received, b"", "the engine answered a v1 client")
+        self.assertTrue(closed, "the engine left a v1 client connected")
         self.assertFalse(campaign.connected)
         self.assertTrue(
-            any("client protocol 1 != engine 2" in line for line in logs.output),
-            logs.output,
+            any("client protocol 1 != engine 3" in line for line in output),
+            output,
+        )
+
+    def test_a_version_2_client_is_refused_the_same_way(self):
+        """A v2 client reports no ammunition, and the engine would read every
+        SEAD element it held as having fired its whole load."""
+        campaign, received, closed, output = self._refused(2)
+        self.assertEqual(received, b"", "the engine answered a v2 client")
+        self.assertTrue(closed, "the engine left a v2 client connected")
+        self.assertFalse(campaign.connected)
+        self.assertTrue(
+            any("client protocol 2 != engine 3" in line for line in output),
+            output,
         )
 
 

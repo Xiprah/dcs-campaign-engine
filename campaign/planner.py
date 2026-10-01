@@ -168,13 +168,20 @@ class Element:
     #: Set when the package's TOT is resolved; after that this element's
     #: ordnance is gone whatever happens to the aircraft.
     weapons_released: bool = False
-    #: Ids of enemy threat sites DCS has held at the same time as this
-    #: element, before its TOT was resolved. Sorted. Only a SEAD element's is
-    #: ever read: its DCS task engages air defences wherever it meets them,
-    #: so a site it shared the sim with was the sim's to engage, and the
-    #: paper must not fire the same missiles at it again (docs/design.md,
-    #: section 5).
-    sim_contact: list[str] = field(default_factory=list)
+    #: Rounds of its munition gone from the sim since it was fragged, over
+    #: every instantiation: fired, or carried down with an aircraft the sim
+    #: destroyed -- a summed count cannot tell the two apart, and the paper
+    #: may fire neither. Read from snapshots only, and only a SEAD element's
+    #: (docs/design.md, section 5). Zero for an element never instantiated.
+    sim_spent: int = 0
+    #: The count of its munition last read during the current
+    #: instantiation, starting from the client's spawn-time reading (the
+    #: baseline). Every drop from one reading to the next is spent. A rise,
+    #: which a jet in flight cannot do, is taken as the new reading, so a
+    #: later drop is still counted. None until a snapshot of this
+    #: instantiation arrives; each instantiation starts again, because the
+    #: client builds every spawn with the template's loadout.
+    ammo_seen: int | None = None
 
     @property
     def is_open(self) -> bool:
@@ -198,7 +205,8 @@ class Element:
             "t_rtb": self.t_rtb,
             "state": self.state,
             "weapons_released": self.weapons_released,
-            "sim_contact": list(self.sim_contact),
+            "sim_spent": self.sim_spent,
+            "ammo_seen": self.ammo_seen,
         }
 
     @classmethod
@@ -217,7 +225,8 @@ class Element:
             t_rtb=float(raw["t_rtb"]),
             state=raw["state"],
             weapons_released=bool(raw["weapons_released"]),
-            sim_contact=[str(site_id) for site_id in raw["sim_contact"]],
+            sim_spent=int(raw["sim_spent"]),
+            ammo_seen=None if raw["ammo_seen"] is None else int(raw["ammo_seen"]),
         )
 
 

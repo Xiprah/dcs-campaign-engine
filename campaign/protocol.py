@@ -13,7 +13,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 #: Hard cap on a single frame. Longer frames indicate a bug, not a big payload.
 MAX_FRAME_BYTES = 64 * 1024
@@ -73,6 +73,13 @@ class GroupSnapshot:
     units: int
     units_initial: int
     pos: Vec3 | None = None
+    #: Rounds aboard, per weapon, summed over the group's living units; for
+    #: aircraft only. None when there is nothing to report or the client
+    #: could not read it -- never guessed. See docs/protocol.md.
+    ammo: dict[str, int] | None = None
+    #: The same count as the client read it when it built the group, before
+    #: anything could have been fired. The engine's baseline.
+    ammo_initial: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -295,7 +302,38 @@ def _check_state(report: StateReport) -> StateReport:
             raise ProtocolError(
                 f"malformed GroupSnapshot: spawn_id {group.spawn_id!r} is not a string"
             )
+        for name in ("ammo", "ammo_initial"):
+            _check_ammo(group.spawn_id, name, getattr(group, name))
     return report
+
+
+def _check_ammo(spawn_id: str, name: str, ammo: Any) -> None:
+    """An ammunition count is a map of weapon name to a whole, non-negative count.
+
+    Refused rather than repaired, like the rest of a snapshot. A count read
+    wrongly is a count of missiles the sim fired, and the engine withholds
+    exactly that many from the paper: a guessed count either fires a missile
+    twice or silently disarms a SEAD element. Null is allowed -- it is how a
+    client says it has nothing to report -- and the engine reads it as an
+    unvouched count, never as zero.
+    """
+    if ammo is None:
+        return
+    if not isinstance(ammo, dict):
+        raise ProtocolError(
+            f"malformed GroupSnapshot {spawn_id}: {name} is {type(ammo).__name__}, "
+            f"not an object"
+        )
+    for weapon, count in ammo.items():
+        if not isinstance(weapon, str) or not weapon:
+            raise ProtocolError(
+                f"malformed GroupSnapshot {spawn_id}: {name} has weapon name {weapon!r}"
+            )
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ProtocolError(
+                f"malformed GroupSnapshot {spawn_id}: {name}[{weapon!r}] is {count!r}, "
+                f"not a whole non-negative count"
+            )
 
 
 def decode_uplink(raw: bytes | str) -> Uplink:

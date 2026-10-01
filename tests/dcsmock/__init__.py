@@ -8,8 +8,11 @@ backed by a genuine non-blocking Python socket, so the client opens a real
 TCP connection to a real campaign engine.
 
 What is deliberately *not* modelled: flight dynamics, weapons, damage. The
-harness kills things when a test says to. Mission time is whatever
-:meth:`DCSMock.advance` has been called with; nothing here reads a clock.
+harness kills things when a test says to, and empties a pylon when a test
+says a missile was fired (:meth:`DCSMock.fire_weapon`); `Unit:getAmmo` only
+reports what a test loaded (:meth:`DCSMock.load_ammo`). Mission time is
+whatever :meth:`DCSMock.advance` has been called with; nothing here reads a
+clock.
 
 Nothing in this package is imported by the main suite unless lupa is
 installed -- see the skip guard in tests/test_mission_client.py.
@@ -420,6 +423,39 @@ class DCSMock:
 
     def kill_unit(self, unit_name: str) -> bool:
         return bool(self.env.kill_unit(unit_name))
+
+    def load_ammo(self, unit_type: str, entries: list[tuple[str, int, int]]) -> None:
+        """Every unit of `unit_type` built from now on carries `entries`.
+
+        Each entry is (DCS typeName, count, desc.category); category 0 is the
+        gun's shells. Units already built keep what they have.
+        """
+        table = self.lua.table_from(
+            [
+                self.lua.table_from(
+                    {
+                        "count": count,
+                        "desc": self.lua.table_from(
+                            {"typeName": type_name, "category": category}
+                        ),
+                    }
+                )
+                for type_name, count, category in entries
+            ]
+        )
+        self.env.ammo_by_type[unit_type] = table
+
+    def fire_weapon(self, unit_name: str, type_name: str, count: int = 1) -> int:
+        """Take `count` rounds of `type_name` off one unit; return how many."""
+        return int(self.env.fire_weapon(unit_name, type_name, count))
+
+    def fail_get_ammo(self, unit_name: str, fail: bool = True) -> None:
+        """Make one unit's getAmmo raise, as a stale or broken handle does."""
+        self.env.ammo_raises[unit_name] = True if fail else None
+
+    def without_get_ammo(self) -> None:
+        """Build units from now on with no getAmmo at all."""
+        self.env.no_get_ammo = True
 
     def kill_group(self, name: str) -> bool:
         return bool(self.env.kill_group(name))

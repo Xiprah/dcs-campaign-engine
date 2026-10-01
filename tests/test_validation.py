@@ -90,6 +90,11 @@ EXPECTED_IDS = {
     "task.EngageTargets_SEAD",
     "task.AttackGroup_SEAD",
     "drift.sead_target_types",
+    # Protocol v3's ammunition report: the weapon type names getAmmo gives
+    # each SEAD missile, and the cross-check on the client's table of them.
+    "ammo.F-16C_sead_harm",
+    "ammo.Su-24M_sead_kh58",
+    "drift.weapon_names",
 }
 
 
@@ -150,11 +155,14 @@ class ValidatorRun:
         ammo: dict[str, str] | None = None,
         ammo_always: bool = False,
         autoload: bool = True,
+        get_ammo: bool = True,
     ) -> None:
         # Port 1 has nothing listening. Only the `with_client` runs open a
         # socket at all, and a refused connect is a path the client already
         # has tests for; nothing here waits on it.
         self.mock = DCSMock(port=1, tick=0.1, autostart=False)
+        if not get_ammo:
+            self.mock.without_get_ammo()
         self.tmp = tempfile.TemporaryDirectory()
         self.json_path = Path(self.tmp.name) / "campaign_validation.json"
 
@@ -666,10 +674,49 @@ class TestThePylonProbe(unittest.TestCase):
         self.assertIn("cannot tell loaded from unarmed", control["error"])
 
     def test_without_getammo_it_says_unknown_rather_than_guessing(self):
-        run = ValidatorRun()  # the plain mock has no weapons model at all
+        # Units built with no getAmmo at all, as an environment without the
+        # call would build them.
+        run = ValidatorRun(get_ammo=False)
         self.addCleanup(run.close)
         by_id = {r["id"]: r for r in run.run_now()["results"]}
         case = by_id["pylon.baseline_empty"]
+        self.assertEqual(case["status"], "UNKNOWN")
+        self.assertIn("getAmmo", case["error"])
+
+
+@requires_lua
+class TestTheWeaponTypeNameCases(unittest.TestCase):
+    """The `ammo.*` cases: what DCS calls a SEAD missile, and whether the
+    client's WEAPON_NAMES reports it under the engine's name."""
+
+    HARM_CLSID = "{B06DD79A-F21E-4EB9-BD9D-AB3844618C93}"
+
+    def case(self, loaded: dict[str, str]) -> dict:
+        run = ValidatorRun(ammo=loaded)
+        self.addCleanup(run.close)
+        return {r["id"]: r for r in run.run_now()["results"]}["ammo.F-16C_sead_harm"]
+
+    def test_a_type_name_the_client_maps_is_ok_and_recorded(self):
+        case = self.case({self.HARM_CLSID: "weapons.missiles.AGM_88"})
+        self.assertEqual(case["status"], "OK", case["error"])
+        self.assertFalse(case["required"])
+        self.assertIn("weapons.missiles.AGM_88x2->AGM-88C", case["detail"]["type_names"])
+
+    def test_a_type_name_the_client_does_not_map_is_rejected_by_name(self):
+        case = self.case({self.HARM_CLSID: "weapons.missiles.AGM_88C_HARM"})
+        self.assertEqual(case["status"], "REJECTED")
+        self.assertIn("weapons.missiles.AGM_88C_HARM", case["error"])
+        self.assertIn("unmapped", case["detail"]["type_names"])
+
+    def test_an_empty_pylon_names_nothing_and_says_so(self):
+        case = self.case({})
+        self.assertEqual(case["status"], "UNKNOWN")
+        self.assertIn("pylon stayed empty", case["error"])
+
+    def test_without_getammo_it_says_unknown(self):
+        run = ValidatorRun(get_ammo=False)
+        self.addCleanup(run.close)
+        case = {r["id"]: r for r in run.run_now()["results"]}["ammo.Su-24M_sead_kh58"]
         self.assertEqual(case["status"], "UNKNOWN")
         self.assertIn("getAmmo", case["error"])
 
@@ -723,7 +770,7 @@ class TestItValidatesWhatTheClientActuallyUses(unittest.TestCase):
         run = ValidatorRun()
         self.addCleanup(run.close)
         by_id = {r["id"]: r for r in run.run_now()["results"]}
-        for case in ("drift.templates", "drift.sead_target_types"):
+        for case in ("drift.templates", "drift.sead_target_types", "drift.weapon_names"):
             drift = by_id[case]
             self.assertEqual(drift["status"], "SKIP", case)
             self.assertFalse(drift["required"], case)
@@ -744,6 +791,26 @@ class TestItValidatesWhatTheClientActuallyUses(unittest.TestCase):
         self.assertEqual(drift["status"], "DRIFT")
         self.assertTrue(drift["required"])
         self.assertIn("SAM SR", drift["error"])
+
+    def test_the_weapon_names_match_the_clients_own(self):
+        run = ValidatorRun(with_client=True)
+        self.addCleanup(run.close)
+        drift = {r["id"]: r for r in run.run_now()["results"]}["drift.weapon_names"]
+        self.assertEqual(drift["status"], "OK", drift["error"])
+        self.assertTrue(drift["required"])
+
+    def test_weapon_names_changed_in_the_client_are_reported_as_drift(self):
+        for key, value in (("weapons.missiles.AGM_88", "AGM-88B"),
+                           ("weapons.missiles.AGM_88_HARM", "AGM-88C")):
+            with self.subTest(key=key):
+                run = ValidatorRun(with_client=True, autoload=False)
+                self.addCleanup(run.close)
+                run.mock.lua.globals().CampaignClient.WEAPON_NAMES[key] = value
+                run.load()
+                drift = {r["id"]: r for r in run.run_now()["results"]}["drift.weapon_names"]
+                self.assertEqual(drift["status"], "DRIFT")
+                self.assertTrue(drift["required"])
+                self.assertIn(key, drift["error"])
 
     def test_the_validator_needs_no_client_and_no_engine(self):
         # It loaded and ran in every test above with no campaign_client.lua
