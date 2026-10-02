@@ -399,7 +399,10 @@ To run inside DCS for real, see `mission/README.md` — it covers desanitising
 - Target damage, airframe losses and munition expenditure charged to a
   conserved inventory that cannot leak on a scrubbed or destroyed package.
 - JSON save and reload, including the RNG state and the spawn-id counter, so a
-  restarted engine continues the same war rather than a similar one.
+  restarted engine continues the same war rather than a similar one. The
+  save is written every minute while the engine runs (`--autosave`), on
+  every DCS disconnect, on Ctrl+C and when the console window is closed, so
+  a war that runs for days with DCS closed loses at most a minute to a crash.
 - Reconnect after a sim restart: re-sync, re-issue every live spawn at the
   unit count attrition has already recorded, and rebase the mission clock so
   the campaign loses no time.

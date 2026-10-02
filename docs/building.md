@@ -90,11 +90,17 @@ Things worth knowing:
   default `saves\campaign.json` lands next to the exe. From a shortcut it
   lands under the shortcut's "Start in" folder. Pass `--save` with a full path
   to be sure.
-- **Stop it with Ctrl+C.** That is the clean shutdown: the exe writes the
-  campaign to the save and exits 0 (verified by `tools/check_exe.py`). The
-  save is also written every time DCS disconnects. Closing the console window
-  instead is *not* verified to write the save; with DCS closed the war keeps
-  advancing, and anything since the last save may be lost.
+- **Stop it with Ctrl+C, or close the window.** Ctrl+C is the clean
+  shutdown: the exe writes the campaign to the save and exits 0 (verified by
+  `tools/check_exe.py`). Closing the console window, logging off or shutting
+  Windows down also writes the save first: the engine installs a console
+  control handler that saves before Windows ends the process. That was
+  verified with `python -m campaign` by closing the pseudoconsole it ran in,
+  which is what Windows Terminal does when a tab closes (the engine before
+  this saved nothing); the exe runs the same code but has not been closed
+  that way itself. The save is also written every time DCS disconnects and
+  every minute while the engine runs (`--autosave SECONDS`, 0 for off), so a
+  crash, a hard kill or a power cut loses at most a minute of war.
 - **No firewall prompt by default.** The engine binds `127.0.0.1`, which
   Windows Firewall does not ask about. `--host 0.0.0.0` (DCS on another
   machine) should be expected to prompt.

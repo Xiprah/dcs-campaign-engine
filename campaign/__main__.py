@@ -12,6 +12,7 @@ import contextlib
 import logging
 import os
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,28 @@ from campaign.server import (
 )
 
 DEFAULT_SAVE = Path("saves/campaign.json")
+
+#: Wall seconds between saves while the engine serves. The war carries on
+#: with DCS closed for as long as the engine runs, so before this a crash,
+#: a power cut or a reboot lost everything since DCS last disconnected --
+#: which, with nobody flying, could be days of war. A save of a three-day
+#: Syria war is about a quarter of a megabyte and takes milliseconds, so a
+#: minute costs nothing. Wall seconds, not campaign seconds, because what a
+#: crash loses is the operator's time, and at high compression a campaign
+#: interval would save many times a second. Saving reads the campaign and
+#: changes nothing in it, so when it happens cannot change the war.
+DEFAULT_AUTOSAVE = 60.0
+
+#: Windows console control events that end the process whatever a handler
+#: does: the console window closed (2), the user logging off (5), the
+#: machine shutting down (6). Ctrl+C (0) and Ctrl+Break (1) are left to
+#: Python, which turns Ctrl+C into the KeyboardInterrupt that saves on the
+#: way out.
+_CONSOLE_CLOSE_EVENTS = frozenset({2, 5, 6})
+
+#: How long the close handler waits for the save. Windows ends the process
+#: about five seconds after a close event, whatever the handler is doing.
+_CLOSE_SAVE_TIMEOUT = 4.0
 
 #: Maps a new campaign can be started on. `syria` is the real one; `slice` is
 #: the two-base test slice the unit tests are written against, kept for
@@ -201,6 +224,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "1 is real time, 0 stops the war until DCS connects",
     )
     parser.add_argument(
+        "--autosave",
+        type=_non_negative,
+        default=DEFAULT_AUTOSAVE,
+        metavar="SECONDS",
+        help=f"wall seconds between saves while serving (default "
+        f"{DEFAULT_AUTOSAVE:g}); 0 saves only when DCS disconnects and on exit",
+    )
+    parser.add_argument(
         "--simulate",
         type=_non_negative,
         default=None,
@@ -223,6 +254,74 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+async def _autosave(engine: _Persisting, period: float) -> None:
+    """Save every `period` wall seconds, until cancelled."""
+    while True:
+        await asyncio.sleep(period)
+        engine.persist()
+
+
+def _console_close_handler(loop: asyncio.AbstractEventLoop, engine: _Persisting):
+    """A Windows console control handler that saves before the process dies.
+
+    Closing the console window does not raise KeyboardInterrupt: Windows
+    calls the process's control handlers on a thread of its own and ends the
+    process about five seconds later, so nothing on the way out runs. The
+    save is handed to the event loop, which owns the campaign, rather than
+    written from this thread, where it could read a campaign half-way through
+    a step; the handler waits for it. Returns whether it handled the event.
+    """
+
+    def handler(event: int) -> bool:
+        if event not in _CONSOLE_CLOSE_EVENTS:
+            return False
+        done = threading.Event()
+
+        def save() -> None:
+            try:
+                engine.persist()
+            finally:
+                done.set()
+
+        try:
+            loop.call_soon_threadsafe(save)
+        except RuntimeError:
+            # The loop is closed: the process is already on its way out, and
+            # `_run` saved on the way.
+            return False
+        done.wait(_CLOSE_SAVE_TIMEOUT)
+        return True
+
+    return handler
+
+
+@contextlib.contextmanager
+def _saving_on_console_close(loop: asyncio.AbstractEventLoop, engine: _Persisting):
+    """Install `_console_close_handler` for the life of the block, on Windows."""
+    if sys.platform != "win32":
+        yield
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    routine_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    # Kept referenced for as long as it is installed: Windows holds only the
+    # function pointer, and a collected one is a crash on close.
+    routine = routine_type(_console_close_handler(loop, engine))
+    kernel32 = ctypes.windll.kernel32
+    installed = bool(kernel32.SetConsoleCtrlHandler(routine, True))
+    if not installed:
+        logging.getLogger("campaign").warning(
+            "could not install the console close handler; closing the window "
+            "will not save (Ctrl+C will)"
+        )
+    try:
+        yield
+    finally:
+        if installed:
+            kernel32.SetConsoleCtrlHandler(routine, False)
+
+
 async def _run(args: argparse.Namespace, engine: _Persisting) -> None:
     server = CampaignServer(
         engine,
@@ -234,9 +333,17 @@ async def _run(args: argparse.Namespace, engine: _Persisting) -> None:
     # Bind before anything is written: a busy port must not overwrite a live
     # campaign with the empty one this process just built.
     await server.start()
+    autosave = (
+        asyncio.create_task(_autosave(engine, args.autosave)) if args.autosave > 0 else None
+    )
     try:
-        await server.serve_forever()
+        with _saving_on_console_close(asyncio.get_running_loop(), engine):
+            await server.serve_forever()
     finally:
+        if autosave is not None:
+            autosave.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await autosave
         await server.close()
         engine.persist()
 

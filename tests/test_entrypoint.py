@@ -10,14 +10,27 @@ traceback -- so both are pinned.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import io
 import json
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
-from campaign.__main__ import _Persisting, main
+from campaign.__main__ import (
+    DEFAULT_AUTOSAVE,
+    _console_close_handler,
+    _Persisting,
+    _run,
+    _saving_on_console_close,
+    main,
+    parse_args,
+)
+from campaign.campaign import Campaign
 
 
 class _Engine:
@@ -79,6 +92,145 @@ class PersistTests(unittest.TestCase):
         with self.assertLogs("campaign", level="WARNING"):
             _Persisting(Bare(), self.save).persist()
         self.assertFalse(self.save.exists())
+
+
+class _Counting(_Persisting):
+    """Persists for real, and remembers on which thread each finished save ran."""
+
+    def __init__(self, engine, save: Path, *, slow: float = 0.0) -> None:
+        super().__init__(engine, save)
+        self.saves: list[int] = []
+        self.slow = slow
+
+    def persist(self) -> bool:
+        if self.slow:
+            time.sleep(self.slow)
+        written = super().persist()
+        self.saves.append(threading.get_ident())
+        return written
+
+
+def _serve_for(engine: _Persisting, seconds: float, **overrides) -> None:
+    """Run the server path of `python -m campaign` for `seconds`, then stop it."""
+    args = argparse.Namespace(host="127.0.0.1", port=0, tick_period=0.01,
+                              time_compression=0.0, autosave=DEFAULT_AUTOSAVE)
+    vars(args).update(overrides)
+
+    async def go() -> None:
+        task = asyncio.create_task(_run(args, engine))
+        await asyncio.sleep(seconds)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(go())
+
+
+class AutosaveTests(unittest.TestCase):
+    """The war runs for days with DCS closed; a crash must not lose them.
+
+    Before this the save was written only when DCS disconnected and when the
+    process exited cleanly, so a crash, a power cut or a reboot lost every
+    paper step since the last disconnect.
+    """
+
+    def setUp(self) -> None:
+        self.dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.save = self.dir / "campaign.json"
+
+    def test_the_server_saves_on_a_period_while_it_runs(self) -> None:
+        engine = _Counting(Campaign(), self.save)
+        _serve_for(engine, 0.5, autosave=0.05)
+        # Several periodic saves and the one on the way out, not just that one.
+        self.assertGreaterEqual(len(engine.saves), 4, engine.saves)
+        self.assertTrue(self.save.exists())
+
+    def test_zero_turns_the_periodic_save_off(self) -> None:
+        engine = _Counting(Campaign(), self.save)
+        _serve_for(engine, 0.3, autosave=0.0)
+        self.assertEqual(len(engine.saves), 1, "only the save on the way out")
+
+    def test_a_minute_by_default_and_settable(self) -> None:
+        self.assertEqual(parse_args([]).autosave, 60.0)
+        self.assertEqual(parse_args(["--autosave", "15"]).autosave, 15.0)
+        self.assertEqual(parse_args(["--autosave", "0"]).autosave, 0.0)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(["--autosave", "-1"])
+
+
+class ConsoleCloseTests(unittest.TestCase):
+    """Closing the console window saves, as Ctrl+C already did.
+
+    Windows does not raise KeyboardInterrupt for a closed window: it calls
+    the process's console control handlers on a thread of its own and ends
+    the process seconds later, so nothing on the way out runs.
+    """
+
+    def setUp(self) -> None:
+        self.dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # A slow save, so a handler that did not wait for it would return
+        # before it finished -- and Windows would end the process mid-write.
+        self.engine = _Counting(_Engine(), self.dir / "campaign.json", slow=0.2)
+
+    def _from_windows_thread(self, event: int) -> tuple[bool, int]:
+        """Call the handler from another thread while the loop runs, as Windows does.
+
+        Returns what it answered and the loop's thread, and records how many
+        saves had finished at the instant it returned in `self.at_return`.
+        """
+
+        async def go() -> tuple[bool, int]:
+            loop = asyncio.get_running_loop()
+            handler = _console_close_handler(loop, self.engine)
+
+            def as_windows_calls_it() -> bool:
+                handled = handler(event)
+                self.at_return = len(self.engine.saves)
+                return handled
+
+            return await loop.run_in_executor(None, as_windows_calls_it), threading.get_ident()
+
+        return asyncio.run(go())
+
+    def test_closing_the_window_saves_on_the_loop_before_returning(self) -> None:
+        for event, label in ((2, "window closed"), (5, "log off"), (6, "shutdown")):
+            with self.subTest(label):
+                self.engine.saves.clear()
+                handled, loop_thread = self._from_windows_thread(event)
+                self.assertTrue(handled)
+                # Saved, and by the loop that owns the campaign, not by the
+                # thread Windows called in on.
+                self.assertEqual(self.engine.saves, [loop_thread])
+                self.assertEqual(self.at_return, 1, "returned before the save finished")
+                self.assertTrue((self.dir / "campaign.json").exists())
+
+    def test_ctrl_c_and_ctrl_break_are_left_to_python(self) -> None:
+        for event in (0, 1):
+            with self.subTest(event=event):
+                handled, _ = self._from_windows_thread(event)
+                self.assertFalse(handled)
+                self.assertEqual(self.engine.saves, [])
+
+    def test_a_closed_loop_is_not_waited_on(self) -> None:
+        loop = asyncio.new_event_loop()
+        loop.close()
+        self.assertFalse(_console_close_handler(loop, self.engine)(2))
+        self.assertEqual(self.engine.saves, [])
+
+    def test_it_installs_on_windows_and_is_a_no_op_elsewhere(self) -> None:
+        """Not skipped off Windows: CI's Lua run allows no skip but lupa's.
+
+        On Windows a failed install is a logged warning, so no warning means
+        the handler went in (and came out); elsewhere there is nothing to
+        install, and the block must simply run.
+        """
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        with self.assertNoLogs("campaign", level="WARNING"):
+            with _saving_on_console_close(loop, self.engine):
+                pass
 
 
 class CorruptSaveTests(unittest.TestCase):
